@@ -2,10 +2,12 @@ use gpui::{
     App, Application, Bounds, Context, Render, SharedString, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, rgb, size, uniform_list,
 };
+use std::fmt::Write as _;
 use std::ops::Range;
 
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
+const SAMPLE_FILE_PATH: &str = "src/engine.rs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffKind {
@@ -22,68 +24,95 @@ struct DiffLine {
 }
 
 struct ReviewWorkspace {
+    path: SharedString,
     lines: Vec<DiffLine>,
     selected_line: usize,
 }
 
 impl ReviewWorkspace {
     fn new() -> Self {
+        let diff = sample_unified_diff();
+        let file = cururu_core::parse_unified_diff(&diff)
+            .into_iter()
+            .next()
+            .expect("the generated unified diff contains one file");
         let mut lines = Vec::with_capacity(DIFF_LINE_COUNT);
         let mut old_number = 1;
-        let mut new_number = 1;
+        let mut right_lines = file.right_lines.into_iter();
 
-        for index in 0..DIFF_LINE_COUNT {
-            let kind = match index % 11 {
-                3 | 4 => DiffKind::Removed,
-                5 | 6 => DiffKind::Added,
-                _ => DiffKind::Context,
+        for raw_line in file.patch.lines() {
+            if raw_line.starts_with("diff --git ")
+                || raw_line.starts_with("--- ")
+                || raw_line.starts_with("+++ ")
+                || raw_line.starts_with("@@ ")
+            {
+                continue;
+            }
+            let Some(marker) = raw_line.chars().next() else {
+                continue;
             };
-            let (old, new, marker, source) = match kind {
-                DiffKind::Context => {
-                    let values = (
-                        Some(old_number),
-                        Some(new_number),
-                        ' ',
-                        "let result = calculate(input);",
-                    );
+            let kind = match marker {
+                ' ' => DiffKind::Context,
+                '+' => DiffKind::Added,
+                '-' => DiffKind::Removed,
+                _ => continue,
+            };
+            let old = match kind {
+                DiffKind::Context | DiffKind::Removed => {
+                    let number = Some(old_number);
                     old_number += 1;
-                    new_number += 1;
-                    values
+                    number
                 }
-                DiffKind::Removed => {
-                    let values = (
-                        Some(old_number),
-                        None,
-                        '-',
-                        "let result = calculate_legacy(input);",
-                    );
-                    old_number += 1;
-                    values
-                }
-                DiffKind::Added => {
-                    let values = (
-                        None,
-                        Some(new_number),
-                        '+',
-                        "let result = calculate_checked(input)?;",
-                    );
-                    new_number += 1;
-                    values
-                }
+                DiffKind::Added => None,
+            };
+            let new = match kind {
+                DiffKind::Context | DiffKind::Added => right_lines.next().map(|line| line as usize),
+                DiffKind::Removed => None,
             };
             lines.push(DiffLine {
                 old_number: old,
                 new_number: new,
                 kind,
-                text: format!("{marker}{source} // review row {index}").into(),
+                text: raw_line.to_string().into(),
             });
         }
 
         Self {
+            path: file.path.into(),
             lines,
             selected_line: 42,
         }
     }
+}
+
+fn sample_unified_diff() -> String {
+    let mut body = String::new();
+    let mut old_count = 0;
+    let mut new_count = 0;
+
+    for index in 0..DIFF_LINE_COUNT {
+        let (marker, source) = match index % 11 {
+            3 | 4 => {
+                old_count += 1;
+                ('-', "let result = calculate_legacy(input);")
+            }
+            5 | 6 => {
+                new_count += 1;
+                ('+', "let result = calculate_checked(input)?;")
+            }
+            _ => {
+                old_count += 1;
+                new_count += 1;
+                (' ', "let result = calculate(input);")
+            }
+        };
+        writeln!(body, "{marker}{source} // review row {index}")
+            .expect("writing a line into a String cannot fail");
+    }
+
+    format!(
+        "diff --git a/{SAMPLE_FILE_PATH} b/{SAMPLE_FILE_PATH}\nindex 0000000..1111111 100644\n--- a/{SAMPLE_FILE_PATH}\n+++ b/{SAMPLE_FILE_PATH}\n@@ -1,{old_count} +1,{new_count} @@\n{body}"
+    )
 }
 
 impl Render for ReviewWorkspace {
@@ -100,7 +129,7 @@ impl Render for ReviewWorkspace {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(Self::render_file_rail())
+                    .child(self.render_file_rail())
                     .child(self.render_diff(cx))
                     .child(self.render_finding_panel()),
             )
@@ -131,7 +160,17 @@ impl ReviewWorkspace {
             )
     }
 
-    fn render_file_rail() -> impl IntoElement {
+    fn render_file_rail(&self) -> impl IntoElement {
+        let added = self
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffKind::Added)
+            .count();
+        let removed = self
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffKind::Removed)
+            .count();
         div()
             .flex()
             .flex_col()
@@ -145,15 +184,16 @@ impl ReviewWorkspace {
                     .px_3()
                     .py_3()
                     .text_color(rgb(0x009b_aaba))
-                    .child("CHANGED FILES · 8"),
+                    .child("CHANGED FILES · 1"),
             )
-            .child(Self::file_row("src/engine.rs", "+82  −14", true))
-            .child(Self::file_row("src/parser.rs", "+31  −8", false))
-            .child(Self::file_row("src/model.rs", "+19  −2", false))
-            .child(Self::file_row("tests/engine.rs", "+54  −0", false))
+            .child(Self::file_row(
+                self.path.clone(),
+                format!("+{added}  −{removed}"),
+                true,
+            ))
     }
 
-    fn file_row(path: &'static str, summary: &'static str, selected: bool) -> impl IntoElement {
+    fn file_row(path: SharedString, summary: String, selected: bool) -> impl IntoElement {
         let background = if selected { 0x0026_3442 } else { 0x0015_1e27 };
         div()
             .flex()
@@ -181,7 +221,7 @@ impl ReviewWorkspace {
                     .items_center()
                     .border_b_1()
                     .border_color(rgb(0x002b_3946))
-                    .child("src/engine.rs"),
+                    .child(self.path.clone()),
             )
             .child(
                 uniform_list(
@@ -301,7 +341,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIFF_LINE_COUNT, DiffKind, ReviewWorkspace};
+    use super::{DIFF_LINE_COUNT, DiffKind, ReviewWorkspace, SAMPLE_FILE_PATH};
 
     #[test]
     fn review_workspace_generates_large_diff_and_initial_selection() {
@@ -309,8 +349,24 @@ mod tests {
 
         assert_eq!(workspace.lines.len(), DIFF_LINE_COUNT);
         assert_eq!(workspace.selected_line, 42);
+        assert_eq!(workspace.path.as_ref(), SAMPLE_FILE_PATH);
         assert_eq!(workspace.lines[0].kind, DiffKind::Context);
         assert_eq!(workspace.lines[3].kind, DiffKind::Removed);
         assert_eq!(workspace.lines[5].kind, DiffKind::Added);
+        assert_eq!(workspace.lines[0].old_number, Some(1));
+        assert_eq!(workspace.lines[0].new_number, Some(1));
+        assert_eq!(workspace.lines[5].old_number, None);
+        assert_eq!(workspace.lines[5].new_number, Some(4));
+        let mut anchored_lines = 0;
+        for line in &workspace.lines {
+            match line.kind {
+                DiffKind::Context | DiffKind::Added => {
+                    assert!(line.new_number.is_some());
+                    anchored_lines += 1;
+                }
+                DiffKind::Removed => assert!(line.new_number.is_none()),
+            }
+        }
+        assert_eq!(anchored_lines, 8_182);
     }
 }

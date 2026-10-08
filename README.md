@@ -12,8 +12,9 @@ The first vertical slice is a GPUI feasibility pass for the review workspace:
 - a virtualized diff with 10,000 rows;
 - selectable source lines and a finding detail pane.
 
-The sample diff is generated in memory. This slice does not access a repository,
-SCM credentials, an evaluator, or external services.
+The 10,000-row unified diff is generated in memory and parsed through the pinned
+`cururu-core` parser. This slice does not access a repository, SCM credentials,
+an evaluator, or external services.
 
 ## Run
 
