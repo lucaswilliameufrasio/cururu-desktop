@@ -7,8 +7,13 @@ license = "MIT OR Apache-2.0"
 description = "Desktop code review client for Cururu"
 
 [dependencies]
+anyhow = "1"
 cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "3ea5deb" }
 gpui = "0.2.2"
+gix = { version = "=0.87.0", default-features = false, features = ["basic", "parallel", "sha1"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

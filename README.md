@@ -16,6 +16,11 @@ The 10,000-row unified diff is generated in memory and parsed through the pinned
 `cururu-core` parser. This slice does not access a repository, SCM credentials,
 an evaluator, or external services.
 
+Local Git access is being built on the embedded `gix` library rather than a Git
+subprocess. The first read-only adapter can discover a repository and report its
+root and branch; interactive repository opening and real diff rendering are not
+wired into the workspace yet. See [the architecture decisions](docs/decisions.md).
+
 ## Run
 
 ```sh

@@ -5,6 +5,8 @@ use gpui::{
 use std::fmt::Write as _;
 use std::ops::Range;
 
+pub mod repository;
+
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
 const SAMPLE_FILE_PATHS: [&str; 4] = [
