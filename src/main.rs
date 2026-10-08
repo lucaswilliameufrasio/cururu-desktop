@@ -7,7 +7,7 @@ use std::ops::Range;
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffKind {
     Context,
     Added,
@@ -297,4 +297,20 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DIFF_LINE_COUNT, DiffKind, ReviewWorkspace};
+
+    #[test]
+    fn review_workspace_generates_large_diff_and_initial_selection() {
+        let workspace = ReviewWorkspace::new();
+
+        assert_eq!(workspace.lines.len(), DIFF_LINE_COUNT);
+        assert_eq!(workspace.selected_line, 42);
+        assert_eq!(workspace.lines[0].kind, DiffKind::Context);
+        assert_eq!(workspace.lines[3].kind, DiffKind::Removed);
+        assert_eq!(workspace.lines[5].kind, DiffKind::Added);
+    }
 }
