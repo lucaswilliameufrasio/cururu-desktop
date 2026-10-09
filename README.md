@@ -52,9 +52,11 @@ submissions, inline comment threads, and general conversation comments. Inline
 comments whose current line is absent but original line is known are marked as
 outdated locations; this does not mean the concern was resolved. This is
 read-only; choosing an inline comment focuses its file and diff line when that
-anchor is present in the loaded patch. Missing or oversized patches fail closed
-instead of showing an incomplete diff. Loading a remote PR does not send code
-to an evaluator or publish comments.
+anchor is present in the loaded patch, and loads a bounded source excerpt at
+the comment's original commit. Missing or oversized patches fail closed instead
+of showing an incomplete diff. Remote source is fetched only on selection and
+kept in memory. Loading a remote PR does not send code to an evaluator or
+publish comments.
 
 ## Run
 

@@ -73,6 +73,7 @@ struct ReviewWorkspace {
     github_credentials: Option<github_auth::StoredCredentials>,
     pull_request_input: Option<Entity<InputState>>,
     remote_review_state: RemoteReviewState,
+    remote_source_context: RemoteSourceContextState,
     selected_file: Option<usize>,
     selected_line: usize,
     diff_scroll_handle: UniformListScrollHandle,
@@ -103,6 +104,26 @@ enum RemoteReviewState {
     Loaded(Box<github_pr::PullRequestSnapshot>),
     Failed {
         reference: github_pr::PullRequestRef,
+        message: SharedString,
+    },
+}
+
+enum RemoteSourceContextState {
+    Idle,
+    Loading {
+        comment_id: u64,
+        path: String,
+        commit_sha: String,
+    },
+    Loaded {
+        comment_id: u64,
+        source: github_pr::PullRequestSourceFile,
+        anchor_line: Option<u32>,
+    },
+    Failed {
+        comment_id: u64,
+        path: String,
+        commit_sha: String,
         message: SharedString,
     },
 }
@@ -166,6 +187,7 @@ impl ReviewWorkspace {
             github_credentials: None,
             pull_request_input: None,
             remote_review_state: RemoteReviewState::Idle,
+            remote_source_context: RemoteSourceContextState::Idle,
             selected_file: Some(0),
             selected_line: 42,
             diff_scroll_handle: UniformListScrollHandle::new(),
@@ -203,6 +225,7 @@ impl ReviewWorkspace {
             Ok(opened) => {
                 let snapshot = opened.snapshot;
                 self.remote_review_state = RemoteReviewState::Idle;
+                self.remote_source_context = RemoteSourceContextState::Idle;
                 self.head_oid.clone_from(&snapshot.head_oid);
                 let files = snapshot
                     .changed_files
@@ -284,6 +307,14 @@ impl ReviewWorkspace {
             .into(),
         );
         true
+    }
+
+    fn begin_source_context_load(&mut self, comment: &github_pr::PullRequestComment) {
+        self.remote_source_context = RemoteSourceContextState::Loading {
+            comment_id: comment.id,
+            path: comment.path.clone(),
+            commit_sha: comment.original_commit_id.clone(),
+        };
     }
 }
 
@@ -672,6 +703,7 @@ impl ReviewWorkspace {
                                 return false;
                             }
                             this.notice = Some("Loading pull request from GitHub…".into());
+                            this.remote_source_context = RemoteSourceContextState::Idle;
                             this.remote_review_state =
                                 RemoteReviewState::Loading(reference.clone());
                             cx.notify();
@@ -1147,6 +1179,10 @@ impl ReviewWorkspace {
         let review_controls = if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state
         {
             let entity = cx.entity();
+            let http = cx.http_client();
+            let access_token = self.github_credentials.as_ref().and_then(|credentials| {
+                (!credentials.access_token_is_expired()).then(|| credentials.access_token.clone())
+            });
             div()
                 .flex()
                 .flex_col()
@@ -1155,6 +1191,9 @@ impl ReviewWorkspace {
                 .children(render_remote_review_threads(
                     &snapshot.review_threads,
                     entity,
+                    http,
+                    access_token,
+                    snapshot.reference.clone(),
                 ))
                 .children(
                     snapshot
@@ -1199,6 +1238,7 @@ impl ReviewWorkspace {
                     .child(line.text.clone()),
             )
             .child(review_controls)
+            .child(render_remote_source_context(&self.remote_source_context))
             .child(
                 div()
                     .mt_2()
@@ -1451,6 +1491,70 @@ fn start_pull_request_load(
     .detach();
 }
 
+fn start_source_context_load(
+    entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: String,
+    reference: github_pr::PullRequestRef,
+    comment: github_pr::PullRequestComment,
+    cx: &App,
+) {
+    cx.spawn(async move |cx| {
+        let comment_id = comment.id;
+        let path = comment.path.clone();
+        let commit_sha = comment.original_commit_id.clone();
+        let anchor_line = comment.original_line.or(comment.line);
+        let result = async {
+            let client = github_pr::GitHubPullRequestClient::new(http, access_token)?;
+            with_network_timeout(
+                client.load_source_file(&reference, &path, &commit_sha),
+                cx.background_executor(),
+            )
+            .await
+        }
+        .await;
+        let _ = entity.update(cx, |this, cx| {
+            let is_current_request = matches!(
+                &this.remote_source_context,
+                RemoteSourceContextState::Loading {
+                    comment_id: active_id,
+                    ..
+                } if *active_id == comment_id
+            );
+            if !is_current_request {
+                return;
+            }
+            match result {
+                Ok(source) => {
+                    this.remote_source_context = RemoteSourceContextState::Loaded {
+                        comment_id,
+                        source,
+                        anchor_line,
+                    };
+                    this.notice = Some(
+                        "Loaded the source file at the commit where this comment was written."
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    this.remote_source_context = RemoteSourceContextState::Failed {
+                        comment_id,
+                        path,
+                        commit_sha,
+                        message: error.to_string().into(),
+                    };
+                    this.notice = Some(
+                        "Reviewed source could not be loaded; the diff and thread remain available."
+                            .into(),
+                    );
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 async fn with_network_timeout<T>(
     operation: impl Future<Output = anyhow::Result<T>>,
     executor: &BackgroundExecutor,
@@ -1482,6 +1586,9 @@ fn render_remote_review_summary(review: &github_pr::PullRequestReview) -> impl I
 fn render_remote_review_threads(
     threads: &[github_pr::PullRequestReviewThread],
     entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: Option<String>,
+    reference: github_pr::PullRequestRef,
 ) -> impl IntoIterator<Item = impl IntoElement> + '_ {
     threads.iter().map(move |thread| {
         let root = &thread.root;
@@ -1503,7 +1610,14 @@ fn render_remote_review_threads(
                 root.author,
                 root_status
             ))
-            .child(render_remote_inline_comment(root, entity.clone(), false))
+            .child(render_remote_inline_comment(
+                root,
+                entity.clone(),
+                http.clone(),
+                access_token.clone(),
+                reference.clone(),
+                false,
+            ))
             .children(thread.replies.iter().map(|reply| {
                 div()
                     .ml_3()
@@ -1511,7 +1625,14 @@ fn render_remote_review_threads(
                     .border_color(rgb(0x003b_4c5c))
                     .pl_2()
                     .child(format!("↳ @{}", reply.author))
-                    .child(render_remote_inline_comment(reply, entity.clone(), true))
+                    .child(render_remote_inline_comment(
+                        reply,
+                        entity.clone(),
+                        http.clone(),
+                        access_token.clone(),
+                        reference.clone(),
+                        true,
+                    ))
             }))
     })
 }
@@ -1519,6 +1640,9 @@ fn render_remote_review_threads(
 fn render_remote_inline_comment(
     comment: &github_pr::PullRequestComment,
     entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: Option<String>,
+    reference: github_pr::PullRequestRef,
     nested: bool,
 ) -> impl IntoElement {
     let comment_for_click = comment.clone();
@@ -1531,8 +1655,11 @@ fn render_remote_inline_comment(
         .cursor_pointer()
         .child(div().text_color(rgb(0x00b5_c0cb)).child(comment.body.clone()))
         .on_click(move |_event, _window, cx| {
+            let clicked_comment = comment_for_click.clone();
             entity.update(cx, |this, cx| {
-                if !this.focus_remote_comment(&comment_for_click) {
+                let found_in_diff = this.focus_remote_comment(&clicked_comment);
+                this.begin_source_context_load(&clicked_comment);
+                if !found_in_diff {
                     this.notice = Some(
                         "The referenced line is outside the current patch; the comment remains available above."
                             .into(),
@@ -1542,7 +1669,98 @@ fn render_remote_inline_comment(
                 }
                 cx.notify();
             });
+            if let Some(access_token) = access_token.clone() {
+                start_source_context_load(
+                    entity.clone(),
+                    http.clone(),
+                    access_token,
+                    reference.clone(),
+                    clicked_comment,
+                    cx,
+                );
+            } else {
+                entity.update(cx, |this, cx| {
+                    this.remote_source_context = RemoteSourceContextState::Failed {
+                        comment_id: clicked_comment.id,
+                        path: clicked_comment.path.clone(),
+                        commit_sha: clicked_comment.original_commit_id.clone(),
+                        message: "GitHub session expired; reconnect to load the reviewed source."
+                            .into(),
+                    };
+                    cx.notify();
+                });
+            }
         })
+}
+
+fn render_remote_source_context(state: &RemoteSourceContextState) -> impl IntoElement {
+    match state {
+        RemoteSourceContextState::Idle => div(),
+        RemoteSourceContextState::Loading {
+            path, commit_sha, ..
+        } => div().p_2().text_color(rgb(0x009b_aaba)).child(format!(
+            "Loading reviewed source {path} at {}…",
+            short_sha(commit_sha)
+        )),
+        RemoteSourceContextState::Loaded {
+            comment_id,
+            source,
+            anchor_line,
+        } => div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(rgb(0x0011_1820))
+            .child(format!(
+                "COMMENT #{comment_id} · {} · {}",
+                source.path,
+                short_sha(&source.commit_sha)
+            ))
+            .child(
+                div()
+                    .text_color(rgb(0x00b5_c0cb))
+                    .child(source_excerpt(&source.content, *anchor_line)),
+            ),
+        RemoteSourceContextState::Failed {
+            comment_id,
+            path,
+            commit_sha,
+            message,
+        } => div().p_2().text_color(rgb(0x00e5_b6ba)).child(format!(
+            "Could not load context for comment #{comment_id} ({path} at {}): {message}",
+            short_sha(commit_sha)
+        )),
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+fn source_excerpt(content: &str, anchor_line: Option<u32>) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "(empty source file)".to_string();
+    }
+    let anchor = anchor_line
+        .and_then(|line| usize::try_from(line).ok())
+        .filter(|line| *line > 0)
+        .unwrap_or(1);
+    let start = anchor.saturating_sub(5).max(1);
+    let end = lines.len().min(anchor.saturating_add(5));
+    let mut excerpt = String::new();
+    for line_number in start..=end {
+        if let Some(line) = lines.get(line_number - 1) {
+            use std::fmt::Write as _;
+            let mut bounded_line = line.chars().take(500).collect::<String>();
+            if line.chars().count() > 500 {
+                bounded_line.push('…');
+            }
+            let _ = writeln!(excerpt, "{line_number:>5} {bounded_line}");
+        }
+    }
+    excerpt
 }
 
 fn render_remote_conversation_comment(
@@ -1852,7 +2070,7 @@ fn main() {
 mod tests {
     use super::{
         DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewWorkspace, SAMPLE_FILE_PATHS,
-        locate_remote_comment, parse_diff_file,
+        locate_remote_comment, parse_diff_file, source_excerpt,
     };
     use std::fs;
 
@@ -1939,6 +2157,20 @@ mod tests {
             side: Some("LEFT".to_string()),
         };
         assert_eq!(locate_remote_comment(&files, &comment), Some((0, 1)));
+    }
+
+    #[test]
+    fn source_excerpt_is_bounded_and_centers_on_the_reviewed_line() {
+        let content = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = source_excerpt(&content, Some(50));
+        assert!(excerpt.contains("   45 line 45"));
+        assert!(excerpt.contains("   50 line 50"));
+        assert!(excerpt.contains("   55 line 55"));
+        assert!(!excerpt.contains("line 44"));
+        assert!(!excerpt.contains("line 56"));
     }
 
     #[test]

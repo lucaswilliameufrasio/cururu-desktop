@@ -1,6 +1,7 @@
 use std::{fmt, path::Path, sync::Arc};
 
 use anyhow::{Context as _, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpui::http_client::{
     AsyncBody, HttpClient, HttpRequestExt as _, Method, RedirectPolicy, Request, StatusCode, Url,
 };
@@ -15,6 +16,7 @@ const MAX_COLLECTION_BYTES: usize = 8 * 1_048_576;
 const MAX_COLLECTION_PAGES: usize = 50;
 const MAX_REMOTE_DIFF_FILE_BYTES: usize = 45_000;
 const MAX_REMOTE_DIFF_BYTES: usize = 180_000;
+const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PullRequestRef {
@@ -123,6 +125,13 @@ pub struct PullRequestConversationComment {
     pub html_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSourceFile {
+    pub path: String,
+    pub commit_sha: String,
+    pub content: String,
+}
+
 pub struct GitHubPullRequestClient {
     http: Arc<dyn HttpClient>,
     access_token: String,
@@ -207,6 +216,67 @@ impl GitHubPullRequestClient {
             reviews,
             review_threads: group_review_threads(comments),
             conversation_comments,
+        })
+    }
+
+    pub async fn load_source_file(
+        &self,
+        reference: &PullRequestRef,
+        path: &str,
+        commit_sha: &str,
+    ) -> anyhow::Result<PullRequestSourceFile> {
+        validate_relative_path(path)?;
+        ensure!(
+            valid_commit_sha(commit_sha),
+            "GitHub review comment has an invalid commit identifier"
+        );
+        let mut url = Url::parse(API_ROOT).context("invalid GitHub API root")?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("could not build GitHub contents API path"))?;
+            segments
+                .push("repos")
+                .push(&reference.owner)
+                .push(&reference.repository)
+                .push("contents");
+            for segment in path.split('/') {
+                segments.push(segment);
+            }
+        }
+        url.query_pairs_mut().append_pair("ref", commit_sha);
+        let response: PullRequestSourceFileResponse = self.get_json(url.as_str()).await?;
+        ensure!(
+            response.kind == "file" && response.encoding == "base64",
+            "GitHub returned a non-file or unsupported source representation"
+        );
+        ensure!(
+            response.path == path,
+            "GitHub returned source for a different repository path"
+        );
+        ensure!(
+            response.size <= MAX_SOURCE_FILE_BYTES,
+            "Reviewed source file exceeds the desktop context limit"
+        );
+        let decoded = STANDARD
+            .decode(
+                response
+                    .content
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>(),
+            )
+            .context("GitHub returned invalid base64 source content")?;
+        ensure!(
+            decoded.len() == response.size,
+            "GitHub source content size does not match its metadata"
+        );
+        let content =
+            String::from_utf8(decoded).context("Reviewed source file is not valid UTF-8 text")?;
+        Ok(PullRequestSourceFile {
+            path: response.path,
+            commit_sha: commit_sha.to_string(),
+            content,
         })
     }
 
@@ -307,6 +377,10 @@ impl GitHubPullRequestClient {
         let next = next_page_url(&parts.headers)?;
         Ok((bytes, next, size))
     }
+}
+
+fn valid_commit_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn next_page_url(headers: &gpui::http_client::http::HeaderMap) -> anyhow::Result<Option<String>> {
@@ -614,6 +688,16 @@ struct PullRequestConversationResponse {
     user: Option<GitHubUser>,
 }
 
+#[derive(Deserialize)]
+struct PullRequestSourceFileResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    encoding: String,
+    size: usize,
+    path: String,
+    content: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -751,6 +835,59 @@ mod tests {
                 Some("Bearer test-token-not-real")
             );
             assert_eq!(requests[0].api_version.as_deref(), Some("2022-11-28"));
+        });
+    }
+
+    #[test]
+    fn source_file_is_loaded_at_the_comment_commit_with_a_strict_size_limit() {
+        futures::executor::block_on(async {
+            let (client, http) = api_client(&[
+                r#"{"type":"file","encoding":"base64","size":13,"path":"src/lib.rs","content":"Zm4gbWFpbigpIHt9Cg==","sha":"blob-sha"}"#,
+            ]);
+            let commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let source = client
+                .load_source_file(
+                    &PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                    "src/lib.rs",
+                    commit_sha,
+                )
+                .await
+                .unwrap();
+            assert_eq!(source.path, "src/lib.rs");
+            assert_eq!(source.commit_sha, commit_sha);
+            assert_eq!(source.content, "fn main() {}\n");
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(
+                requests[0].uri,
+                format!(
+                    "https://api.github.com/repos/octo-org/review_repo/contents/src/lib.rs?ref={commit_sha}"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn source_file_rejects_unsafe_paths_and_large_files() {
+        futures::executor::block_on(async {
+            let (client, _) = api_client(&[]);
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            assert!(
+                client
+                    .load_source_file(&reference, "../secrets.txt", commit_sha)
+                    .await
+                    .is_err()
+            );
+
+            let (client, _) = api_client(&[
+                r#"{"type":"file","encoding":"base64","size":262145,"path":"src/lib.rs","content":"","sha":"blob-sha"}"#,
+            ]);
+            assert!(
+                client
+                    .load_source_file(&reference, "src/lib.rs", commit_sha)
+                    .await
+                    .is_err()
+            );
         });
     }
 
