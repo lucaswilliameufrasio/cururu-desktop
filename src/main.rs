@@ -99,7 +99,7 @@ enum GitHubAuthState {
 enum RemoteReviewState {
     Idle,
     Loading(github_pr::PullRequestRef),
-    Loaded(github_pr::PullRequestSnapshot),
+    Loaded(Box<github_pr::PullRequestSnapshot>),
     Failed {
         reference: github_pr::PullRequestRef,
         message: SharedString,
@@ -118,11 +118,13 @@ fn remote_review_status(state: &RemoteReviewState) -> String {
             format!("Loading {}#{}…", reference.owner, reference.number)
         }
         RemoteReviewState::Loaded(snapshot) => format!(
-            "Loaded {}#{} · {} files · {} review comments",
+            "Loaded {}#{} · {} files · {} reviews · {} inline threads · {} conversation comments",
             snapshot.reference.owner,
             snapshot.reference.number,
             snapshot.files.len(),
-            snapshot.comments.len()
+            snapshot.reviews.len(),
+            snapshot.review_threads.len(),
+            snapshot.conversation_comments.len()
         ),
         RemoteReviewState::Failed { reference, message } => format!(
             "Could not load {}#{}: {message}",
@@ -1102,7 +1104,14 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .children(render_remote_review_comments(&snapshot.comments))
+                .children(snapshot.reviews.iter().map(render_remote_review_summary))
+                .children(render_remote_review_threads(&snapshot.review_threads))
+                .children(
+                    snapshot
+                        .conversation_comments
+                        .iter()
+                        .map(render_remote_conversation_comment),
+                )
         } else {
             div()
                 .flex()
@@ -1372,7 +1381,7 @@ fn start_pull_request_load(
                         .collect();
                     this.selected_file = (!this.files.is_empty()).then_some(0);
                     this.selected_line = 0;
-                    this.remote_review_state = RemoteReviewState::Loaded(snapshot);
+                    this.remote_review_state = RemoteReviewState::Loaded(Box::new(snapshot));
                     this.notice = Some("Pull request loaded read-only from GitHub.".into());
                 }
                 Err(error) => {
@@ -1407,26 +1416,71 @@ async fn with_network_timeout<T>(
     }
 }
 
-fn render_remote_review_comments(
-    comments: &[github_pr::PullRequestComment],
+fn render_remote_review_summary(review: &github_pr::PullRequestReview) -> impl IntoElement {
+    div()
+        .p_2()
+        .bg(rgb(0x0020_2b36))
+        .child(format!("REVIEW · {} · @{}", review.state, review.author))
+        .child(
+            div()
+                .mt_1()
+                .text_color(rgb(0x00b5_c0cb))
+                .child(review.body.clone()),
+        )
+}
+
+fn render_remote_review_threads(
+    threads: &[github_pr::PullRequestReviewThread],
 ) -> impl IntoIterator<Item = impl IntoElement> + '_ {
-    comments.iter().map(|comment| {
+    threads.iter().map(|thread| {
+        let root = &thread.root;
+        let root_status = if root.is_outdated {
+            " · outdated location"
+        } else {
+            ""
+        };
         div()
+            .flex()
+            .flex_col()
+            .gap_1()
             .p_2()
             .bg(rgb(0x0020_2b36))
             .child(format!(
-                "{}:{} · @{}",
-                comment.path,
-                comment.line.or(comment.original_line).unwrap_or_default(),
-                comment.author
+                "INLINE · {}:{} · @{}{}",
+                root.path,
+                root.line.or(root.original_line).unwrap_or_default(),
+                root.author,
+                root_status
             ))
-            .child(
+            .child(div().text_color(rgb(0x00b5_c0cb)).child(root.body.clone()))
+            .children(thread.replies.iter().map(|reply| {
                 div()
-                    .mt_1()
-                    .text_color(rgb(0x00b5_c0cb))
-                    .child(comment.body.clone()),
-            )
+                    .ml_3()
+                    .border_l_1()
+                    .border_color(rgb(0x003b_4c5c))
+                    .pl_2()
+                    .child(format!("↳ @{}", reply.author))
+                    .child(div().text_color(rgb(0x00b5_c0cb)).child(reply.body.clone()))
+            }))
     })
+}
+
+fn render_remote_conversation_comment(
+    comment: &github_pr::PullRequestConversationComment,
+) -> impl IntoElement {
+    div()
+        .p_2()
+        .bg(rgb(0x0020_2b36))
+        .child(format!(
+            "CONVERSATION · @{} · {}",
+            comment.author, comment.created_at
+        ))
+        .child(
+            div()
+                .mt_1()
+                .text_color(rgb(0x00b5_c0cb))
+                .child(comment.body.clone()),
+        )
 }
 
 fn start_github_device_login(
@@ -1762,7 +1816,7 @@ mod tests {
         assert!(!RemoteReviewState::Idle.blocks_local_drafts());
         assert!(RemoteReviewState::Loading(reference.clone()).blocks_local_drafts());
         assert!(
-            RemoteReviewState::Loaded(crate::github_pr::PullRequestSnapshot {
+            RemoteReviewState::Loaded(Box::new(crate::github_pr::PullRequestSnapshot {
                 reference,
                 title: "remote review".to_string(),
                 state: "open".to_string(),
@@ -1771,8 +1825,10 @@ mod tests {
                 base_sha: "base".to_string(),
                 head_sha: "head".to_string(),
                 files: Vec::new(),
-                comments: Vec::new(),
-            })
+                reviews: Vec::new(),
+                review_threads: Vec::new(),
+                conversation_comments: Vec::new(),
+            }))
             .blocks_local_drafts()
         );
     }

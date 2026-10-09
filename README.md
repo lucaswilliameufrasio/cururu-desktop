@@ -42,15 +42,18 @@ rejected rather than silently overwriting newer text.
 
 GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
 `CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
-This currently enables authentication only; remote pull-request review and
-publishing are not implemented. **Disconnect GitHub** removes local credentials
-but does not revoke the grant at GitHub.
+GitHub authentication and read-only pull-request inspection are available;
+remote comment publication is not implemented. **Disconnect GitHub** removes
+local credentials but does not revoke the grant at GitHub.
 
 With a valid GitHub session, enter a PR as `owner/repository#number` and choose
-**Open GitHub PR** to load its metadata, changed-file patches, and review
-comments. This is read-only; missing or oversized patches fail closed instead
-of showing an incomplete diff. Loading a remote PR does not send code to an
-evaluator and does not publish comments.
+**Open GitHub PR** to load its metadata, changed-file patches, review
+submissions, inline comment threads, and general conversation comments. Inline
+comments whose current line is absent but original line is known are marked as
+outdated locations; this does not mean the concern was resolved. This is
+read-only; missing or oversized patches fail closed instead of showing an
+incomplete diff. Loading a remote PR does not send code to an evaluator or
+publish comments.
 
 ## Run
 

@@ -139,9 +139,12 @@ The initial remote review journey identifies a PR with an explicit
 `owner/repository#number` supplied by the user. Do not infer the target PR
 repository from a local `origin`: a fork's `origin` can differ from the PR base
 repository. Use named GitHub API operations to read PR metadata, changed-file
-patches, and review comments. Follow only HTTPS pagination links on
-`api.github.com`, use bounded pages/responses/diffs, and fail closed when a
-patch is missing or incomplete. This first remote slice is read-only and does
-not invoke the evaluator or persist remote content. Publication remains a
-separate, explicitly confirmed feature; revisit repository discovery when a
-multi-repository chooser is designed.
+patches, review submissions, inline review comments, and issue-conversation
+comments. Preserve inline reply relationships by `in_reply_to_id`; a missing
+current line with an original line is shown as an outdated location, not as a
+resolved concern. Follow only HTTPS pagination links on `api.github.com`, use
+bounded pages/responses/diffs, and fail closed when a patch is missing or
+incomplete. This remote review slice is read-only and does not invoke the
+evaluator or persist remote content. Publication remains a separate, explicitly
+confirmed feature; revisit repository discovery when a multi-repository chooser
+is designed.
