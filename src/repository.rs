@@ -207,7 +207,6 @@ mod tests {
                 std::iter::empty::<gix::ObjectId>(),
             )
             .unwrap();
-        drop(repository);
         fs::write(directory.path().join("tracked.txt"), "after\n").unwrap();
 
         let snapshot = RepositorySnapshot::open(directory.path()).unwrap();
@@ -217,6 +216,24 @@ mod tests {
         assert!(snapshot.changed_files[0].patch.contains("-before"));
         assert!(snapshot.changed_files[0].patch.contains("+after"));
         assert_eq!(snapshot.changed_files[0].right_lines, [1]);
+
+        let staged_blob = repository.write_blob(b"staged\n").unwrap().detach();
+        let mut index = repository.index_from_tree(tree_id.as_ref()).unwrap();
+        index.entries_mut()[0].id = staged_blob;
+        index.remove_tree();
+        index.write(gix::index::write::Options::default()).unwrap();
+        fs::write(directory.path().join("tracked.txt"), "staged\n").unwrap();
+        let index_path = directory.path().join(".git/index");
+        let index_before_open = fs::read(&index_path).unwrap();
+
+        let staged_snapshot = RepositorySnapshot::open(directory.path()).unwrap();
+
+        assert_eq!(staged_snapshot.changed_paths, ["tracked.txt"]);
+        assert_eq!(staged_snapshot.changed_files.len(), 1);
+        assert!(staged_snapshot.changed_files[0].patch.contains("-before"));
+        assert!(staged_snapshot.changed_files[0].patch.contains("+staged"));
+        assert_eq!(staged_snapshot.changed_files[0].right_lines, [1]);
+        assert_eq!(fs::read(index_path).unwrap(), index_before_open);
     }
 
     #[test]
