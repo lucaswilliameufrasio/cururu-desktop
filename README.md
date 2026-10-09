@@ -6,7 +6,8 @@ updates adopt engine changes explicitly; no crate release is required.
 
 ## Current slice
 
-The first vertical slice is a GPUI feasibility pass for the review workspace:
+The current desktop slice includes local review, read-only GitHub PR context,
+and a dual-provider second-opinion workflow. The review workspace includes:
 
 - a repository file rail;
 - a virtualized diff with 10,000 rows;
@@ -57,6 +58,19 @@ the comment's original commit. Missing or oversized patches fail closed instead
 of showing an incomplete diff. Remote source is fetched only on selection and
 kept in memory. Loading a remote PR does not send code to an evaluator or
 publish comments.
+
+“Understand a review” can optionally run a second opinion through both a
+user-configured OpenAI-compatible chat-completions endpoint and Jev. Configure
+both models and enter both API keys in that mode; keys are stored only in the
+OS keyring, while non-secret settings stay in local SQLite. The app requires
+explicit local authorization for the exact `owner/repository` and provider
+configuration, then a separate **Send this bounded thread** action. That
+action sends the selected inline thread, a small source excerpt at the comment
+commit, and at most 2,500 diff characters to both providers. Calls run
+concurrently with a 2-minute deadline; no partial result is shown if either
+provider fails. Results are informational only: they never filter findings,
+modify code, or publish the draft reply. No evaluator is contacted during PR
+loading or comment selection.
 
 ## Run
 

@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod evaluator;
 pub mod github_auth;
 pub mod github_pr;
 pub mod repository;
@@ -75,9 +76,49 @@ struct ReviewWorkspace {
     remote_review_state: RemoteReviewState,
     remote_source_context: RemoteSourceContextState,
     review_mode: ReviewMode,
+    selected_remote_comment: Option<github_pr::PullRequestComment>,
+    evaluator_settings: Option<session_store::EvaluatorSettings>,
+    evaluator_notice: Option<SharedString>,
+    evaluator_endpoint_input: Option<Entity<InputState>>,
+    evaluator_openai_model_input: Option<Entity<InputState>>,
+    evaluator_jev_model_input: Option<Entity<InputState>>,
+    evaluator_openai_key_input: Option<Entity<InputState>>,
+    evaluator_jev_key_input: Option<Entity<InputState>>,
+    evaluator_result: Option<evaluator::CombinedReviewAnalysis>,
+    evaluator_result_comment_id: Option<u64>,
+    is_evaluator_running: bool,
+    evaluator_authorized_repository: Option<String>,
+    active_evaluator_context: Option<EvaluatorRequestContext>,
+    next_evaluator_request_id: u64,
     selected_file: Option<usize>,
     selected_line: usize,
     diff_scroll_handle: UniformListScrollHandle,
+}
+
+#[derive(Clone)]
+struct EvaluatorSettingsInputs {
+    endpoint: Option<Entity<InputState>>,
+    openai_model: Option<Entity<InputState>>,
+    jev_model: Option<Entity<InputState>>,
+    openai_key: Option<Entity<InputState>>,
+    jev_key: Option<Entity<InputState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvaluatorRequestContext {
+    request_id: u64,
+    repository_identity: String,
+    comment_id: u64,
+    config_fingerprint: String,
+}
+
+#[derive(Clone)]
+struct EvaluatorAnalysisRequest {
+    settings: session_store::EvaluatorSettings,
+    repository_identity: String,
+    config_fingerprint: String,
+    input: evaluator::ReviewAnalysisInput,
+    comment_id: u64,
 }
 
 enum GitHubAuthState {
@@ -196,6 +237,20 @@ impl ReviewWorkspace {
             remote_review_state: RemoteReviewState::Idle,
             remote_source_context: RemoteSourceContextState::Idle,
             review_mode: ReviewMode::ReviewChanges,
+            selected_remote_comment: None,
+            evaluator_settings: None,
+            evaluator_notice: None,
+            evaluator_endpoint_input: None,
+            evaluator_openai_model_input: None,
+            evaluator_jev_model_input: None,
+            evaluator_openai_key_input: None,
+            evaluator_jev_key_input: None,
+            evaluator_result: None,
+            evaluator_result_comment_id: None,
+            is_evaluator_running: false,
+            evaluator_authorized_repository: None,
+            active_evaluator_context: None,
+            next_evaluator_request_id: 0,
             selected_file: Some(0),
             selected_line: 42,
             diff_scroll_handle: UniformListScrollHandle::new(),
@@ -206,6 +261,13 @@ impl ReviewWorkspace {
         let mut workspace = Self::sample();
         match session_store::SessionStore::open_default() {
             Ok(store) => {
+                match store.evaluator_settings() {
+                    Ok(settings) => workspace.evaluator_settings = settings,
+                    Err(error) => {
+                        workspace.evaluator_notice =
+                            Some(format!("Could not read evaluator settings: {error}").into());
+                    }
+                }
                 match store.most_recent() {
                     Ok(session) => workspace.last_session = session,
                     Err(error) => {
@@ -612,6 +674,53 @@ impl Render for ReviewWorkspace {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
             }));
         }
+        if self.evaluator_endpoint_input.is_none() {
+            let value = self
+                .evaluator_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| settings.openai_endpoint.clone());
+            self.evaluator_endpoint_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("https://provider.example/v1/chat/completions")
+                    .default_value(value)
+            }));
+        }
+        if self.evaluator_openai_model_input.is_none() {
+            let value = self
+                .evaluator_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| settings.openai_model.clone());
+            self.evaluator_openai_model_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("OpenAI-compatible model (required)")
+                    .default_value(value)
+            }));
+        }
+        if self.evaluator_jev_model_input.is_none() {
+            let value = self
+                .evaluator_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| settings.jev_model.clone());
+            self.evaluator_jev_model_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("Jev model (required)")
+                    .default_value(value)
+            }));
+        }
+        if self.evaluator_openai_key_input.is_none() {
+            self.evaluator_openai_key_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("OpenAI-compatible API key")
+                    .masked(true)
+            }));
+        }
+        if self.evaluator_jev_key_input.is_none() {
+            self.evaluator_jev_key_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("Jev API key")
+                    .masked(true)
+            }));
+        }
         div()
             .flex()
             .flex_col()
@@ -622,6 +731,10 @@ impl Render for ReviewWorkspace {
             .child(self.render_mode_switch(cx))
             .child(self.render_github_auth_status())
             .child(self.render_pull_request_loader(cx))
+            .children(
+                (self.review_mode == ReviewMode::UnderstandReview)
+                    .then(|| self.render_evaluator_settings(cx)),
+            )
             .children(self.notice.clone().map(|notice| {
                 div()
                     .px_4()
@@ -649,6 +762,56 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn render_evaluator_settings(&self, cx: &Context<Self>) -> impl IntoElement {
+        let endpoint = self.evaluator_endpoint_input.as_ref().map(TextInput::new);
+        let openai_model = self
+            .evaluator_openai_model_input
+            .as_ref()
+            .map(TextInput::new);
+        let jev_model = self.evaluator_jev_model_input.as_ref().map(TextInput::new);
+        let openai_key = self.evaluator_openai_key_input.as_ref().map(TextInput::new);
+        let jev_key = self.evaluator_jev_key_input.as_ref().map(TextInput::new);
+        let entity = cx.entity();
+        let inputs = EvaluatorSettingsInputs {
+            endpoint: self.evaluator_endpoint_input.clone(),
+            openai_model: self.evaluator_openai_model_input.clone(),
+            jev_model: self.evaluator_jev_model_input.clone(),
+            openai_key: self.evaluator_openai_key_input.clone(),
+            jev_key: self.evaluator_jev_key_input.clone(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x002b_3946))
+            .child("Second opinion · both providers receive the selected review context")
+            .children(endpoint)
+            .children(openai_model)
+            .children(jev_model)
+            .children(openai_key)
+            .children(jev_key)
+            .child(
+                div()
+                    .id("save-evaluator-configuration")
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(0x0026_3442))
+                    .cursor_pointer()
+                    .child("Save both providers (keys stored in OS keyring)")
+                    .on_click(move |_event, window, cx| {
+                        save_evaluator_configuration(&entity, inputs.clone(), window, cx);
+                    }),
+            )
+            .children(
+                self.evaluator_notice
+                    .clone()
+                    .map(|notice| div().text_color(rgb(0x00b8_dfc4)).child(notice)),
+            )
+    }
+
     fn render_mode_switch(&self, cx: &Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let modes = [
@@ -766,6 +929,12 @@ impl ReviewWorkspace {
                             }
                             this.notice = Some("Loading pull request from GitHub…".into());
                             this.remote_source_context = RemoteSourceContextState::Idle;
+                            this.selected_remote_comment = None;
+                            this.evaluator_authorized_repository = None;
+                            this.evaluator_result = None;
+                            this.evaluator_result_comment_id = None;
+                            this.active_evaluator_context = None;
+                            this.is_evaluator_running = false;
                             this.remote_review_state =
                                 RemoteReviewState::Loading(reference.clone());
                             cx.notify();
@@ -1313,6 +1482,7 @@ impl ReviewWorkspace {
                             .iter()
                             .map(render_remote_conversation_comment),
                     )
+                    .child(self.render_evaluator_action(cx, snapshot))
             }
             (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
                 .flex()
@@ -1336,6 +1506,105 @@ impl ReviewWorkspace {
                 .gap_2()
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
+    }
+
+    fn render_evaluator_action(
+        &self,
+        cx: &Context<Self>,
+        snapshot: &github_pr::PullRequestSnapshot,
+    ) -> impl IntoElement {
+        let Some(settings) = self.evaluator_settings.clone() else {
+            return div()
+                .p_2()
+                .text_color(rgb(0x00e5_b6ba))
+                .child("Configure both evaluator providers above before analysis.");
+        };
+        let Some(comment) = self.selected_remote_comment.clone() else {
+            return div()
+                .p_2()
+                .text_color(rgb(0x009b_aaba))
+                .child("Select an inline review comment to prepare a second opinion.");
+        };
+        let source = match &self.remote_source_context {
+            RemoteSourceContextState::Loaded {
+                comment_id,
+                source,
+                anchor_line,
+            } if *comment_id == comment.id => Some((source.clone(), *anchor_line)),
+            _ => None,
+        };
+        let Some((source, anchor_line)) = source else {
+            return div()
+                .p_2()
+                .text_color(rgb(0x009b_aaba))
+                .child("Select a comment and wait for its source-at-commit context to load.");
+        };
+        let identity = format!(
+            "{}/{}",
+            snapshot.reference.owner, snapshot.reference.repository
+        );
+        let fingerprint = match evaluator::DualReviewEvaluator::config_fingerprint(&settings) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return div()
+                    .p_2()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child(format!("Evaluator configuration is invalid: {error}"));
+            }
+        };
+        let is_authorized = self.evaluator_authorized_repository.as_deref() == Some(&identity);
+        let entity = cx.entity();
+        let authorization_button = render_evaluator_authorization_button(
+            entity.clone(),
+            self.session_store.clone(),
+            identity.clone(),
+            fingerprint.clone(),
+            is_authorized,
+        );
+        let authorization_status = if is_authorized {
+            "Local consent is active for this repository and provider configuration."
+        } else {
+            "Analysis is blocked until you explicitly authorize this repository locally."
+        };
+        let analysis_input =
+            build_review_analysis_input(snapshot, &comment, &source, anchor_line).ok();
+        let analysis_request = analysis_input.map(|input| EvaluatorAnalysisRequest {
+            settings: settings.clone(),
+            repository_identity: identity.clone(),
+            config_fingerprint: fingerprint.clone(),
+            input,
+            comment_id: comment.id,
+        });
+        let analysis_button = render_evaluator_send_button(
+            entity,
+            cx.http_client(),
+            analysis_request,
+            is_authorized && !self.is_evaluator_running,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_2()
+            .p_2()
+            .border_t_1()
+            .border_color(rgb(0x003b_4c5c))
+            .child("AI SECOND OPINION · never filters or publishes")
+            .child(format!(
+                "OpenAI-compatible: {} · {}",
+                settings.openai_model, settings.openai_endpoint
+            ))
+            .child(format!("Jev: {} · api.typesafe.ai", settings.jev_model))
+            .child("If you continue, both providers receive the selected comment, its inline thread, an excerpt from the source at the comment commit, and a bounded current diff. Remote text is treated as untrusted data.")
+            .child(authorization_status)
+            .child(authorization_button)
+            .child(analysis_button)
+            .children(
+                self.evaluator_result
+                    .as_ref()
+                    .filter(|_| self.evaluator_result_comment_id == Some(comment.id))
+                    .map(render_evaluator_result),
+            )
     }
 
     fn render_draft_controls(
@@ -1534,6 +1803,413 @@ impl ReviewWorkspace {
     }
 }
 
+fn render_evaluator_authorization_button(
+    entity: Entity<ReviewWorkspace>,
+    store: Option<session_store::SessionStore>,
+    identity: String,
+    fingerprint: String,
+    is_authorized: bool,
+) -> impl IntoElement {
+    let label = if is_authorized {
+        format!("Revoke local evaluator access for {identity}")
+    } else {
+        format!("Authorize local evaluator access for {identity}")
+    };
+    div()
+        .id("authorize-evaluator-repository")
+        .px_3()
+        .py_2()
+        .bg(rgb(0x0030_3b2e))
+        .cursor_pointer()
+        .child(label)
+        .on_click(move |_event, _window, cx| {
+            let Some(store) = store.clone() else {
+                entity.update(cx, |this, cx| {
+                    this.evaluator_notice = Some(
+                        "Local database is unavailable; authorization was not changed.".into(),
+                    );
+                    cx.notify();
+                });
+                return;
+            };
+            let entity_for_task = entity.clone();
+            let repository = identity.clone();
+            let fingerprint = fingerprint.clone();
+            let repository_for_store = repository.clone();
+            let fingerprint_for_store = fingerprint;
+            cx.spawn(async move |cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if is_authorized {
+                            store
+                                .revoke_evaluator_authorization(&repository_for_store)
+                                .map(|_| false)
+                        } else {
+                            store
+                                .authorize_evaluator(&repository_for_store, &fingerprint_for_store)
+                                .map(|()| true)
+                        }
+                    })
+                    .await;
+                let _ = entity_for_task.update(cx, |this, cx| {
+                    match result {
+                        Ok(true) => {
+                            this.evaluator_authorized_repository = Some(repository);
+                            this.evaluator_notice = Some(
+                                "Local authorization recorded. No code was sent; use the explicit analysis button below when ready."
+                                    .into(),
+                            );
+                        }
+                        Ok(false) => {
+                            this.evaluator_authorized_repository = None;
+                            this.evaluator_notice = Some(
+                                "Local evaluator authorization was revoked.".into(),
+                            );
+                        }
+                        Err(error) => this.evaluator_notice = Some(error.to_string().into()),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        })
+}
+
+fn render_evaluator_send_button(
+    entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    request: Option<EvaluatorAnalysisRequest>,
+    can_analyze: bool,
+) -> impl IntoElement {
+    div()
+        .id("send-thread-to-both-evaluators")
+        .px_3()
+        .py_2()
+        .bg(rgb(if can_analyze {
+            0x0030_3b2e
+        } else {
+            0x001b_2732
+        }))
+        .cursor_pointer()
+        .child("Send this bounded thread to OpenAI-compatible + Jev")
+        .on_click(move |_event, _window, cx| {
+            if !can_analyze {
+                return;
+            }
+            let Some(request) = request.clone() else {
+                return;
+            };
+            start_review_analysis(entity.clone(), http.clone(), request, cx);
+        })
+}
+
+fn build_review_analysis_input(
+    snapshot: &github_pr::PullRequestSnapshot,
+    comment: &github_pr::PullRequestComment,
+    source: &github_pr::PullRequestSourceFile,
+    anchor_line: Option<u32>,
+) -> anyhow::Result<evaluator::ReviewAnalysisInput> {
+    anyhow::ensure!(
+        source.path == comment.path,
+        "review source path does not match the selected comment"
+    );
+    anyhow::ensure!(
+        source.commit_sha == comment.original_commit_id,
+        "review source commit does not match the selected comment anchor"
+    );
+    let changed_file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == comment.path)
+        .context("selected comment file is not part of the loaded pull-request diff")?;
+    let thread = snapshot
+        .review_threads
+        .iter()
+        .find(|thread| {
+            thread.root.id == comment.id
+                || thread.replies.iter().any(|reply| reply.id == comment.id)
+        })
+        .context("selected inline comment no longer belongs to a loaded review thread")?;
+    let mut thread_context = Vec::new();
+    if thread.root.id != comment.id {
+        thread_context.push(thread.root.body.clone());
+    }
+    for reply in &thread.replies {
+        if reply.id != comment.id {
+            thread_context.push(reply.body.clone());
+        }
+    }
+    Ok(evaluator::ReviewAnalysisInput {
+        repository_identity: format!(
+            "{}/{}",
+            snapshot.reference.owner, snapshot.reference.repository
+        ),
+        path: comment.path.clone(),
+        line: comment.line.or(comment.original_line),
+        comment_body: comment.body.clone(),
+        thread_context,
+        source_at_comment: source_excerpt(&source.content, anchor_line),
+        current_diff: changed_file.patch.chars().take(2_500).collect(),
+    })
+}
+
+fn save_evaluator_configuration(
+    entity: &Entity<ReviewWorkspace>,
+    inputs: EvaluatorSettingsInputs,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (
+        Some(endpoint_input),
+        Some(openai_model_input),
+        Some(jev_model_input),
+        Some(openai_key_input),
+        Some(jev_key_input),
+    ) = (
+        inputs.endpoint,
+        inputs.openai_model,
+        inputs.jev_model,
+        inputs.openai_key,
+        inputs.jev_key,
+    )
+    else {
+        return;
+    };
+    let settings = session_store::EvaluatorSettings {
+        openai_endpoint: endpoint_input.read(cx).value().to_string(),
+        openai_model: openai_model_input.read(cx).value().to_string(),
+        jev_model: jev_model_input.read(cx).value().to_string(),
+    };
+    let openai_secret = openai_key_input.read(cx).value().to_string();
+    let jev_secret = jev_key_input.read(cx).value().to_string();
+    for input in [&openai_key_input, &jev_key_input] {
+        input.update(cx, |state, input_cx| {
+            state.set_value("", window, input_cx);
+        });
+    }
+    let store = entity.read(cx).session_store.clone();
+    let Some(store) = store else {
+        entity.update(cx, |this, cx| {
+            this.evaluator_notice =
+                Some("Local database is unavailable; evaluator settings were not saved.".into());
+            cx.notify();
+        });
+        return;
+    };
+    entity.update(cx, |this, cx| {
+        this.evaluator_notice = Some("Saving both evaluator configurations…".into());
+        cx.notify();
+    });
+    let entity_for_task = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                evaluator::DualReviewEvaluator::config_fingerprint(&settings)?;
+                anyhow::ensure!(
+                    !openai_secret.is_empty() && !jev_secret.is_empty(),
+                    "enter both provider API keys to save the configuration"
+                );
+                store.save_evaluator_settings(&settings)?;
+                evaluator::EvaluatorSecrets::save(&openai_secret, &jev_secret)?;
+                Ok::<_, anyhow::Error>(settings)
+            })
+            .await;
+        let _ = entity_for_task.update(cx, |this, cx| {
+            match result {
+                Ok(settings) => {
+                    this.evaluator_settings = Some(settings);
+                    this.evaluator_authorized_repository = None;
+                    this.evaluator_result = None;
+                    this.evaluator_result_comment_id = None;
+                    this.active_evaluator_context = None;
+                    this.is_evaluator_running = false;
+                    this.evaluator_notice = Some(
+                        "Both providers are configured; keys were saved only in the OS keyring."
+                            .into(),
+                    );
+                }
+                Err(error) => this.evaluator_notice = Some(error.to_string().into()),
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn render_evaluator_result(result: &evaluator::CombinedReviewAnalysis) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .mt_2()
+        .p_2()
+        .bg(rgb(0x0011_1820))
+        .child(format!(
+            "SECOND OPINION · {} + {}",
+            result.openai_model, result.jev.model
+        ))
+        .child(format!(
+            "{} · Jev defect probability {:.0}% · severity {}{}",
+            match result.explanation.classification {
+                evaluator::ClaimClassification::Sustained => "Sustained",
+                evaluator::ClaimClassification::Contradicted => "Contradicted",
+                evaluator::ClaimClassification::InsufficientContext => "Insufficient context",
+                evaluator::ClaimClassification::PreferenceTradeoff => "Preference / trade-off",
+                evaluator::ClaimClassification::AlreadyFixed => "Already fixed",
+            },
+            result.jev.defect_probability * 100.0,
+            result.jev.severity,
+            result
+                .jev
+                .severity_confidence
+                .map_or_else(String::new, |confidence| {
+                    format!(" · confidence {:.0}%", confidence * 100.0)
+                })
+        ))
+        .child(result.explanation.explanation.clone())
+        .child(format!("Claims: {}", result.explanation.claims.join(" · ")))
+        .child(format!(
+            "Evidence: {}",
+            result.explanation.evidence.join(" · ")
+        ))
+        .child(format!(
+            "Conditions: {}",
+            result.explanation.conditions.join(" · ")
+        ))
+        .child(format!(
+            "Verification: {}",
+            result.explanation.verification_steps.join(" · ")
+        ))
+        .child(format!(
+            "Uncertainties: {}",
+            result.explanation.uncertainties.join(" · ")
+        ))
+        .child(format!(
+            "Draft reply (not published): {}",
+            result.explanation.draft_response
+        ))
+}
+
+fn start_review_analysis(
+    entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    request: EvaluatorAnalysisRequest,
+    cx: &mut App,
+) {
+    let store = entity.read(cx).session_store.clone();
+    let Some(store) = store else {
+        entity.update(cx, |this, cx| {
+            this.evaluator_notice =
+                Some("Local database unavailable; evaluation is blocked.".into());
+            cx.notify();
+        });
+        return;
+    };
+    let request_context = entity.update(cx, |this, cx| {
+        this.next_evaluator_request_id = this.next_evaluator_request_id.saturating_add(1);
+        let request_context = EvaluatorRequestContext {
+            request_id: this.next_evaluator_request_id,
+            ..evaluator_request_context(&request)
+        };
+        this.is_evaluator_running = true;
+        this.evaluator_result = None;
+        this.evaluator_result_comment_id = None;
+        this.active_evaluator_context = Some(request_context.clone());
+        this.evaluator_notice = Some(
+            "Sending bounded review context to both configured providers; waiting for both results…"
+                .into(),
+        );
+        cx.notify();
+        request_context
+    });
+    cx.spawn(async move |cx| {
+        let executor = cx.background_executor();
+        let result = run_review_analysis(store, http, request.clone(), executor).await;
+        let _ = entity.update(cx, |this, cx| {
+            if this.active_evaluator_context.as_ref() != Some(&request_context) {
+                return;
+            }
+            let current_repository = match &this.remote_review_state {
+                RemoteReviewState::Loaded(snapshot) => format!(
+                    "{}/{}",
+                    snapshot.reference.owner, snapshot.reference.repository
+                )
+                .to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            let current_fingerprint = this.evaluator_settings.as_ref().and_then(|current| {
+                evaluator::DualReviewEvaluator::config_fingerprint(current).ok()
+            });
+            let still_matches = current_repository == request_context.repository_identity
+                && this
+                    .selected_remote_comment
+                    .as_ref()
+                    .is_some_and(|comment| comment.id == request_context.comment_id)
+                && current_fingerprint.as_deref()
+                    == Some(request_context.config_fingerprint.as_str());
+            this.is_evaluator_running = false;
+            this.active_evaluator_context = None;
+            if !still_matches {
+                return;
+            }
+            match result {
+                Ok(analysis) => {
+                    this.evaluator_result = Some(analysis);
+                    this.evaluator_result_comment_id = Some(request.comment_id);
+                    this.evaluator_notice = Some(
+                        "Both providers completed. This is informational only; no finding was filtered and nothing was published."
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    this.evaluator_result = None;
+                    this.evaluator_result_comment_id = None;
+                    this.evaluator_notice = Some(
+                        format!("No combined result is shown because both providers must succeed: {error}")
+                            .into(),
+                    );
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn evaluator_request_context(request: &EvaluatorAnalysisRequest) -> EvaluatorRequestContext {
+    EvaluatorRequestContext {
+        request_id: 0,
+        repository_identity: request.repository_identity.to_ascii_lowercase(),
+        comment_id: request.comment_id,
+        config_fingerprint: request.config_fingerprint.clone(),
+    }
+}
+
+async fn run_review_analysis(
+    store: session_store::SessionStore,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    request: EvaluatorAnalysisRequest,
+    executor: &BackgroundExecutor,
+) -> anyhow::Result<evaluator::CombinedReviewAnalysis> {
+    let repository_identity = request.repository_identity.clone();
+    let config_fingerprint = request.config_fingerprint.clone();
+    let authorized = executor
+        .spawn(
+            async move { store.evaluator_is_authorized(&repository_identity, &config_fingerprint) },
+        )
+        .await?;
+    anyhow::ensure!(
+        authorized,
+        "local authorization is missing or no longer matches this repository/provider configuration"
+    );
+    let secrets = evaluator::EvaluatorSecrets::load()?
+        .context("both provider keys must be available in the OS keyring")?;
+    let client = evaluator::DualReviewEvaluator::new(http, request.settings, secrets)?;
+    with_evaluator_timeout(client.analyze(&request.input), executor).await
+}
+
 fn start_pull_request_load(
     entity: Entity<ReviewWorkspace>,
     http: Arc<dyn gpui::http_client::HttpClient>,
@@ -1661,6 +2337,21 @@ async fn with_network_timeout<T>(
     }
 }
 
+async fn with_evaluator_timeout<T>(
+    operation: impl Future<Output = anyhow::Result<T>>,
+    executor: &BackgroundExecutor,
+) -> anyhow::Result<T> {
+    let timeout = executor.timer(Duration::from_secs(120));
+    futures::pin_mut!(operation);
+    futures::pin_mut!(timeout);
+    match futures::future::select(operation, timeout).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), _)) => {
+            anyhow::bail!("dual evaluator analysis timed out after 2 minutes")
+        }
+    }
+}
+
 fn render_remote_review_summary(review: &github_pr::PullRequestReview) -> impl IntoElement {
     div()
         .p_2()
@@ -1749,6 +2440,9 @@ fn render_remote_inline_comment(
             let clicked_comment = comment_for_click.clone();
             entity.update(cx, |this, cx| {
                 let found_in_diff = this.focus_remote_comment(&clicked_comment);
+                this.selected_remote_comment = Some(clicked_comment.clone());
+                this.evaluator_result = None;
+                this.evaluator_result_comment_id = None;
                 this.begin_source_context_load(&clicked_comment);
                 if !found_in_diff {
                     this.notice = Some(
