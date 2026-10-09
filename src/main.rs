@@ -1,9 +1,20 @@
+use anyhow::Context as _;
 use gpui::{
-    App, Application, Bounds, Context, Entity, PathPromptOptions, Render, SharedString, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size, uniform_list,
+    App, Application, BackgroundExecutor, Bounds, Context, Entity, PathPromptOptions, Render,
+    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    uniform_list,
 };
 use gpui_component::input::{InputState, TextInput};
-use std::{fmt::Write as _, ops::Range, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    ops::Range,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 pub mod github_auth;
 pub mod repository;
@@ -55,8 +66,30 @@ struct ReviewWorkspace {
     comment_drafts: Vec<session_store::StoredCommentDraft>,
     editing_draft: Option<session_store::StoredCommentDraft>,
     draft_input: Option<Entity<InputState>>,
+    github_app_client_id: Option<String>,
+    github_auth_state: GitHubAuthState,
+    github_credentials: Option<github_auth::StoredCredentials>,
     selected_file: Option<usize>,
     selected_line: usize,
+}
+
+enum GitHubAuthState {
+    Uninitialized,
+    CheckingCredentials,
+    SignedOut,
+    StartingDeviceFlow,
+    AwaitingDeviceAuthorization {
+        user_code: String,
+        verification_url: String,
+        expires_at: Instant,
+        cancel: Arc<AtomicBool>,
+    },
+    RefreshingToken,
+    SavingCredentials,
+    SignedIn,
+    ReauthorizationRequired,
+    Disconnecting,
+    Failed(SharedString),
 }
 
 impl ReviewWorkspace {
@@ -83,6 +116,9 @@ impl ReviewWorkspace {
             comment_drafts: Vec::new(),
             editing_draft: None,
             draft_input: None,
+            github_app_client_id: std::env::var("CURURU_GITHUB_APP_CLIENT_ID").ok(),
+            github_auth_state: GitHubAuthState::Uninitialized,
+            github_credentials: None,
             selected_file: Some(0),
             selected_line: 42,
         }
@@ -423,6 +459,7 @@ fn sample_unified_diff() -> String {
 
 impl Render for ReviewWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_github_credentials_loaded(cx);
         if self.draft_input.is_none() {
             self.draft_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx)
@@ -438,6 +475,7 @@ impl Render for ReviewWorkspace {
             .bg(rgb(0x0011_1820))
             .text_color(rgb(0x00d5_dee8))
             .child(self.render_header(cx))
+            .child(self.render_github_auth_status())
             .children(self.notice.clone().map(|notice| {
                 div()
                     .px_4()
@@ -465,6 +503,136 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn handle_github_auth_action(
+        &mut self,
+        http: Arc<dyn gpui::http_client::HttpClient>,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.github_auth_state {
+            GitHubAuthState::AwaitingDeviceAuthorization { cancel, .. } => {
+                cancel.store(true, Ordering::Release);
+                self.github_auth_state = GitHubAuthState::SignedOut;
+                self.notice = Some("GitHub sign-in cancelled.".into());
+                cx.notify();
+            }
+            GitHubAuthState::SignedIn => {
+                self.github_auth_state = GitHubAuthState::Disconnecting;
+                let entity = cx.entity();
+                start_github_disconnect(entity, cx);
+            }
+            GitHubAuthState::ReauthorizationRequired => {
+                let (Some(client_id), Some(credentials)) = (
+                    self.github_app_client_id.clone(),
+                    self.github_credentials.clone(),
+                ) else {
+                    self.github_auth_state = GitHubAuthState::Failed(
+                        "Configure CURURU_GITHUB_APP_CLIENT_ID before connecting GitHub.".into(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                self.github_auth_state = GitHubAuthState::RefreshingToken;
+                start_github_refresh(cx.entity(), client_id, http, credentials, cx);
+            }
+            GitHubAuthState::SignedOut | GitHubAuthState::Failed(_) => {
+                let Some(client_id) = self.github_app_client_id.clone() else {
+                    self.github_auth_state = GitHubAuthState::Failed(
+                        "Configure CURURU_GITHUB_APP_CLIENT_ID before connecting GitHub.".into(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                self.github_auth_state = GitHubAuthState::StartingDeviceFlow;
+                start_github_device_login(cx.entity(), client_id, http, cx);
+            }
+            GitHubAuthState::Uninitialized
+            | GitHubAuthState::CheckingCredentials
+            | GitHubAuthState::StartingDeviceFlow
+            | GitHubAuthState::RefreshingToken
+            | GitHubAuthState::SavingCredentials
+            | GitHubAuthState::Disconnecting => {}
+        }
+    }
+
+    fn ensure_github_credentials_loaded(&mut self, cx: &Context<Self>) {
+        if !matches!(self.github_auth_state, GitHubAuthState::Uninitialized) {
+            return;
+        }
+        self.github_auth_state = GitHubAuthState::CheckingCredentials;
+        let entity = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { github_auth::CredentialStore::load() })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(credentials)) => {
+                        this.github_auth_state = if credentials.access_token_is_expired() {
+                            GitHubAuthState::ReauthorizationRequired
+                        } else {
+                            GitHubAuthState::SignedIn
+                        };
+                        this.github_credentials = Some(credentials);
+                    }
+                    Ok(None) => {
+                        this.github_auth_state = GitHubAuthState::SignedOut;
+                    }
+                    Err(error) => {
+                        this.github_auth_state = GitHubAuthState::Failed(
+                            format!("Could not access the OS credential store: {error}").into(),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_github_auth_status(&self) -> impl IntoElement {
+        let message = match &self.github_auth_state {
+            GitHubAuthState::Uninitialized | GitHubAuthState::CheckingCredentials => {
+                Some("Checking the operating-system credential store…".to_string())
+            }
+            GitHubAuthState::StartingDeviceFlow => {
+                Some("Requesting a GitHub device code…".to_string())
+            }
+            GitHubAuthState::AwaitingDeviceAuthorization {
+                user_code,
+                verification_url,
+                expires_at,
+                ..
+            } => Some(format!(
+                "Enter {user_code} at {verification_url} to authorize Cururu · expires in {}s.",
+                expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+            )),
+            GitHubAuthState::RefreshingToken => Some("Refreshing the GitHub session…".to_string()),
+            GitHubAuthState::SavingCredentials => {
+                Some("Saving credentials to the OS keyring…".to_string())
+            }
+            GitHubAuthState::SignedIn => {
+                Some("GitHub connected · publication still requires confirmation.".to_string())
+            }
+            GitHubAuthState::ReauthorizationRequired => {
+                Some("GitHub session expired. Try refreshing or reconnecting.".to_string())
+            }
+            GitHubAuthState::Disconnecting => Some("Removing GitHub credentials…".to_string()),
+            GitHubAuthState::Failed(message) => Some(message.to_string()),
+            GitHubAuthState::SignedOut => Some(
+                "GitHub is not connected · the app requests Contents read and Pull requests read/write."
+                    .to_string(),
+            ),
+        };
+        div()
+            .px_4()
+            .py_2()
+            .text_color(rgb(0x009b_aaba))
+            .children(message)
+    }
+
     fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let subtitle = match (&self.repository_root, &self.branch) {
             (Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
@@ -530,6 +698,7 @@ impl ReviewWorkspace {
                     start_repository_picker(cx, entity, store.clone());
                 }
             });
+        let auth_button = self.render_github_auth_button(cx);
         div()
             .flex()
             .items_center()
@@ -551,8 +720,39 @@ impl ReviewWorkspace {
                     .flex()
                     .gap_2()
                     .children(reopen_button)
+                    .child(auth_button)
                     .child(open_button),
             )
+    }
+
+    fn render_github_auth_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let label = match self.github_auth_state {
+            GitHubAuthState::SignedIn => "Disconnect GitHub",
+            GitHubAuthState::AwaitingDeviceAuthorization { .. } => "Cancel sign-in",
+            GitHubAuthState::StartingDeviceFlow => "Connecting…",
+            GitHubAuthState::RefreshingToken => "Refreshing…",
+            GitHubAuthState::SavingCredentials => "Saving credentials…",
+            GitHubAuthState::Disconnecting => "Disconnecting…",
+            GitHubAuthState::CheckingCredentials | GitHubAuthState::Uninitialized => {
+                "Checking GitHub…"
+            }
+            GitHubAuthState::ReauthorizationRequired => "Refresh GitHub session",
+            GitHubAuthState::SignedOut | GitHubAuthState::Failed(_) => "Connect GitHub",
+        };
+        let entity = cx.entity();
+        let http = cx.http_client();
+        div()
+            .id("github-auth-action")
+            .px_3()
+            .py_2()
+            .bg(rgb(0x0020_2b36))
+            .cursor_pointer()
+            .child(label)
+            .on_click(move |_event, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.handle_github_auth_action(http.clone(), cx);
+                });
+            })
     }
 
     fn render_file_rail(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -943,6 +1143,165 @@ impl ReviewWorkspace {
                 )
         })
     }
+}
+
+fn start_github_device_login(
+    entity: Entity<ReviewWorkspace>,
+    client_id: String,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    cx: &Context<ReviewWorkspace>,
+) {
+    cx.spawn(async move |_this, cx| {
+        let task_entity = entity.clone();
+        let result = async {
+            let flow = github_auth::GitHubDeviceFlow::new(client_id, http)?;
+            let authorization = flow.request_device_code().await?;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let verification_url = authorization.verification_uri.to_string();
+            cx.update(|app| app.open_url(&verification_url))
+                .context("could not open the GitHub device verification page")?;
+            entity.update(cx, |this, cx| {
+                this.github_auth_state = GitHubAuthState::AwaitingDeviceAuthorization {
+                    user_code: authorization.user_code.clone(),
+                    verification_url,
+                    expires_at: authorization.expires_at,
+                    cancel: cancel.clone(),
+                };
+                cx.notify();
+            })?;
+            let Some(credentials) = poll_for_device_authorization(
+                &flow,
+                &authorization,
+                &cancel,
+                cx.background_executor(),
+            )
+            .await?
+            else {
+                entity.update(cx, |this, cx| {
+                    this.github_auth_state = GitHubAuthState::SignedOut;
+                    this.notice = Some("GitHub sign-in cancelled.".into());
+                    cx.notify();
+                })?;
+                return Ok::<(), anyhow::Error>(());
+            };
+            entity.update(cx, |this, cx| {
+                this.github_auth_state = GitHubAuthState::SavingCredentials;
+                cx.notify();
+            })?;
+            let credentials_to_store = credentials.clone();
+            cx.background_executor()
+                .spawn(async move { github_auth::CredentialStore::save(&credentials_to_store) })
+                .await?;
+            entity.update(cx, |this, cx| {
+                this.github_credentials = Some(credentials);
+                this.github_auth_state = GitHubAuthState::SignedIn;
+                this.notice =
+                    Some("GitHub connected. Remote actions still need confirmation.".into());
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = task_entity.update(cx, |this, cx| {
+                this.github_auth_state =
+                    GitHubAuthState::Failed(format!("GitHub sign-in failed: {error}").into());
+                cx.notify();
+            });
+        }
+    })
+    .detach();
+}
+
+async fn poll_for_device_authorization(
+    flow: &github_auth::GitHubDeviceFlow,
+    authorization: &github_auth::DeviceAuthorization,
+    cancel: &AtomicBool,
+    executor: &BackgroundExecutor,
+) -> anyhow::Result<Option<github_auth::StoredCredentials>> {
+    let mut interval = authorization.polling_interval;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if Instant::now() >= authorization.expires_at {
+            anyhow::bail!("GitHub device code expired; start sign-in again");
+        }
+        executor.timer(interval).await;
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match flow.poll(authorization).await? {
+            github_auth::DevicePoll::Pending => {}
+            github_auth::DevicePoll::SlowDown => {
+                interval += Duration::from_secs(5);
+            }
+            github_auth::DevicePoll::Authorized(credentials) => return Ok(Some(credentials)),
+        }
+    }
+}
+
+fn start_github_refresh(
+    entity: Entity<ReviewWorkspace>,
+    client_id: String,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    credentials: github_auth::StoredCredentials,
+    cx: &Context<ReviewWorkspace>,
+) {
+    cx.spawn(async move |_this, cx| {
+        let task_entity = entity.clone();
+        let result = async {
+            let flow = github_auth::GitHubDeviceFlow::new(client_id, http)?;
+            let refreshed = flow.refresh(&credentials).await?;
+            let refreshed_to_store = refreshed.clone();
+            cx.background_executor()
+                .spawn(async move { github_auth::CredentialStore::save(&refreshed_to_store) })
+                .await?;
+            entity.update(cx, |this, cx| {
+                this.github_credentials = Some(refreshed);
+                this.github_auth_state = GitHubAuthState::SignedIn;
+                this.notice = Some("GitHub session refreshed.".into());
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = task_entity.update(cx, |this, cx| {
+                this.github_auth_state = GitHubAuthState::SignedOut;
+                this.session_store_error = Some(
+                    format!("Could not refresh GitHub session; sign in again: {error}").into(),
+                );
+                cx.notify();
+            });
+        }
+    })
+    .detach();
+}
+
+fn start_github_disconnect(entity: Entity<ReviewWorkspace>, cx: &Context<ReviewWorkspace>) {
+    cx.spawn(async move |_this, cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async { github_auth::CredentialStore::delete() })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            match result {
+                Ok(()) => {
+                    this.github_credentials = None;
+                    this.github_auth_state = GitHubAuthState::SignedOut;
+                    this.notice = Some("GitHub disconnected and local credentials removed.".into());
+                }
+                Err(error) => {
+                    this.github_auth_state = GitHubAuthState::Failed(
+                        format!("Could not remove GitHub credentials: {error}").into(),
+                    );
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 fn delete_comment_draft(
