@@ -142,6 +142,7 @@ fn ensure_file_size(path: &str, file_size: u64, total_input_bytes: &mut u64) -> 
 #[cfg(test)]
 mod tests {
     use super::RepositorySnapshot;
+    use gix::bstr::ByteSlice;
     use std::fs;
     #[test]
     fn opening_a_repository_reads_worktree_status_without_writing_the_index() {
@@ -176,6 +177,46 @@ mod tests {
 
         assert_eq!(snapshot.changed_paths.len(), 0);
         assert_eq!(snapshot.changed_files.len(), 0);
+    }
+
+    #[test]
+    fn opening_a_repository_renders_a_tracked_worktree_modification() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = gix::init(directory.path()).unwrap();
+        let blob_id = repository.write_blob(b"before\n").unwrap().detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: (0o100_644).try_into().unwrap(),
+                filename: "tracked.txt".into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id = repository.write_object(&tree).unwrap().detach();
+        let actor = gix::actor::SignatureRef {
+            name: b"Cururu Test".as_bstr(),
+            email: b"cururu@example.test".as_bstr(),
+            time: "1 +0000",
+        };
+        repository
+            .commit_as(
+                actor,
+                actor,
+                "refs/heads/main",
+                "base commit",
+                tree_id,
+                std::iter::empty::<gix::ObjectId>(),
+            )
+            .unwrap();
+        drop(repository);
+        fs::write(directory.path().join("tracked.txt"), "after\n").unwrap();
+
+        let snapshot = RepositorySnapshot::open(directory.path()).unwrap();
+
+        assert_eq!(snapshot.changed_paths, ["tracked.txt"]);
+        assert_eq!(snapshot.changed_files.len(), 1);
+        assert!(snapshot.changed_files[0].patch.contains("-before"));
+        assert!(snapshot.changed_files[0].patch.contains("+after"));
+        assert_eq!(snapshot.changed_files[0].right_lines, [1]);
     }
 
     #[test]
