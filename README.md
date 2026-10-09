@@ -13,8 +13,9 @@ The first vertical slice is a GPUI feasibility pass for the review workspace:
 - selectable source lines and a finding detail pane.
 
 Without an argument, the app renders a 10,000-row synthetic unified diff parsed
-through the pinned `cururu-core` parser. This sample does not access a
-repository, SCM credentials, an evaluator, or external services.
+through the pinned `cururu-core` parser. The sample does not access a
+repository or evaluator; GitHub is contacted only if you explicitly choose
+**Connect GitHub**.
 
 Local Git access uses the embedded `gix` library rather than a Git subprocess.
 Open a worktree with the **Open repository…** folder picker, or from the command
@@ -27,8 +28,9 @@ paths are not rendered.
 
 The app records the most recently opened repository's path, branch, and HEAD
 object ID in a local SQLite database. **Reopen last session** explicitly resumes
-it; the app does not auto-open repositories. No credentials, source snapshots,
-or cloud data are stored. See [the architecture decisions](docs/decisions.md).
+it; the app does not auto-open repositories. SQLite stores no credentials or
+source snapshots. GitHub tokens, when connected, are stored only in the
+operating-system credential store. See [the architecture decisions](docs/decisions.md).
 
 In an opened repository, select a line on the new side of the diff to write and
 save a local comment draft. Drafts are anchored to the path, line, and observed
@@ -37,6 +39,12 @@ and kept at their original anchor rather than silently moved or discarded.
 Click a saved draft to edit it, or explicitly delete it; drafts do not expire
 automatically. Multiple app instances are supported, and conflicting edits are
 rejected rather than silently overwriting newer text.
+
+GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
+`CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
+This currently enables authentication only; remote pull-request review and
+publishing are not implemented. **Disconnect GitHub** removes local credentials
+but does not revoke the grant at GitHub.
 
 ## Run
 

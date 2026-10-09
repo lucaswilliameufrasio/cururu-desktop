@@ -14,6 +14,7 @@ const ACCESS_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token
 const CREDENTIAL_SERVICE: &str = "com.cururu.desktop.github";
 const CREDENTIAL_ACCOUNT: &str = "github.com";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const MAX_AUTH_RESPONSE_BYTES: usize = 16_384;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceAuthorization {
@@ -28,7 +29,7 @@ impl std::fmt::Debug for DeviceAuthorization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DeviceAuthorization")
-            .field("user_code", &self.user_code)
+            .field("user_code", &"[REDACTED]")
             .field("verification_uri", &self.verification_uri)
             .field("expires_at", &self.expires_at)
             .field("polling_interval", &self.polling_interval)
@@ -120,6 +121,10 @@ impl GitHubDeviceFlow {
             response.expires_in > 0,
             "GitHub returned an expired device code"
         );
+        ensure!(
+            response.expires_in <= 3_600 && response.interval <= 60,
+            "GitHub returned unreasonable device authorization timing"
+        );
         Ok(DeviceAuthorization {
             user_code: response.user_code,
             verification_uri,
@@ -162,6 +167,10 @@ impl GitHubDeviceFlow {
                 else {
                     anyhow::bail!("GitHub returned an incomplete token response");
                 };
+                ensure!(
+                    response.token_type.as_deref() == Some("bearer"),
+                    "GitHub returned an unsupported token type"
+                );
                 ensure!(
                     !access_token.is_empty()
                         && !refresh_token.is_empty()
@@ -211,6 +220,10 @@ impl GitHubDeviceFlow {
             anyhow::bail!("GitHub returned an incomplete refreshed-token response");
         };
         ensure!(
+            response.token_type.as_deref() == Some("bearer"),
+            "GitHub returned an unsupported refreshed-token type"
+        );
+        ensure!(
             !access_token.is_empty()
                 && !refresh_token.is_empty()
                 && expires_in > 0
@@ -243,16 +256,35 @@ impl GitHubDeviceFlow {
             .await
             .context("could not reach GitHub authorization service")?;
         let (parts, body) = response.into_parts();
-        let bytes = body
-            .collect()
-            .await
-            .context("could not read GitHub authorization response")?
-            .to_bytes();
         ensure!(
             parts.status == StatusCode::OK,
             "GitHub authorization service returned HTTP {}",
             parts.status
         );
+        if let Some(content_length) = parts
+            .headers
+            .get(gpui::http_client::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            ensure!(
+                content_length <= MAX_AUTH_RESPONSE_BYTES,
+                "GitHub authorization response exceeded the size limit"
+            );
+        }
+        let mut bytes = Vec::new();
+        let mut body = body;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.context("could not read GitHub authorization response")?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            ensure!(
+                bytes.len().saturating_add(data.len()) <= MAX_AUTH_RESPONSE_BYTES,
+                "GitHub authorization response exceeded the size limit"
+            );
+            bytes.extend_from_slice(&data);
+        }
         serde_json::from_slice(&bytes).context("GitHub returned an invalid authorization response")
     }
 }
@@ -325,6 +357,7 @@ struct TokenPollResponse {
     refresh_token: Option<String>,
     expires_in: Option<u64>,
     refresh_token_expires_in: Option<u64>,
+    token_type: Option<String>,
     error: Option<String>,
 }
 
