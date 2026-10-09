@@ -13,6 +13,7 @@ const MAX_LOCAL_DIFF_BYTES: usize = 180_000;
 pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: Option<String>,
+    pub head_oid: Option<String>,
     pub changed_paths: Vec<String>,
     pub changed_files: Vec<cururu_core::ChangedFile>,
 }
@@ -29,6 +30,17 @@ impl RepositorySnapshot {
         let branch = repository
             .head_name()?
             .map(|name| name.shorten().to_string());
+        let head_oid = match repository.head_id() {
+            Ok(id) => Some(id.to_string()),
+            Err(error) => {
+                let is_unborn_branch = branch.is_some() && repository.head_ref()?.is_none();
+                if is_unborn_branch {
+                    None
+                } else {
+                    return Err(error.into());
+                }
+            }
+        };
         let mut changed_paths = Vec::new();
         let status = repository
             .status(gix::progress::Discard)?
@@ -54,6 +66,7 @@ impl RepositorySnapshot {
         Ok(Self {
             root,
             branch,
+            head_oid,
             changed_paths,
             changed_files,
         })
@@ -156,6 +169,7 @@ mod tests {
 
         assert_eq!(snapshot.root, directory.path());
         assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!(snapshot.head_oid, None);
         assert_eq!(snapshot.changed_paths, ["new-file.txt"]);
         assert_eq!(snapshot.changed_files.len(), 1);
         assert_eq!(snapshot.changed_files[0].path, "new-file.txt");
@@ -212,6 +226,7 @@ mod tests {
         let snapshot = RepositorySnapshot::open(directory.path()).unwrap();
 
         assert_eq!(snapshot.changed_paths, ["tracked.txt"]);
+        assert!(snapshot.head_oid.is_some());
         assert_eq!(snapshot.changed_files.len(), 1);
         assert!(snapshot.changed_files[0].patch.contains("-before"));
         assert!(snapshot.changed_files[0].patch.contains("+after"));

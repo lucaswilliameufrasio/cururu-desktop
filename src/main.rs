@@ -5,6 +5,7 @@ use gpui::{
 use std::{fmt::Write as _, ops::Range, path::PathBuf};
 
 pub mod repository;
+pub mod session_store;
 
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
@@ -43,6 +44,9 @@ struct ReviewWorkspace {
     load_error: Option<SharedString>,
     notice: Option<SharedString>,
     is_opening_repository: bool,
+    session_store: Option<session_store::SessionStore>,
+    last_session: Option<session_store::StoredSession>,
+    session_store_error: Option<SharedString>,
     selected_file: Option<usize>,
     selected_line: usize,
 }
@@ -62,43 +66,44 @@ impl ReviewWorkspace {
             load_error: None,
             notice: None,
             is_opening_repository: false,
+            session_store: None,
+            last_session: None,
+            session_store_error: None,
             selected_file: Some(0),
             selected_line: 42,
         }
     }
 
     fn from_cli() -> Self {
-        let Some(path) = std::env::args_os().nth(1) else {
-            return Self::sample();
-        };
-
-        let mut workspace = Self::empty();
-        workspace.open_repository(path.into());
+        let mut workspace = Self::sample();
+        match session_store::SessionStore::open_default() {
+            Ok(store) => {
+                match store.most_recent() {
+                    Ok(session) => workspace.last_session = session,
+                    Err(error) => {
+                        workspace.session_store_error =
+                            Some(format!("Could not read saved sessions: {error}").into());
+                    }
+                }
+                workspace.session_store = Some(store);
+            }
+            Err(error) => {
+                workspace.session_store_error =
+                    Some(format!("Local session storage is unavailable: {error}").into());
+            }
+        }
+        if let Some(path) = std::env::args_os().nth(1) {
+            let result = load_repository_session(path.into(), workspace.session_store.clone());
+            workspace.apply_repository_result(result);
+        }
         workspace
     }
 
-    const fn empty() -> Self {
-        Self {
-            files: Vec::new(),
-            repository_root: None,
-            branch: None,
-            load_error: None,
-            notice: None,
-            is_opening_repository: false,
-            selected_file: None,
-            selected_line: 0,
-        }
-    }
-
-    fn open_repository(&mut self, path: PathBuf) {
-        let result = repository::RepositorySnapshot::open(path);
-        self.apply_repository_result(result);
-    }
-
-    fn apply_repository_result(&mut self, result: anyhow::Result<repository::RepositorySnapshot>) {
+    fn apply_repository_result(&mut self, result: anyhow::Result<OpenedRepository>) {
         self.is_opening_repository = false;
         match result {
-            Ok(snapshot) => {
+            Ok(opened) => {
+                let snapshot = opened.snapshot;
                 let files = snapshot
                     .changed_files
                     .into_iter()
@@ -110,6 +115,20 @@ impl ReviewWorkspace {
                 self.branch = snapshot.branch.map(Into::into);
                 self.load_error = None;
                 self.notice = Some("Repository opened · local access is read-only".into());
+                if let Some(session_result) = opened.session_result {
+                    match session_result {
+                        Ok(session) => {
+                            self.last_session = Some(session);
+                            self.session_store_error = None;
+                        }
+                        Err(error) => {
+                            self.session_store_error = Some(
+                                format!("Repository opened, but session was not saved: {error}")
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 self.selected_file = selected_file;
                 self.selected_line = 0;
             }
@@ -129,7 +148,34 @@ impl ReviewWorkspace {
     }
 }
 
-fn start_repository_picker(cx: &App, entity: Entity<ReviewWorkspace>) {
+struct OpenedRepository {
+    snapshot: repository::RepositorySnapshot,
+    session_result: Option<anyhow::Result<session_store::StoredSession>>,
+}
+
+fn load_repository_session(
+    path: PathBuf,
+    store: Option<session_store::SessionStore>,
+) -> anyhow::Result<OpenedRepository> {
+    let snapshot = repository::RepositorySnapshot::open(path)?;
+    let session_result = store.map(|store| {
+        store.record_opened(
+            &snapshot.root,
+            snapshot.branch.as_deref(),
+            snapshot.head_oid.as_deref(),
+        )
+    });
+    Ok(OpenedRepository {
+        snapshot,
+        session_result,
+    })
+}
+
+fn start_repository_picker(
+    cx: &App,
+    entity: Entity<ReviewWorkspace>,
+    store: Option<session_store::SessionStore>,
+) {
     let receiver = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -171,7 +217,30 @@ fn start_repository_picker(cx: &App, entity: Entity<ReviewWorkspace>) {
         });
         let result = cx
             .background_executor()
-            .spawn(async move { repository::RepositorySnapshot::open(path) })
+            .spawn(async move { load_repository_session(path, store) })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            this.apply_repository_result(result);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn start_reopen_last_session(
+    cx: &App,
+    entity: Entity<ReviewWorkspace>,
+    path: PathBuf,
+    store: Option<session_store::SessionStore>,
+) {
+    cx.spawn(async move |cx| {
+        let _ = entity.update(cx, |this, cx| {
+            this.notice = Some("Scanning repository changes…".into());
+            cx.notify();
+        });
+        let result = cx
+            .background_executor()
+            .spawn(async move { load_repository_session(path, store) })
             .await;
         let _ = entity.update(cx, |this, cx| {
             this.apply_repository_result(result);
@@ -320,6 +389,13 @@ impl Render for ReviewWorkspace {
                     .text_color(rgb(0x00b8_dfc4))
                     .child(notice)
             }))
+            .children(self.session_store_error.clone().map(|error| {
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_color(rgb(0x00f0_a090))
+                    .child(error)
+            }))
             .child(
                 div()
                     .flex()
@@ -341,6 +417,63 @@ impl ReviewWorkspace {
             (None, Some(branch)) => format!("{branch} → working tree"),
         };
         let entity = cx.entity();
+        let store = self.session_store.clone();
+        let reopen_button = self.last_session.clone().map(|session| {
+            let entity = entity.clone();
+            let path = session.repository_root;
+            let store = store.clone();
+            div()
+                .id("reopen-last-session")
+                .px_3()
+                .py_2()
+                .bg(rgb(0x0020_2b36))
+                .cursor_pointer()
+                .child("Reopen last session")
+                .on_click(move |_event, _window, cx| {
+                    let entity = entity.clone();
+                    let can_open = entity.update(cx, |this, cx| {
+                        if this.is_opening_repository {
+                            return false;
+                        }
+                        this.is_opening_repository = true;
+                        cx.notify();
+                        true
+                    });
+                    if can_open {
+                        start_reopen_last_session(cx, entity, path.clone(), store.clone());
+                    }
+                })
+        });
+        let open_button = div()
+            .id("open-repository")
+            .px_3()
+            .py_2()
+            .bg(rgb(if self.is_opening_repository {
+                0x001b_2732
+            } else {
+                0x0026_3442
+            }))
+            .cursor_pointer()
+            .child(if self.is_opening_repository {
+                "Opening repository…"
+            } else {
+                "Open repository…"
+            })
+            .on_click(move |_event, _window, cx| {
+                let entity = entity.clone();
+                let can_open = entity.update(cx, |this, cx| {
+                    if this.is_opening_repository {
+                        return false;
+                    }
+                    this.is_opening_repository = true;
+                    this.notice = Some("Choose a repository folder to open".into());
+                    cx.notify();
+                    true
+                });
+                if can_open {
+                    start_repository_picker(cx, entity, store.clone());
+                }
+            });
         div()
             .flex()
             .items_center()
@@ -359,36 +492,10 @@ impl ReviewWorkspace {
             .child(div().text_color(rgb(0x009b_aaba)).child(subtitle))
             .child(
                 div()
-                    .id("open-repository")
-                    .px_3()
-                    .py_2()
-                    .bg(rgb(if self.is_opening_repository {
-                        0x001b_2732
-                    } else {
-                        0x0026_3442
-                    }))
-                    .cursor_pointer()
-                    .child(if self.is_opening_repository {
-                        "Opening repository…"
-                    } else {
-                        "Open repository…"
-                    })
-                    .on_click(move |_event, _window, cx| {
-                        let entity = entity.clone();
-                        let can_open = entity.update(cx, |this, cx| {
-                            if this.is_opening_repository {
-                                return false;
-                            }
-                            this.is_opening_repository = true;
-                            this.notice = Some("Choose a repository folder to open".into());
-                            cx.notify();
-                            true
-                        });
-                        if !can_open {
-                            return;
-                        }
-                        start_repository_picker(cx, entity);
-                    }),
+                    .flex()
+                    .gap_2()
+                    .children(reopen_button)
+                    .child(open_button),
             )
     }
 
@@ -683,10 +790,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         gix::init(directory.path()).unwrap();
         fs::write(directory.path().join("notes.txt"), "local change\n").unwrap();
-        let snapshot = super::repository::RepositorySnapshot::open(directory.path()).unwrap();
+        let opened = super::load_repository_session(directory.path().to_path_buf(), None).unwrap();
         let mut workspace = ReviewWorkspace::sample();
 
-        workspace.apply_repository_result(Ok(snapshot));
+        workspace.apply_repository_result(Ok(opened));
 
         assert_eq!(workspace.files.len(), 1);
         assert_eq!(workspace.files[0].path.as_ref(), "notes.txt");
@@ -694,5 +801,27 @@ mod tests {
         assert_eq!(workspace.selected_line, 0);
         assert!(workspace.repository_root.is_some());
         assert!(workspace.notice.as_ref().unwrap().contains("read-only"));
+    }
+
+    #[test]
+    fn opening_a_repository_records_it_for_explicit_session_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_root = directory.path().join("repo");
+        gix::init(&repository_root).unwrap();
+        fs::write(repository_root.join("notes.txt"), "local change\n").unwrap();
+        let store = super::session_store::SessionStore::open(
+            directory.path().join("app-data/sessions.sqlite3"),
+        )
+        .unwrap();
+
+        let opened =
+            super::load_repository_session(repository_root.clone(), Some(store.clone())).unwrap();
+        let mut workspace = ReviewWorkspace::sample();
+        workspace.apply_repository_result(Ok(opened));
+
+        let saved = store.most_recent().unwrap().unwrap();
+        assert_eq!(saved.repository_root, repository_root);
+        assert_eq!(saved.branch.as_deref(), Some("main"));
+        assert_eq!(workspace.last_session, Some(saved));
     }
 }

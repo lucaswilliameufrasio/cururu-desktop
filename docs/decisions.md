@@ -28,8 +28,7 @@ binary, symlink, and non-UTF-8 path support remains follow-up work.
 
 ## Local review-session persistence
 
-- **Status:** Proposed; implementation is not approved until the open questions
-  below are resolved
+- **Status:** Accepted
 - **Date:** 2026-10-09
 
 ### Context
@@ -61,22 +60,22 @@ offline-review requirement justifies it.
    and review state when the app exits, so it does not satisfy the session
    journey.
 
-### Recommendation (not yet accepted)
+### Decision
 
-Use SQLite in the operating system's per-user application data directory,
-behind a small `session_store` module and typed storage DTOs. Keep persistence
-off the GPUI render path; use the GPUI background executor for synchronous
-SQLite operations unless implementation evidence justifies an async driver.
-Start with a single local writer, explicit schema migrations, and real-file
-integration tests. Persist repository path/identity, base/head object IDs,
-session mode/state, draft comments and anchors, user decisions, and bounded
-evaluation metadata/history. Recompute diffs and line context from the
-repository; do not persist credentials or duplicate source text by default.
-Do not add cloud sync in this slice. A later sync feature must define conflict,
-identity, encryption, and authorization semantics separately.
+Use SQLite in the operating system's per-user application data directory via
+`rusqlite` with bundled SQLite. Keep persistence behind a small `session_store`
+module with typed storage records; run synchronous database work off the GPUI
+render path on the GPUI background executor. Use explicit schema migrations
+and real-file integration tests. The first slice persists local worktree
+identity (repository path, branch, HEAD object ID) and last-opened time, and
+offers an explicit “reopen last session” action rather than auto-opening a
+repository at app launch.
 
-SQLite implementation crate (`rusqlite` versus an async driver), bundled versus
-system SQLite, encryption-at-rest expectations for drafts/evaluation data,
-multi-instance behavior, and retention/cleanup policy remain open. The
-recommendation does not authorize adding a storage dependency or schema until
-these choices are confirmed.
+The application will not add its own database encryption in this slice; local
+data relies on OS account permissions and any full-disk encryption configured
+by the user. Do not persist credentials, full source snapshots, or cloud-sync
+data. Future draft comments, decisions, and bounded evaluation history may be
+stored locally, but must not duplicate source text by default. Cloud sync and
+its conflict, identity, encryption, and authorization semantics are separate
+decisions. Multi-instance write behavior and retention/cleanup policy should be
+revisited before adding durable draft/history records.
