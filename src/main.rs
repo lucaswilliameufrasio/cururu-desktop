@@ -39,12 +39,15 @@ struct DiffFile {
 
 struct ReviewWorkspace {
     files: Vec<DiffFile>,
-    selected_file: usize,
+    repository_root: Option<SharedString>,
+    branch: Option<SharedString>,
+    load_error: Option<SharedString>,
+    selected_file: Option<usize>,
     selected_line: usize,
 }
 
 impl ReviewWorkspace {
-    fn new() -> Self {
+    fn sample() -> Self {
         let diff = sample_unified_diff();
         let files = cururu_core::parse_unified_diff(&diff)
             .into_iter()
@@ -53,17 +56,52 @@ impl ReviewWorkspace {
 
         Self {
             files,
-            selected_file: 0,
+            repository_root: None,
+            branch: None,
+            load_error: None,
+            selected_file: Some(0),
             selected_line: 42,
         }
     }
 
-    const fn select_file(&mut self, index: usize) {
-        if index >= self.files.len() {
-            return;
+    fn from_cli() -> Self {
+        let Some(path) = std::env::args_os().nth(1) else {
+            return Self::sample();
+        };
+
+        match repository::RepositorySnapshot::open(path) {
+            Ok(snapshot) => {
+                let files = snapshot
+                    .changed_files
+                    .into_iter()
+                    .map(parse_diff_file)
+                    .collect::<Vec<_>>();
+                let selected_file = (!files.is_empty()).then_some(0);
+                Self {
+                    files,
+                    repository_root: Some(snapshot.root.display().to_string().into()),
+                    branch: snapshot.branch.map(Into::into),
+                    load_error: None,
+                    selected_file,
+                    selected_line: 0,
+                }
+            }
+            Err(error) => Self {
+                files: Vec::new(),
+                repository_root: None,
+                branch: None,
+                load_error: Some(error.to_string().into()),
+                selected_file: None,
+                selected_line: 0,
+            },
         }
-        self.selected_file = index;
-        self.selected_line = 0;
+    }
+
+    const fn select_file(&mut self, index: usize) {
+        if index < self.files.len() {
+            self.selected_file = Some(index);
+            self.selected_line = 0;
+        }
     }
 }
 
@@ -78,8 +116,11 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
         if raw_line.starts_with("diff --git ")
             || raw_line.starts_with("--- ")
             || raw_line.starts_with("+++ ")
-            || raw_line.starts_with("@@ ")
         {
+            continue;
+        }
+        if let Some(start) = hunk_old_start(raw_line) {
+            old_number = start;
             continue;
         }
         let Some(marker) = raw_line.chars().next() else {
@@ -122,6 +163,15 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
         added,
         removed,
     }
+}
+
+fn hunk_old_start(header: &str) -> Option<usize> {
+    let range = header
+        .strip_prefix("@@ ")?
+        .split_whitespace()
+        .find(|range| range.starts_with('-'))?
+        .strip_prefix('-')?;
+    range.split(',').next()?.parse().ok()
 }
 
 fn sample_unified_diff() -> String {
@@ -174,7 +224,7 @@ impl Render for ReviewWorkspace {
             .size_full()
             .bg(rgb(0x0011_1820))
             .text_color(rgb(0x00d5_dee8))
-            .child(Self::render_header())
+            .child(self.render_header())
             .child(
                 div()
                     .flex()
@@ -188,7 +238,13 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
-    fn render_header() -> impl IntoElement {
+    fn render_header(&self) -> impl IntoElement {
+        let subtitle = match (&self.repository_root, &self.branch) {
+            (Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
+            (Some(root), None) => format!("{root} · detached HEAD → working tree"),
+            (None, None) => "synthetic review workspace".to_string(),
+            (None, Some(branch)) => format!("{branch} → working tree"),
+        };
         div()
             .flex()
             .items_center()
@@ -204,18 +260,14 @@ impl ReviewWorkspace {
                     .child(div().text_color(rgb(0x00e5_a84b)).child("CURURU"))
                     .child(div().text_color(rgb(0x009b_aaba)).child("review workspace")),
             )
-            .child(
-                div()
-                    .text_color(rgb(0x009b_aaba))
-                    .child("feat/checked-calculation → working tree"),
-            )
+            .child(div().text_color(rgb(0x009b_aaba)).child(subtitle))
     }
 
     fn render_file_rail(&self, cx: &Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let mut file_rows = Vec::with_capacity(self.files.len());
         for (index, file) in self.files.iter().enumerate() {
-            let selected = index == self.selected_file;
+            let selected = Some(index) == self.selected_file;
             let path = file.path.clone();
             let summary = format!("+{}  −{}", file.added, file.removed);
             let entity = entity.clone();
@@ -258,8 +310,23 @@ impl ReviewWorkspace {
     }
 
     fn render_diff(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(selected_file) = self.selected_file else {
+            let message = self
+                .load_error
+                .clone()
+                .unwrap_or_else(|| "No changed files in this working tree.".to_string().into());
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .justify_center()
+                .items_center()
+                .text_color(rgb(0x009b_aaba))
+                .child(message);
+        };
         let entity = cx.entity();
-        let file = &self.files[self.selected_file];
+        let file = &self.files[selected_file];
         div()
             .flex()
             .flex_col()
@@ -281,7 +348,7 @@ impl ReviewWorkspace {
                     file.lines.len(),
                     cx.processor(move |this, range: Range<usize>, _window, _cx| {
                         let mut elements = Vec::with_capacity(range.len());
-                        let lines = &this.files[this.selected_file].lines;
+                        let lines = &this.files[selected_file].lines;
                         for index in range {
                             let line = &lines[index];
                             let is_selected = index == this.selected_line;
@@ -329,8 +396,29 @@ impl ReviewWorkspace {
     }
 
     fn render_finding_panel(&self) -> impl IntoElement {
-        let file = &self.files[self.selected_file];
+        let Some(selected_file) = self.selected_file else {
+            return div()
+                .w(px(300.0))
+                .flex_shrink_0()
+                .border_l_1()
+                .border_color(rgb(0x002b_3946))
+                .bg(rgb(0x0015_1e27));
+        };
+        let file = &self.files[selected_file];
         let line = &file.lines[self.selected_line];
+        let (label, title, description) = if self.repository_root.is_some() {
+            (
+                "LOCAL CHANGE",
+                "Working-tree diff",
+                "No automated finding is attached to this line.",
+            )
+        } else {
+            (
+                "SYNTHETIC FINDING · HIGH",
+                "Unchecked result can escape",
+                "The new calculation may return an invalid value without preserving the parser error.",
+            )
+        };
         div()
             .flex()
             .flex_col()
@@ -341,18 +429,9 @@ impl ReviewWorkspace {
             .bg(rgb(0x0015_1e27))
             .p_4()
             .gap_3()
-            .child(div().text_color(rgb(0x00e5_a84b)).child("FINDING · HIGH"))
-            .child(
-                div()
-                    .text_lg()
-                    .text_color(rgb(0x00f0_f3f6))
-                    .child("Unchecked result can escape"),
-            )
-            .child(
-                div()
-                    .text_color(rgb(0x00b5_c0cb))
-                    .child("The new calculation may return an invalid value without preserving the parser error."),
-            )
+            .child(div().text_color(rgb(0x00e5_a84b)).child(label))
+            .child(div().text_lg().text_color(rgb(0x00f0_f3f6)).child(title))
+            .child(div().text_color(rgb(0x00b5_c0cb)).child(description))
             .child(
                 div()
                     .mt_2()
@@ -373,7 +452,7 @@ impl ReviewWorkspace {
                 div()
                     .mt_2()
                     .text_color(rgb(0x0078_8a9b))
-                    .child("10,000 diff rows · virtualized list"),
+                    .child(format!("{} diff rows · virtualized list", file.lines.len())),
             )
     }
 }
@@ -386,7 +465,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| ReviewWorkspace::new()),
+            |_, cx| cx.new(|_| ReviewWorkspace::from_cli()),
         )
         .unwrap();
         cx.activate(true);
@@ -399,7 +478,7 @@ mod tests {
 
     #[test]
     fn review_workspace_generates_large_diff_and_initial_selection() {
-        let workspace = ReviewWorkspace::new();
+        let workspace = ReviewWorkspace::sample();
 
         assert_eq!(workspace.files.len(), SAMPLE_FILE_PATHS.len());
         assert_eq!(
@@ -410,6 +489,7 @@ mod tests {
                 .sum::<usize>(),
             DIFF_LINE_COUNT
         );
+        assert_eq!(workspace.selected_file, Some(0));
         assert_eq!(workspace.selected_line, 42);
         let file = &workspace.files[0];
         assert_eq!(file.path.as_ref(), SAMPLE_FILE_PATHS[0]);
@@ -435,20 +515,36 @@ mod tests {
 
     #[test]
     fn selecting_a_file_resets_the_diff_selection_and_rejects_invalid_indices() {
-        let mut workspace = ReviewWorkspace::new();
+        let mut workspace = ReviewWorkspace::sample();
 
         workspace.select_file(1);
 
-        assert_eq!(workspace.selected_file, 1);
+        assert_eq!(workspace.selected_file, Some(1));
         assert_eq!(workspace.selected_line, 0);
         assert_eq!(
-            workspace.files[workspace.selected_file].path.as_ref(),
+            workspace.files[workspace.selected_file.unwrap()]
+                .path
+                .as_ref(),
             SAMPLE_FILE_PATHS[1]
         );
 
         workspace.select_file(usize::MAX);
 
-        assert_eq!(workspace.selected_file, 1);
+        assert_eq!(workspace.selected_file, Some(1));
         assert_eq!(workspace.selected_line, 0);
+    }
+
+    #[test]
+    fn real_unified_hunk_offsets_are_used_for_old_side_line_numbers() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -20,2 +40,2 @@\n-old\n+new\n context\n";
+        let file = cururu_core::parse_unified_diff(diff).remove(0);
+        let file = super::parse_diff_file(file);
+
+        assert_eq!(file.lines[0].old_number, Some(20));
+        assert_eq!(file.lines[0].new_number, None);
+        assert_eq!(file.lines[1].old_number, None);
+        assert_eq!(file.lines[1].new_number, Some(40));
+        assert_eq!(file.lines[2].old_number, Some(21));
+        assert_eq!(file.lines[2].new_number, Some(41));
     }
 }
