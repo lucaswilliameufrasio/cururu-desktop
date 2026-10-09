@@ -46,11 +46,13 @@ struct ReviewWorkspace {
     notice: Option<SharedString>,
     is_opening_repository: bool,
     is_saving_draft: bool,
+    deleting_draft_id: Option<i64>,
     session_store: Option<session_store::SessionStore>,
     last_session: Option<session_store::StoredSession>,
     session_store_error: Option<SharedString>,
     head_oid: Option<String>,
     comment_drafts: Vec<session_store::StoredCommentDraft>,
+    editing_draft: Option<session_store::StoredCommentDraft>,
     draft_input: Option<Entity<InputState>>,
     selected_file: Option<usize>,
     selected_line: usize,
@@ -72,11 +74,13 @@ impl ReviewWorkspace {
             notice: None,
             is_opening_repository: false,
             is_saving_draft: false,
+            deleting_draft_id: None,
             session_store: None,
             last_session: None,
             session_store_error: None,
             head_oid: None,
             comment_drafts: Vec::new(),
+            editing_draft: None,
             draft_input: None,
             selected_file: Some(0),
             selected_line: 42,
@@ -143,6 +147,7 @@ impl ReviewWorkspace {
                     match drafts_result {
                         Ok(drafts) => {
                             self.comment_drafts = drafts;
+                            self.editing_draft = None;
                         }
                         Err(error) => {
                             self.session_store_error = Some(
@@ -165,10 +170,11 @@ impl ReviewWorkspace {
         }
     }
 
-    const fn select_file(&mut self, index: usize) {
+    fn select_file(&mut self, index: usize) {
         if index < self.files.len() {
             self.selected_file = Some(index);
             self.selected_line = 0;
+            self.editing_draft = None;
         }
     }
 }
@@ -177,6 +183,15 @@ struct OpenedRepository {
     snapshot: repository::RepositorySnapshot,
     session_result: Option<anyhow::Result<session_store::StoredSession>>,
     drafts_result: Option<anyhow::Result<Vec<session_store::StoredCommentDraft>>>,
+}
+
+struct DraftSave {
+    store: session_store::SessionStore,
+    repository_root: PathBuf,
+    base_head_oid: Option<String>,
+    current_head_oid: Option<String>,
+    draft: cururu_core::ReviewCommentDraft,
+    expected_revision: Option<i64>,
 }
 
 fn load_repository_session(
@@ -646,6 +661,7 @@ impl ReviewWorkspace {
                                     .on_click(move |_event, _window, cx| {
                                         entity.update(cx, |this, cx| {
                                             this.selected_line = index;
+                                            this.editing_draft = None;
                                             cx.notify();
                                         });
                                     })
@@ -739,7 +755,8 @@ impl ReviewWorkspace {
         path: &str,
         selected_line: Option<usize>,
     ) -> impl IntoElement {
-        let can_comment = self.repository_root.is_some() && selected_line.is_some();
+        let can_comment = self.repository_root.is_some()
+            && (selected_line.is_some() || self.editing_draft.is_some());
         let draft_input = can_comment
             .then(|| self.draft_input.as_ref().map(TextInput::new))
             .flatten();
@@ -752,9 +769,21 @@ impl ReviewWorkspace {
                 .repository_root
                 .as_ref()
                 .map(|root| PathBuf::from(root.as_ref()));
-            let path = path.to_string();
-            let line_number = selected_line.and_then(|number| u32::try_from(number).ok());
+            let selected_path = path.to_string();
+            let selected_line_number = selected_line.and_then(|number| u32::try_from(number).ok());
             let head_oid = self.head_oid.clone();
+            let editing_draft = self.editing_draft.clone();
+            let expected_revision = editing_draft.as_ref().map(|draft| draft.revision);
+            let (path, line_number, base_head_oid) = editing_draft.as_ref().map_or_else(
+                || (selected_path, selected_line_number, head_oid.clone()),
+                |draft| {
+                    (
+                        draft.draft.path.clone(),
+                        draft.draft.line,
+                        draft.base_head_oid.clone(),
+                    )
+                },
+            );
             Some(
                 div()
                     .id("save-comment-draft")
@@ -796,10 +825,14 @@ impl ReviewWorkspace {
                         };
                         persist_comment_draft(
                             entity.clone(),
-                            store,
-                            root,
-                            head_oid.clone(),
-                            draft,
+                            DraftSave {
+                                store,
+                                repository_root: root,
+                                base_head_oid: base_head_oid.clone(),
+                                current_head_oid: head_oid.clone(),
+                                draft,
+                                expected_revision,
+                            },
                             cx,
                         );
                     }),
@@ -807,26 +840,7 @@ impl ReviewWorkspace {
         } else {
             None
         };
-        let draft_rows = self.comment_drafts.iter().map(|draft| {
-            let status = if draft.is_stale {
-                "STALE · saved against another HEAD"
-            } else {
-                "Saved locally · not published"
-            };
-            div()
-                .p_2()
-                .bg(rgb(0x0020_2b36))
-                .child(format!(
-                    "{}:{} · {status}",
-                    draft.draft.path,
-                    draft.draft.line.unwrap_or_default()
-                ))
-                .child(
-                    div()
-                        .text_color(rgb(0x00b5_c0cb))
-                        .child(draft.draft.body.clone()),
-                )
-        });
+        let draft_rows = self.render_saved_drafts(cx);
         div()
             .flex()
             .flex_col()
@@ -835,16 +849,148 @@ impl ReviewWorkspace {
             .children(save_draft_button)
             .children(draft_rows)
     }
+
+    fn render_saved_drafts(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl IntoIterator<Item = impl IntoElement> {
+        self.comment_drafts.iter().map(|draft| {
+            let status = if draft.is_stale {
+                "STALE · saved against another HEAD"
+            } else {
+                "Saved locally · not published"
+            };
+            let entity = cx.entity();
+            let edit_entity = entity.clone();
+            let input = self.draft_input.clone();
+            let selected_draft = draft.clone();
+            let draft_id = draft.id;
+            let store = self.session_store.clone();
+            let root = self
+                .repository_root
+                .as_ref()
+                .map(|root| PathBuf::from(root.as_ref()));
+            let is_deleting = self.deleting_draft_id == Some(draft.id);
+            div()
+                .id(("comment-draft", draft_id.unsigned_abs()))
+                .p_2()
+                .bg(rgb(0x0020_2b36))
+                .child(
+                    div()
+                        .id(("comment-draft-body", draft_id.unsigned_abs()))
+                        .cursor_pointer()
+                        .on_click(move |_event, window, cx| {
+                            if let Some(input) = input.clone() {
+                                let body = selected_draft.draft.body.clone();
+                                input.update(cx, |state, cx| state.set_value(body, window, cx));
+                            }
+                            edit_entity.update(cx, |this, cx| {
+                                let draft_path = selected_draft.draft.path.as_str();
+                                let draft_line = selected_draft
+                                    .draft
+                                    .line
+                                    .and_then(|line| usize::try_from(line).ok());
+                                if let Some(file_index) = this
+                                    .files
+                                    .iter()
+                                    .position(|file| file.path.as_ref() == draft_path)
+                                    && let Some(line_index) = this.files[file_index]
+                                        .lines
+                                        .iter()
+                                        .position(|line| line.new_number == draft_line)
+                                {
+                                    this.selected_file = Some(file_index);
+                                    this.selected_line = line_index;
+                                }
+                                this.editing_draft = Some(selected_draft.clone());
+                                this.notice = Some("Draft loaded into the editor.".into());
+                                cx.notify();
+                            });
+                        })
+                        .child(format!(
+                            "{}:{} · {status}",
+                            draft.draft.path,
+                            draft.draft.line.unwrap_or_default()
+                        ))
+                        .child(
+                            div()
+                                .text_color(rgb(0x00b5_c0cb))
+                                .child(draft.draft.body.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("delete-comment-draft", draft_id.unsigned_abs()))
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(0x00e5_a84b))
+                        .cursor_pointer()
+                        .child(if is_deleting {
+                            "Deleting…"
+                        } else {
+                            "Delete draft"
+                        })
+                        .on_click(move |_event, _window, cx| {
+                            if is_deleting {
+                                return;
+                            }
+                            let (Some(store), Some(root)) = (store.clone(), root.clone()) else {
+                                return;
+                            };
+                            delete_comment_draft(entity.clone(), store, root, draft_id, cx);
+                        }),
+                )
+        })
+    }
 }
 
-fn persist_comment_draft(
+fn delete_comment_draft(
     entity: Entity<ReviewWorkspace>,
     store: session_store::SessionStore,
     root: PathBuf,
-    head_oid: Option<String>,
-    draft: cururu_core::ReviewCommentDraft,
+    draft_id: i64,
     cx: &mut App,
 ) {
+    entity.update(cx, |this, cx| {
+        this.deleting_draft_id = Some(draft_id);
+        this.notice = Some("Deleting local draft…".into());
+        cx.notify();
+    });
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { store.delete_comment_draft(&root, draft_id) })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            this.deleting_draft_id = None;
+            match result {
+                Ok(true) => {
+                    this.comment_drafts.retain(|draft| draft.id != draft_id);
+                    if this
+                        .editing_draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.id == draft_id)
+                    {
+                        this.editing_draft = None;
+                    }
+                    this.notice = Some("Local draft deleted.".into());
+                }
+                Ok(false) => {
+                    this.comment_drafts.retain(|draft| draft.id != draft_id);
+                    this.notice = Some("Draft was already deleted in another app instance.".into());
+                }
+                Err(error) => {
+                    this.session_store_error =
+                        Some(format!("Could not delete comment draft: {error}").into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn persist_comment_draft(entity: Entity<ReviewWorkspace>, save: DraftSave, cx: &mut App) {
     entity.update(cx, |this, cx| {
         this.is_saving_draft = true;
         this.notice = Some("Saving comment draft locally…".into());
@@ -853,13 +999,22 @@ fn persist_comment_draft(
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
-            .spawn(async move { store.save_comment_draft(&root, head_oid.as_deref(), &draft) })
+            .spawn(async move {
+                save.store.save_comment_draft(
+                    &save.repository_root,
+                    save.base_head_oid.as_deref(),
+                    save.current_head_oid.as_deref(),
+                    &save.draft,
+                    save.expected_revision,
+                )
+            })
             .await;
         let _ = entity.update(cx, |this, cx| {
             this.is_saving_draft = false;
             match result {
                 Ok(saved) => {
                     this.comment_drafts.retain(|draft| draft.id != saved.id);
+                    this.editing_draft = Some(saved.clone());
                     this.comment_drafts.push(saved);
                     this.session_store_error = None;
                     this.notice = Some("Draft saved locally · not published".into());
