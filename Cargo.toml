@@ -10,11 +10,17 @@ description = "Desktop code review client for Cururu"
 anyhow = "1"
 cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "3ea5deb" }
 directories = "6"
+futures = "0.3"
 gpui = "0.2.2"
 gpui-component = { version = "=0.3.0", default-features = false }
 gix = { version = "=0.85.0", default-features = false, features = ["basic", "parallel", "sha1", "status"] }
+http-body-util = "0.1"
+keyring = "=4.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 similar = "2"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"
