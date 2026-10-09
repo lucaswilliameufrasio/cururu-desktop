@@ -157,3 +157,25 @@ bounded excerpt, and retain it only in memory. Do not fetch source files for all
 comments automatically. Publication remains a separate, explicitly confirmed
 feature; revisit repository discovery when a multi-repository chooser is
 designed.
+
+### Review understanding evaluators
+
+Both a user-configured OpenAI-compatible chat-completions provider and Jev are
+required for the “Understand a review” AI action. Run them concurrently on the
+same explicitly selected thread and bounded evidence; do not silently fall
+back to only one provider. OpenAI-compatible supplies the structured
+explanation and response draft; Jev supplies its typed defect-probability and
+severity second opinion. If either call fails or times out, show no combined
+judgment. The result is informational only: it never filters findings, changes
+review state, edits code, or publishes comments.
+
+The API keys belong only in the OS keyring. Non-secret endpoint/model settings
+and the explicit local `owner/repository` authorization belong in the local
+SQLite store. Authorization is scoped to the exact canonical GitHub repository
+and a fingerprint of both provider endpoints/models; changing either provider
+configuration requires fresh approval. Before sending any comment/source, the
+UI must identify that both providers will receive the same bounded context and
+require the repository authorization. Each analysis has one 2-minute deadline,
+no internal retries, and fail-closed behavior. Evidence sent per selected
+thread is capped at 8,000 characters; remote content remains untrusted data and
+cannot trigger tools or actions.
