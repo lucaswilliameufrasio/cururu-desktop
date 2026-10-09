@@ -8,8 +8,9 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
+const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSession {
@@ -29,6 +30,13 @@ pub struct StoredCommentDraft {
     pub updated_at: i64,
     pub revision: i64,
     pub is_stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatorSettings {
+    pub openai_endpoint: String,
+    pub openai_model: String,
+    pub jev_model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +244,102 @@ impl SessionStore {
             .context("failed to delete the local comment draft")
     }
 
+    pub fn evaluator_settings(&self) -> anyhow::Result<Option<EvaluatorSettings>> {
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT openai_endpoint, openai_model, jev_model \
+                 FROM evaluator_settings WHERE id = 1",
+                [],
+                |row| {
+                    Ok(EvaluatorSettings {
+                        openai_endpoint: row.get(0)?,
+                        openai_model: row.get(1)?,
+                        jev_model: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read local evaluator settings")
+    }
+
+    pub fn save_evaluator_settings(&self, settings: &EvaluatorSettings) -> anyhow::Result<()> {
+        validate_evaluator_settings(settings)?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO evaluator_settings (id, openai_endpoint, openai_model, jev_model) \
+                 VALUES (1, ?1, ?2, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 openai_endpoint = excluded.openai_endpoint, \
+                 openai_model = excluded.openai_model, \
+                 jev_model = excluded.jev_model",
+                params![
+                    settings.openai_endpoint,
+                    settings.openai_model,
+                    settings.jev_model
+                ],
+            )
+            .context("failed to save local evaluator settings")?;
+        Ok(())
+    }
+
+    pub fn evaluator_is_authorized(
+        &self,
+        repository_identity: &str,
+        config_fingerprint: &str,
+    ) -> anyhow::Result<bool> {
+        let repository_identity = normalize_evaluator_repository_identity(repository_identity)?;
+        validate_config_fingerprint(config_fingerprint)?;
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM evaluator_authorizations \
+                 WHERE repository_identity = ?1 AND config_fingerprint = ?2)",
+                params![repository_identity, config_fingerprint],
+                |row| row.get(0),
+            )
+            .context("failed to check local evaluator authorization")
+    }
+
+    pub fn authorize_evaluator(
+        &self,
+        repository_identity: &str,
+        config_fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        let repository_identity = normalize_evaluator_repository_identity(repository_identity)?;
+        validate_config_fingerprint(config_fingerprint)?;
+        let now = unix_timestamp()?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO evaluator_authorizations \
+                 (repository_identity, config_fingerprint, authorized_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(repository_identity) DO UPDATE SET \
+                 config_fingerprint = excluded.config_fingerprint, \
+                 authorized_at = excluded.authorized_at",
+                params![repository_identity, config_fingerprint, now],
+            )
+            .context("failed to save local evaluator authorization")?;
+        Ok(())
+    }
+
+    pub fn revoke_evaluator_authorization(
+        &self,
+        repository_identity: &str,
+    ) -> anyhow::Result<bool> {
+        let repository_identity = normalize_evaluator_repository_identity(repository_identity)?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "DELETE FROM evaluator_authorizations WHERE repository_identity = ?1",
+                [repository_identity],
+            )
+            .map(|rows_changed| rows_changed > 0)
+            .context("failed to revoke local evaluator authorization")
+    }
+
     fn initialize(&self) -> anyhow::Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -290,6 +394,24 @@ impl SessionStore {
                 )
                 .context("failed to apply local session database migration 3")?;
         }
+        if version < 4 {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE evaluator_settings (\
+                         id INTEGER PRIMARY KEY CHECK(id = 1),\
+                         openai_endpoint TEXT NOT NULL,\
+                         openai_model TEXT NOT NULL,\
+                         jev_model TEXT NOT NULL\
+                     );\
+                     CREATE TABLE evaluator_authorizations (\
+                         repository_identity TEXT PRIMARY KEY NOT NULL,\
+                         config_fingerprint TEXT NOT NULL,\
+                         authorized_at INTEGER NOT NULL\
+                     );\
+                     PRAGMA user_version = 4;",
+                )
+                .context("failed to apply local session database migration 4")?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -331,6 +453,62 @@ fn validate_draft(draft: &cururu_core::ReviewCommentDraft) -> anyhow::Result<()>
     anyhow::ensure!(
         draft.line.is_some_and(|line| line > 0),
         "draft line must be positive"
+    );
+    Ok(())
+}
+
+fn validate_evaluator_settings(settings: &EvaluatorSettings) -> anyhow::Result<()> {
+    for (name, value) in [
+        (
+            "OpenAI-compatible endpoint",
+            settings.openai_endpoint.as_str(),
+        ),
+        ("OpenAI-compatible model", settings.openai_model.as_str()),
+        ("Jev model", settings.jev_model.as_str()),
+    ] {
+        anyhow::ensure!(!value.trim().is_empty(), "{name} must not be empty");
+        anyhow::ensure!(
+            value.len() <= MAX_EVALUATOR_SETTING_BYTES,
+            "{name} exceeds the local settings size limit"
+        );
+        anyhow::ensure!(
+            !value.chars().any(char::is_control),
+            "{name} must not contain control characters"
+        );
+    }
+    Ok(())
+}
+
+fn normalize_evaluator_repository_identity(value: &str) -> anyhow::Result<String> {
+    let (owner, repository) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("evaluator authorization requires owner/repository"))?;
+    anyhow::ensure!(
+        !repository.contains('/')
+            && valid_github_repository_segment(owner)
+            && valid_github_repository_segment(repository),
+        "evaluator authorization requires a safe GitHub owner/repository"
+    );
+    Ok(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase()
+    ))
+}
+
+fn valid_github_repository_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn validate_config_fingerprint(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "evaluator configuration fingerprint is invalid"
     );
     Ok(())
 }
@@ -386,7 +564,7 @@ fn unix_timestamp() -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionStore;
+    use super::{EvaluatorSettings, SessionStore};
 
     fn draft(path: &str, line: Option<u32>, body: &str) -> cururu_core::ReviewCommentDraft {
         cururu_core::ReviewCommentDraft {
@@ -440,6 +618,85 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("outside the supported range")
+        );
+    }
+
+    #[test]
+    fn evaluator_settings_round_trip_without_storing_provider_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("settings.sqlite3")).unwrap();
+        assert_eq!(store.evaluator_settings().unwrap(), None);
+
+        let settings = EvaluatorSettings {
+            openai_endpoint: "https://api.example.test/v1/chat/completions".to_string(),
+            openai_model: "configured-model".to_string(),
+            jev_model: "configured-jev-model".to_string(),
+        };
+        store.save_evaluator_settings(&settings).unwrap();
+
+        assert_eq!(store.evaluator_settings().unwrap(), Some(settings));
+    }
+
+    #[test]
+    fn evaluator_authorization_is_exact_repository_and_configuration_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("authorization.sqlite3")).unwrap();
+        let fingerprint = "a".repeat(64);
+
+        assert!(
+            !store
+                .evaluator_is_authorized("Owner/Repository", &fingerprint)
+                .unwrap()
+        );
+        store
+            .authorize_evaluator("Owner/Repository", &fingerprint)
+            .unwrap();
+        assert!(
+            store
+                .evaluator_is_authorized("owner/repository", &fingerprint)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .evaluator_is_authorized("owner/another", &fingerprint)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .evaluator_is_authorized("owner/repository", &"b".repeat(64))
+                .unwrap()
+        );
+        assert!(
+            store
+                .revoke_evaluator_authorization("OWNER/REPOSITORY")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .evaluator_is_authorized("owner/repository", &fingerprint)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn evaluator_settings_and_authorizations_reject_malformed_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("invalid.sqlite3")).unwrap();
+        let invalid_settings = EvaluatorSettings {
+            openai_endpoint: "https://api.example.test/\nAuthorization: leak".to_string(),
+            openai_model: "model".to_string(),
+            jev_model: "model".to_string(),
+        };
+        assert!(store.save_evaluator_settings(&invalid_settings).is_err());
+        assert!(
+            store
+                .authorize_evaluator("owner/../repo", &"a".repeat(64))
+                .is_err()
+        );
+        assert!(
+            store
+                .authorize_evaluator("owner/repo", "bad-fingerprint")
+                .is_err()
         );
     }
 
