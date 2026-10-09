@@ -30,6 +30,11 @@ object ID in a local SQLite database. **Reopen last session** explicitly resumes
 it; the app does not auto-open repositories. No credentials, source snapshots,
 or cloud data are stored. See [the architecture decisions](docs/decisions.md).
 
+In an opened repository, select a line on the new side of the diff to write and
+save a local comment draft. Drafts are anchored to the path, line, and observed
+HEAD; they are never published. Drafts from a different HEAD are marked stale
+and kept at their original anchor rather than silently moved or discarded.
+
 ## Run
 
 ```sh
