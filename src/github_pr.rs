@@ -94,6 +94,7 @@ pub struct PullRequestComment {
     pub in_reply_to_id: Option<u64>,
     pub is_outdated: bool,
     pub subject_type: Option<String>,
+    pub side: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +456,7 @@ fn parse_pull_request_comments(
             in_reply_to_id: comment.in_reply_to_id,
             is_outdated: comment.line.is_none() && comment.original_line.is_some(),
             subject_type: comment.subject_type,
+            side: comment.side,
         });
     }
     Ok(comments)
@@ -588,6 +590,7 @@ struct PullRequestReviewComment {
     original_commit_id: String,
     in_reply_to_id: Option<u64>,
     subject_type: Option<String>,
+    side: Option<String>,
     user: Option<GitHubUser>,
 }
 
@@ -851,8 +854,8 @@ mod tests {
         let comments = parse_pull_request_comments(
             serde_json::from_str::<Vec<super::PullRequestReviewComment>>(
                 r#"[
-                    {"id":1,"path":"src/lib.rs","line":null,"original_line":8,"body":"Original point","html_url":"https://github.com/org/repo/pull/1#discussion_r1","commit_id":"head","original_commit_id":"old","user":{"login":"reviewer"}},
-                    {"id":2,"path":"src/lib.rs","line":null,"original_line":8,"body":"Reply","html_url":"https://github.com/org/repo/pull/1#discussion_r2","commit_id":"head","original_commit_id":"old","in_reply_to_id":1,"user":{"login":"author"}}
+                    {"id":1,"path":"src/lib.rs","line":null,"original_line":8,"side":"RIGHT","body":"Original point","html_url":"https://github.com/org/repo/pull/1#discussion_r1","commit_id":"head","original_commit_id":"old","user":{"login":"reviewer"}},
+                    {"id":2,"path":"src/lib.rs","line":null,"original_line":8,"side":"RIGHT","body":"Reply","html_url":"https://github.com/org/repo/pull/1#discussion_r2","commit_id":"head","original_commit_id":"old","in_reply_to_id":1,"user":{"login":"author"}}
                 ]"#,
             )
             .unwrap(),

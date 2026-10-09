@@ -1,8 +1,8 @@
 use anyhow::Context as _;
 use gpui::{
     App, Application, BackgroundExecutor, Bounds, Context, Entity, PathPromptOptions, Render,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
-    uniform_list,
+    ScrollStrategy, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::input::{InputState, TextInput};
 use std::{
@@ -75,6 +75,7 @@ struct ReviewWorkspace {
     remote_review_state: RemoteReviewState,
     selected_file: Option<usize>,
     selected_line: usize,
+    diff_scroll_handle: UniformListScrollHandle,
 }
 
 enum GitHubAuthState {
@@ -167,6 +168,7 @@ impl ReviewWorkspace {
             remote_review_state: RemoteReviewState::Idle,
             selected_file: Some(0),
             selected_line: 42,
+            diff_scroll_handle: UniformListScrollHandle::new(),
         }
     }
 
@@ -261,6 +263,49 @@ impl ReviewWorkspace {
             self.editing_draft = None;
         }
     }
+
+    fn focus_remote_comment(&mut self, comment: &github_pr::PullRequestComment) -> bool {
+        let Some((file_index, line_index)) = locate_remote_comment(&self.files, comment) else {
+            self.notice =
+                Some("This comment's original line is not present in the loaded diff.".into());
+            return false;
+        };
+        self.selected_file = Some(file_index);
+        self.selected_line = line_index;
+        self.editing_draft = None;
+        self.diff_scroll_handle
+            .scroll_to_item(line_index, ScrollStrategy::Center);
+        self.notice = Some(
+            format!(
+                "Focused {}:{} from the selected review thread.",
+                comment.path,
+                comment.line.or(comment.original_line).unwrap_or_default()
+            )
+            .into(),
+        );
+        true
+    }
+}
+
+fn locate_remote_comment(
+    files: &[DiffFile],
+    comment: &github_pr::PullRequestComment,
+) -> Option<(usize, usize)> {
+    let file_index = files
+        .iter()
+        .position(|file| file.path.as_ref() == comment.path)?;
+    let file = &files[file_index];
+    let line_number = comment.line.or(comment.original_line)?;
+    let line_number = usize::try_from(line_number).ok()?;
+    let is_left_side = comment.side.as_deref() == Some("LEFT");
+    let line_index = file.lines.iter().position(|line| {
+        if is_left_side {
+            line.old_number == Some(line_number)
+        } else {
+            line.new_number == Some(line_number)
+        }
+    })?;
+    Some((file_index, line_index))
 }
 
 struct OpenedRepository {
@@ -1064,6 +1109,7 @@ impl ReviewWorkspace {
                         elements
                     }),
                 )
+                .track_scroll(self.diff_scroll_handle.clone())
                 .flex_1(),
             )
     }
@@ -1100,12 +1146,16 @@ impl ReviewWorkspace {
         };
         let review_controls = if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state
         {
+            let entity = cx.entity();
             div()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .children(snapshot.reviews.iter().map(render_remote_review_summary))
-                .children(render_remote_review_threads(&snapshot.review_threads))
+                .children(render_remote_review_threads(
+                    &snapshot.review_threads,
+                    entity,
+                ))
                 .children(
                     snapshot
                         .conversation_comments
@@ -1431,8 +1481,9 @@ fn render_remote_review_summary(review: &github_pr::PullRequestReview) -> impl I
 
 fn render_remote_review_threads(
     threads: &[github_pr::PullRequestReviewThread],
+    entity: Entity<ReviewWorkspace>,
 ) -> impl IntoIterator<Item = impl IntoElement> + '_ {
-    threads.iter().map(|thread| {
+    threads.iter().map(move |thread| {
         let root = &thread.root;
         let root_status = if root.is_outdated {
             " · outdated location"
@@ -1452,7 +1503,7 @@ fn render_remote_review_threads(
                 root.author,
                 root_status
             ))
-            .child(div().text_color(rgb(0x00b5_c0cb)).child(root.body.clone()))
+            .child(render_remote_inline_comment(root, entity.clone(), false))
             .children(thread.replies.iter().map(|reply| {
                 div()
                     .ml_3()
@@ -1460,9 +1511,38 @@ fn render_remote_review_threads(
                     .border_color(rgb(0x003b_4c5c))
                     .pl_2()
                     .child(format!("↳ @{}", reply.author))
-                    .child(div().text_color(rgb(0x00b5_c0cb)).child(reply.body.clone()))
+                    .child(render_remote_inline_comment(reply, entity.clone(), true))
             }))
     })
+}
+
+fn render_remote_inline_comment(
+    comment: &github_pr::PullRequestComment,
+    entity: Entity<ReviewWorkspace>,
+    nested: bool,
+) -> impl IntoElement {
+    let comment_for_click = comment.clone();
+    let comment_id = comment.id;
+    div()
+        .id(("remote-inline-comment", comment_id))
+        .px_1()
+        .py_1()
+        .bg(rgb(0x0020_2b36))
+        .cursor_pointer()
+        .child(div().text_color(rgb(0x00b5_c0cb)).child(comment.body.clone()))
+        .on_click(move |_event, _window, cx| {
+            entity.update(cx, |this, cx| {
+                if !this.focus_remote_comment(&comment_for_click) {
+                    this.notice = Some(
+                        "The referenced line is outside the current patch; the comment remains available above."
+                            .into(),
+                    );
+                } else if nested {
+                    this.notice = Some("Focused the line anchored by this reply's thread.".into());
+                }
+                cx.notify();
+            });
+        })
 }
 
 fn render_remote_conversation_comment(
@@ -1770,7 +1850,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewWorkspace, SAMPLE_FILE_PATHS};
+    use super::{
+        DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewWorkspace, SAMPLE_FILE_PATHS,
+        locate_remote_comment, parse_diff_file,
+    };
     use std::fs;
 
     #[test]
@@ -1831,6 +1914,31 @@ mod tests {
             }))
             .blocks_local_drafts()
         );
+    }
+
+    #[test]
+    fn selecting_a_left_side_comment_resolves_the_deleted_diff_line() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -4,2 +4,2 @@\n context\n-removed\n+added\n";
+        let files = cururu_core::parse_unified_diff(diff)
+            .into_iter()
+            .map(parse_diff_file)
+            .collect::<Vec<_>>();
+        let comment = crate::github_pr::PullRequestComment {
+            id: 1,
+            path: "src/lib.rs".to_string(),
+            line: None,
+            original_line: Some(5),
+            body: "Why remove this?".to_string(),
+            author: "reviewer".to_string(),
+            html_url: "https://github.com/org/repo/pull/1#discussion_r1".to_string(),
+            commit_id: "head".to_string(),
+            original_commit_id: "old".to_string(),
+            in_reply_to_id: None,
+            is_outdated: true,
+            subject_type: Some("line".to_string()),
+            side: Some("LEFT".to_string()),
+        };
+        assert_eq!(locate_remote_comment(&files, &comment), Some((0, 1)));
     }
 
     #[test]
