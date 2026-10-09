@@ -21,7 +21,7 @@ The app currently pins `gix` 0.85.0 with defaults disabled and the features
 needed for local status. This version is used because newer candidates required
 an unavailable `gix-dir` release in the configured package index during initial
 integration. Review content passes through the core unified-diff parser before
-rendering. The first UI entry point is a repository path argument; a native
-folder picker remains follow-up work. Text extraction has bounded inputs and
+rendering. Repositories can be opened through GPUI's native directory picker or
+by passing a path on the command line. Text extraction has bounded inputs and
 uses Cururu's current default diff limits (45,000 bytes/file, 180,000 total);
 binary, symlink, and non-UTF-8 path support remains follow-up work.

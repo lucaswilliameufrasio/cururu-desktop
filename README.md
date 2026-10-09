@@ -17,9 +17,10 @@ through the pinned `cururu-core` parser. This sample does not access a
 repository, SCM credentials, an evaluator, or external services.
 
 Local Git access uses the embedded `gix` library rather than a Git subprocess.
-Open a worktree from the command line with `cargo run -- /path/to/repository`;
-the workspace lists its staged and unstaged text changes and renders unified
-diffs through the pinned `cururu-core` parser. Repository access is read-only.
+Open a worktree with the **Open repository…** folder picker, or from the command
+line with `cargo run -- /path/to/repository`; the workspace lists its staged and
+unstaged text changes and renders unified diffs through the pinned `cururu-core`
+parser. Repository access is read-only.
 Text input is capped at 2 MiB per side/file and 32 MiB aggregate; rendered diffs
 are capped at 45,000 bytes per file and 180,000 bytes total. The UI does not yet
 include a folder picker, and binary, symlink, and non-UTF-8 paths are not

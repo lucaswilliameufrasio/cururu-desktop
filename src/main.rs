@@ -1,9 +1,8 @@
 use gpui::{
-    App, Application, Bounds, Context, Render, SharedString, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size, uniform_list,
+    App, Application, Bounds, Context, Entity, PathPromptOptions, Render, SharedString, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size, uniform_list,
 };
-use std::fmt::Write as _;
-use std::ops::Range;
+use std::{fmt::Write as _, ops::Range, path::PathBuf};
 
 pub mod repository;
 
@@ -42,6 +41,8 @@ struct ReviewWorkspace {
     repository_root: Option<SharedString>,
     branch: Option<SharedString>,
     load_error: Option<SharedString>,
+    notice: Option<SharedString>,
+    is_opening_repository: bool,
     selected_file: Option<usize>,
     selected_line: usize,
 }
@@ -59,6 +60,8 @@ impl ReviewWorkspace {
             repository_root: None,
             branch: None,
             load_error: None,
+            notice: None,
+            is_opening_repository: false,
             selected_file: Some(0),
             selected_line: 42,
         }
@@ -69,7 +72,32 @@ impl ReviewWorkspace {
             return Self::sample();
         };
 
-        match repository::RepositorySnapshot::open(path) {
+        let mut workspace = Self::empty();
+        workspace.open_repository(path.into());
+        workspace
+    }
+
+    const fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            repository_root: None,
+            branch: None,
+            load_error: None,
+            notice: None,
+            is_opening_repository: false,
+            selected_file: None,
+            selected_line: 0,
+        }
+    }
+
+    fn open_repository(&mut self, path: PathBuf) {
+        let result = repository::RepositorySnapshot::open(path);
+        self.apply_repository_result(result);
+    }
+
+    fn apply_repository_result(&mut self, result: anyhow::Result<repository::RepositorySnapshot>) {
+        self.is_opening_repository = false;
+        match result {
             Ok(snapshot) => {
                 let files = snapshot
                     .changed_files
@@ -77,23 +105,19 @@ impl ReviewWorkspace {
                     .map(parse_diff_file)
                     .collect::<Vec<_>>();
                 let selected_file = (!files.is_empty()).then_some(0);
-                Self {
-                    files,
-                    repository_root: Some(snapshot.root.display().to_string().into()),
-                    branch: snapshot.branch.map(Into::into),
-                    load_error: None,
-                    selected_file,
-                    selected_line: 0,
-                }
+                self.files = files;
+                self.repository_root = Some(snapshot.root.display().to_string().into());
+                self.branch = snapshot.branch.map(Into::into);
+                self.load_error = None;
+                self.notice = Some("Repository opened · local access is read-only".into());
+                self.selected_file = selected_file;
+                self.selected_line = 0;
             }
-            Err(error) => Self {
-                files: Vec::new(),
-                repository_root: None,
-                branch: None,
-                load_error: Some(error.to_string().into()),
-                selected_file: None,
-                selected_line: 0,
-            },
+            Err(error) => {
+                let message = format!("Could not open repository: {error}");
+                self.load_error = Some(message.clone().into());
+                self.notice = Some(message.into());
+            }
         }
     }
 
@@ -103,6 +127,70 @@ impl ReviewWorkspace {
             self.selected_line = 0;
         }
     }
+}
+
+fn start_repository_picker(cx: &App, entity: Entity<ReviewWorkspace>) {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Open repository".into()),
+    });
+    cx.spawn(async move |cx| {
+        let paths = match receiver.await {
+            Ok(Ok(Some(paths))) => paths,
+            Ok(Ok(None)) => {
+                finish_repository_picker(&entity, cx, None);
+                return;
+            }
+            Ok(Err(error)) => {
+                finish_repository_picker(
+                    &entity,
+                    cx,
+                    Some(format!("Folder picker failed: {error}")),
+                );
+                return;
+            }
+            Err(error) => {
+                finish_repository_picker(
+                    &entity,
+                    cx,
+                    Some(format!("Folder picker did not complete: {error}")),
+                );
+                return;
+            }
+        };
+        let Some(path) = paths.into_iter().next() else {
+            finish_repository_picker(&entity, cx, None);
+            return;
+        };
+
+        let _ = entity.update(cx, |this, cx| {
+            this.notice = Some("Scanning repository changes…".into());
+            cx.notify();
+        });
+        let result = cx
+            .background_executor()
+            .spawn(async move { repository::RepositorySnapshot::open(path) })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            this.apply_repository_result(result);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn finish_repository_picker(
+    entity: &Entity<ReviewWorkspace>,
+    cx: &mut gpui::AsyncApp,
+    notice: Option<String>,
+) {
+    let _ = entity.update(cx, |this, cx| {
+        this.is_opening_repository = false;
+        this.notice = notice.map(Into::into);
+        cx.notify();
+    });
 }
 
 fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
@@ -224,7 +312,14 @@ impl Render for ReviewWorkspace {
             .size_full()
             .bg(rgb(0x0011_1820))
             .text_color(rgb(0x00d5_dee8))
-            .child(self.render_header())
+            .child(self.render_header(cx))
+            .children(self.notice.clone().map(|notice| {
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_color(rgb(0x00b8_dfc4))
+                    .child(notice)
+            }))
             .child(
                 div()
                     .flex()
@@ -238,13 +333,14 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
-    fn render_header(&self) -> impl IntoElement {
+    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let subtitle = match (&self.repository_root, &self.branch) {
             (Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
             (Some(root), None) => format!("{root} · detached HEAD → working tree"),
             (None, None) => "synthetic review workspace".to_string(),
             (None, Some(branch)) => format!("{branch} → working tree"),
         };
+        let entity = cx.entity();
         div()
             .flex()
             .items_center()
@@ -261,6 +357,39 @@ impl ReviewWorkspace {
                     .child(div().text_color(rgb(0x009b_aaba)).child("review workspace")),
             )
             .child(div().text_color(rgb(0x009b_aaba)).child(subtitle))
+            .child(
+                div()
+                    .id("open-repository")
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(if self.is_opening_repository {
+                        0x001b_2732
+                    } else {
+                        0x0026_3442
+                    }))
+                    .cursor_pointer()
+                    .child(if self.is_opening_repository {
+                        "Opening repository…"
+                    } else {
+                        "Open repository…"
+                    })
+                    .on_click(move |_event, _window, cx| {
+                        let entity = entity.clone();
+                        let can_open = entity.update(cx, |this, cx| {
+                            if this.is_opening_repository {
+                                return false;
+                            }
+                            this.is_opening_repository = true;
+                            this.notice = Some("Choose a repository folder to open".into());
+                            cx.notify();
+                            true
+                        });
+                        if !can_open {
+                            return;
+                        }
+                        start_repository_picker(cx, entity);
+                    }),
+            )
     }
 
     fn render_file_rail(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -475,6 +604,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{DIFF_LINE_COUNT, DiffKind, ReviewWorkspace, SAMPLE_FILE_PATHS};
+    use std::fs;
 
     #[test]
     fn review_workspace_generates_large_diff_and_initial_selection() {
@@ -546,5 +676,23 @@ mod tests {
         assert_eq!(file.lines[1].new_number, Some(40));
         assert_eq!(file.lines[2].old_number, Some(21));
         assert_eq!(file.lines[2].new_number, Some(41));
+    }
+
+    #[test]
+    fn opening_a_local_repository_replaces_the_sample_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        gix::init(directory.path()).unwrap();
+        fs::write(directory.path().join("notes.txt"), "local change\n").unwrap();
+        let snapshot = super::repository::RepositorySnapshot::open(directory.path()).unwrap();
+        let mut workspace = ReviewWorkspace::sample();
+
+        workspace.apply_repository_result(Ok(snapshot));
+
+        assert_eq!(workspace.files.len(), 1);
+        assert_eq!(workspace.files[0].path.as_ref(), "notes.txt");
+        assert_eq!(workspace.selected_file, Some(0));
+        assert_eq!(workspace.selected_line, 0);
+        assert!(workspace.repository_root.is_some());
+        assert!(workspace.notice.as_ref().unwrap().contains("read-only"));
     }
 }
