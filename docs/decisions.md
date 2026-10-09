@@ -80,6 +80,11 @@ its conflict, identity, encryption, and authorization semantics are separate
 decisions. Multi-instance write behavior and retention/cleanup policy should be
 revisited before adding durable draft/history records.
 
+The workspace exposes “Review changes” and “Understand a review” as equally
+prominent modes over the same open session. Switching modes changes only the
+visible work focus; it does not reopen or clear the repository/PR, publish
+anything, or discard local drafts.
+
 ### Local comment drafts
 
 Drafts are user-authored and local-only until a future, separately authorized

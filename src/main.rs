@@ -74,6 +74,7 @@ struct ReviewWorkspace {
     pull_request_input: Option<Entity<InputState>>,
     remote_review_state: RemoteReviewState,
     remote_source_context: RemoteSourceContextState,
+    review_mode: ReviewMode,
     selected_file: Option<usize>,
     selected_line: usize,
     diff_scroll_handle: UniformListScrollHandle,
@@ -126,6 +127,12 @@ enum RemoteSourceContextState {
         commit_sha: String,
         message: SharedString,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewMode {
+    ReviewChanges,
+    UnderstandReview,
 }
 
 impl RemoteReviewState {
@@ -188,6 +195,7 @@ impl ReviewWorkspace {
             pull_request_input: None,
             remote_review_state: RemoteReviewState::Idle,
             remote_source_context: RemoteSourceContextState::Idle,
+            review_mode: ReviewMode::ReviewChanges,
             selected_file: Some(0),
             selected_line: 42,
             diff_scroll_handle: UniformListScrollHandle::new(),
@@ -315,6 +323,14 @@ impl ReviewWorkspace {
             path: comment.path.clone(),
             commit_sha: comment.original_commit_id.clone(),
         };
+    }
+
+    fn select_review_mode(&mut self, mode: ReviewMode) {
+        self.review_mode = mode;
+        self.notice = Some(match mode {
+            ReviewMode::ReviewChanges => "Review changes mode selected.".into(),
+            ReviewMode::UnderstandReview => "Understand a review mode selected.".into(),
+        });
     }
 }
 
@@ -603,6 +619,7 @@ impl Render for ReviewWorkspace {
             .bg(rgb(0x0011_1820))
             .text_color(rgb(0x00d5_dee8))
             .child(self.render_header(cx))
+            .child(self.render_mode_switch(cx))
             .child(self.render_github_auth_status())
             .child(self.render_pull_request_loader(cx))
             .children(self.notice.clone().map(|notice| {
@@ -632,6 +649,51 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn render_mode_switch(&self, cx: &Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let modes = [
+            (ReviewMode::ReviewChanges, "Review changes"),
+            (ReviewMode::UnderstandReview, "Understand a review"),
+        ];
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x002b_3946))
+            .children(modes.into_iter().map(|(mode, label)| {
+                let is_selected = self.review_mode == mode;
+                let entity = entity.clone();
+                div()
+                    .id(match mode {
+                        ReviewMode::ReviewChanges => "mode-review-changes",
+                        ReviewMode::UnderstandReview => "mode-understand-review",
+                    })
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(if is_selected {
+                        0x0026_3442
+                    } else {
+                        0x0015_1e27
+                    }))
+                    .text_color(rgb(if is_selected {
+                        0x00f0_f3f6
+                    } else {
+                        0x009b_aaba
+                    }))
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(move |_event, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.select_review_mode(mode);
+                            cx.notify();
+                        });
+                    })
+            }))
+    }
+
     fn render_pull_request_loader(&self, cx: &Context<Self>) -> impl IntoElement {
         let input = self.pull_request_input.as_ref().map(TextInput::new);
         let input_entity = self.pull_request_input.clone();
@@ -1176,38 +1238,7 @@ impl ReviewWorkspace {
                 "The new calculation may return an invalid value without preserving the parser error.",
             ),
         };
-        let review_controls = if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state
-        {
-            let entity = cx.entity();
-            let http = cx.http_client();
-            let access_token = self.github_credentials.as_ref().and_then(|credentials| {
-                (!credentials.access_token_is_expired()).then(|| credentials.access_token.clone())
-            });
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .children(snapshot.reviews.iter().map(render_remote_review_summary))
-                .children(render_remote_review_threads(
-                    &snapshot.review_threads,
-                    entity,
-                    http,
-                    access_token,
-                    snapshot.reference.clone(),
-                ))
-                .children(
-                    snapshot
-                        .conversation_comments
-                        .iter()
-                        .map(render_remote_conversation_comment),
-                )
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(self.render_draft_controls(cx, file.path.as_ref(), line.new_number))
-        };
+        let review_controls = self.render_review_controls(cx, file.path.as_ref(), line.new_number);
         div()
             .flex()
             .flex_col()
@@ -1238,13 +1269,73 @@ impl ReviewWorkspace {
                     .child(line.text.clone()),
             )
             .child(review_controls)
-            .child(render_remote_source_context(&self.remote_source_context))
+            .children(
+                (self.review_mode == ReviewMode::UnderstandReview)
+                    .then(|| render_remote_source_context(&self.remote_source_context)),
+            )
             .child(
                 div()
                     .mt_2()
                     .text_color(rgb(0x0078_8a9b))
                     .child(format!("{} diff rows · virtualized list", file.lines.len())),
             )
+    }
+
+    fn render_review_controls(
+        &self,
+        cx: &Context<Self>,
+        path: &str,
+        selected_line: Option<usize>,
+    ) -> impl IntoElement {
+        match (&self.review_mode, &self.remote_review_state) {
+            (ReviewMode::UnderstandReview, RemoteReviewState::Loaded(snapshot)) => {
+                let entity = cx.entity();
+                let http = cx.http_client();
+                let access_token = self.github_credentials.as_ref().and_then(|credentials| {
+                    (!credentials.access_token_is_expired())
+                        .then(|| credentials.access_token.clone())
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(snapshot.reviews.iter().map(render_remote_review_summary))
+                    .children(render_remote_review_threads(
+                        &snapshot.review_threads,
+                        entity,
+                        http,
+                        access_token,
+                        snapshot.reference.clone(),
+                    ))
+                    .children(
+                        snapshot
+                            .conversation_comments
+                            .iter()
+                            .map(render_remote_conversation_comment),
+                    )
+            }
+            (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child("PR diff loaded · switch to Understand a review to inspect discussions.")
+                .child(format!(
+                    "{} changed files at head {}",
+                    snapshot.files.len(),
+                    short_sha(&snapshot.head_sha)
+                )),
+            (ReviewMode::UnderstandReview, _) => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child("Load a GitHub pull request to inspect its reviews and discussion threads.")
+                .child(self.render_draft_controls(cx, path, selected_line)),
+            (ReviewMode::ReviewChanges, _) => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(self.render_draft_controls(cx, path, selected_line)),
+        }
     }
 
     fn render_draft_controls(
@@ -2069,8 +2160,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewWorkspace, SAMPLE_FILE_PATHS,
-        locate_remote_comment, parse_diff_file, source_excerpt,
+        DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewMode, ReviewWorkspace,
+        SAMPLE_FILE_PATHS, locate_remote_comment, parse_diff_file, source_excerpt,
     };
     use std::fs;
 
@@ -2171,6 +2262,28 @@ mod tests {
         assert!(excerpt.contains("   55 line 55"));
         assert!(!excerpt.contains("line 44"));
         assert!(!excerpt.contains("line 56"));
+    }
+
+    #[test]
+    fn switching_review_modes_preserves_the_open_workspace_and_drafts() {
+        let mut workspace = ReviewWorkspace::sample();
+        let original_file_count = workspace.files.len();
+        let original_selection = workspace.selected_file;
+        let original_draft_count = workspace.comment_drafts.len();
+
+        workspace.select_review_mode(ReviewMode::UnderstandReview);
+
+        assert_eq!(workspace.review_mode, ReviewMode::UnderstandReview);
+        assert_eq!(workspace.files.len(), original_file_count);
+        assert_eq!(workspace.selected_file, original_selection);
+        assert_eq!(workspace.comment_drafts.len(), original_draft_count);
+
+        workspace.select_review_mode(ReviewMode::ReviewChanges);
+
+        assert_eq!(workspace.review_mode, ReviewMode::ReviewChanges);
+        assert_eq!(workspace.files.len(), original_file_count);
+        assert_eq!(workspace.selected_file, original_selection);
+        assert_eq!(workspace.comment_drafts.len(), original_draft_count);
     }
 
     #[test]
