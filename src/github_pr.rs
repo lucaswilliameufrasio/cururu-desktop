@@ -75,7 +75,9 @@ pub struct PullRequestSnapshot {
     pub base_sha: String,
     pub head_sha: String,
     pub files: Vec<cururu_core::ChangedFile>,
-    pub comments: Vec<PullRequestComment>,
+    pub reviews: Vec<PullRequestReview>,
+    pub review_threads: Vec<PullRequestReviewThread>,
+    pub conversation_comments: Vec<PullRequestConversationComment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +90,36 @@ pub struct PullRequestComment {
     pub author: String,
     pub html_url: String,
     pub commit_id: String,
+    pub original_commit_id: String,
+    pub in_reply_to_id: Option<u64>,
+    pub is_outdated: bool,
+    pub subject_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReviewThread {
+    pub root: PullRequestComment,
+    pub replies: Vec<PullRequestComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReview {
+    pub id: u64,
+    pub state: String,
+    pub body: String,
+    pub author: String,
+    pub submitted_at: Option<String>,
+    pub commit_id: Option<String>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestConversationComment {
+    pub id: u64,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+    pub html_url: String,
 }
 
 pub struct GitHubPullRequestClient {
@@ -148,17 +180,32 @@ impl GitHubPullRequestClient {
         let remote_comments: Vec<PullRequestReviewComment> =
             self.get_all_pages(&comments_path).await?;
         let comments = parse_pull_request_comments(remote_comments)?;
+        let review_path = format!("{API_ROOT}{}", reference.api_path("/reviews"));
+        let remote_reviews: Vec<PullRequestReviewResponse> =
+            self.get_all_pages(&review_path).await?;
+        let reviews = parse_pull_request_reviews(remote_reviews)?;
+        let conversation_path = format!(
+            "{API_ROOT}/repos/{}/{}/issues/{}/comments?per_page={PER_PAGE}&page=1",
+            reference.owner, reference.repository, reference.number
+        );
+        let remote_conversation: Vec<PullRequestConversationResponse> =
+            self.get_all_pages(&conversation_path).await?;
+        let conversation_comments = parse_pull_request_conversation(remote_conversation)?;
 
         Ok(PullRequestSnapshot {
             reference,
             title: pull_request.title,
             state: pull_request.state,
-            author: pull_request.user.login,
+            author: pull_request
+                .user
+                .map_or_else(|| "deleted user".to_string(), |user| user.login),
             html_url: pull_request.html_url,
             base_sha: pull_request.base.sha,
             head_sha: pull_request.head.sha,
             files,
-            comments,
+            reviews,
+            review_threads: group_review_threads(comments),
+            conversation_comments,
         })
     }
 
@@ -390,6 +437,9 @@ fn parse_pull_request_comments(
             safe_web_url(&comment.html_url),
             "GitHub returned an invalid review comment URL"
         );
+        let author = comment
+            .user
+            .map_or_else(|| "deleted user".to_string(), |user| user.login);
         comments.push(PullRequestComment {
             id: comment.id,
             path: comment.path,
@@ -398,9 +448,99 @@ fn parse_pull_request_comments(
                 .original_line
                 .and_then(|line| u32::try_from(line).ok()),
             body: comment.body,
-            author: comment.user.login,
+            author,
             html_url: comment.html_url,
             commit_id: comment.commit_id,
+            original_commit_id: comment.original_commit_id,
+            in_reply_to_id: comment.in_reply_to_id,
+            is_outdated: comment.line.is_none() && comment.original_line.is_some(),
+            subject_type: comment.subject_type,
+        });
+    }
+    Ok(comments)
+}
+
+fn group_review_threads(comments: Vec<PullRequestComment>) -> Vec<PullRequestReviewThread> {
+    let mut threads: Vec<PullRequestReviewThread> = Vec::new();
+    let mut replies = Vec::new();
+    for comment in comments {
+        if comment.in_reply_to_id.is_some() {
+            replies.push(comment);
+        } else {
+            threads.push(PullRequestReviewThread {
+                root: comment,
+                replies: Vec::new(),
+            });
+        }
+    }
+    for reply in replies {
+        if let Some(thread) = threads
+            .iter_mut()
+            .find(|thread| Some(thread.root.id) == reply.in_reply_to_id)
+        {
+            thread.replies.push(reply);
+        } else {
+            // Preserve an orphaned reply rather than silently dropping remote discussion.
+            threads.push(PullRequestReviewThread {
+                root: reply,
+                replies: Vec::new(),
+            });
+        }
+    }
+    threads
+}
+
+fn parse_pull_request_reviews(
+    remote_reviews: Vec<PullRequestReviewResponse>,
+) -> anyhow::Result<Vec<PullRequestReview>> {
+    let mut reviews = Vec::with_capacity(remote_reviews.len());
+    for review in remote_reviews {
+        ensure!(
+            review.body.len() <= 64_000,
+            "GitHub review summary exceeds the size limit"
+        );
+        ensure!(
+            safe_web_url(&review.html_url),
+            "GitHub returned an invalid review URL"
+        );
+        let author = review
+            .user
+            .map_or_else(|| "deleted user".to_string(), |user| user.login);
+        reviews.push(PullRequestReview {
+            id: review.id,
+            state: review.state,
+            body: review.body,
+            author,
+            submitted_at: review.submitted_at,
+            commit_id: review.commit_id,
+            html_url: review.html_url,
+        });
+    }
+    Ok(reviews)
+}
+
+fn parse_pull_request_conversation(
+    remote_comments: Vec<PullRequestConversationResponse>,
+) -> anyhow::Result<Vec<PullRequestConversationComment>> {
+    let mut comments = Vec::with_capacity(remote_comments.len());
+    for comment in remote_comments {
+        ensure!(
+            comment.body.len() <= 64_000,
+            "GitHub conversation comment exceeds the size limit"
+        );
+        ensure!(
+            safe_web_url(&comment.html_url),
+            "GitHub returned an invalid conversation comment URL"
+        );
+        let author = comment
+            .user
+            .map_or_else(|| "deleted user".to_string(), |user| user.login);
+        comments.push(PullRequestConversationComment {
+            id: comment.id,
+            body: comment.body,
+            author,
+            created_at: comment.created_at,
+            html_url: comment.html_url,
         });
     }
     Ok(comments)
@@ -412,7 +552,7 @@ struct PullRequestResponse {
     title: String,
     state: String,
     html_url: String,
-    user: GitHubUser,
+    user: Option<GitHubUser>,
     base: PullRequestCommit,
     head: PullRequestCommit,
 }
@@ -445,7 +585,30 @@ struct PullRequestReviewComment {
     body: String,
     html_url: String,
     commit_id: String,
-    user: GitHubUser,
+    original_commit_id: String,
+    in_reply_to_id: Option<u64>,
+    subject_type: Option<String>,
+    user: Option<GitHubUser>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestReviewResponse {
+    id: u64,
+    state: String,
+    body: String,
+    html_url: String,
+    submitted_at: Option<String>,
+    commit_id: Option<String>,
+    user: Option<GitHubUser>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestConversationResponse {
+    id: u64,
+    body: String,
+    html_url: String,
+    created_at: String,
+    user: Option<GitHubUser>,
 }
 
 #[cfg(test)]
@@ -457,7 +620,10 @@ mod tests {
 
     use gpui::http_client::{AsyncBody, HttpClient, Request, Response, Url};
 
-    use super::{GitHubPullRequestClient, PullRequestRef, next_page_url, parse_pull_request_files};
+    use super::{
+        GitHubPullRequestClient, PullRequestRef, group_review_threads, next_page_url,
+        parse_pull_request_comments, parse_pull_request_files,
+    };
 
     struct FakeHttpClient {
         responses: Mutex<VecDeque<Response<AsyncBody>>>,
@@ -548,7 +714,9 @@ mod tests {
             let (client, http) = api_client(&[
                 r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}"#,
                 r#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-before\n+after"}]"#,
-                r#"[{"id":7,"path":"src/lib.rs","line":1,"original_line":1,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"head-sha","user":{"login":"reviewer"}}]"#,
+                r#"[{"id":7,"path":"src/lib.rs","line":1,"original_line":1,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"head-sha","original_commit_id":"base-sha","user":{"login":"reviewer"}}]"#,
+                r#"[{"id":13,"state":"COMMENTED","body":"Review summary","html_url":"https://github.com/octo-org/review_repo/pull/42#pullrequestreview-13","submitted_at":"2026-10-09T12:00:00Z","commit_id":"head-sha","user":{"login":"reviewer"}}]"#,
+                r#"[{"id":17,"body":"Thanks for the report.","html_url":"https://github.com/octo-org/review_repo/pull/42#issuecomment-17","created_at":"2026-10-09T12:01:00Z","user":{"login":"author"}}]"#,
             ]);
             let snapshot = client
                 .load_pull_request(PullRequestRef::parse("octo-org/review_repo#42").unwrap())
@@ -559,10 +727,18 @@ mod tests {
             assert_eq!(snapshot.head_sha, "head-sha");
             assert_eq!(snapshot.files.len(), 1);
             assert!(snapshot.files[0].patch.contains("+after"));
-            assert_eq!(snapshot.comments[0].author, "reviewer");
-            assert!(snapshot.comments[0].body.contains("keep this check"));
+            assert_eq!(snapshot.review_threads.len(), 1);
+            assert_eq!(snapshot.review_threads[0].root.author, "reviewer");
+            assert!(
+                snapshot.review_threads[0]
+                    .root
+                    .body
+                    .contains("keep this check")
+            );
+            assert_eq!(snapshot.reviews[0].state, "COMMENTED");
+            assert_eq!(snapshot.conversation_comments[0].author, "author");
             let requests = http.requests.lock().unwrap();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), 5);
             assert_eq!(
                 requests[0].uri,
                 "https://api.github.com/repos/octo-org/review_repo/pulls/42"
@@ -668,6 +844,25 @@ mod tests {
         )
         .unwrap();
         assert!(parse_pull_request_files(files).is_err());
+    }
+
+    #[test]
+    fn inline_comments_are_grouped_and_outdated_locations_are_not_called_resolved() {
+        let comments = parse_pull_request_comments(
+            serde_json::from_str::<Vec<super::PullRequestReviewComment>>(
+                r#"[
+                    {"id":1,"path":"src/lib.rs","line":null,"original_line":8,"body":"Original point","html_url":"https://github.com/org/repo/pull/1#discussion_r1","commit_id":"head","original_commit_id":"old","user":{"login":"reviewer"}},
+                    {"id":2,"path":"src/lib.rs","line":null,"original_line":8,"body":"Reply","html_url":"https://github.com/org/repo/pull/1#discussion_r2","commit_id":"head","original_commit_id":"old","in_reply_to_id":1,"user":{"login":"author"}}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let threads = group_review_threads(comments);
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].root.is_outdated);
+        assert_eq!(threads[0].replies.len(), 1);
+        assert_eq!(threads[0].replies[0].in_reply_to_id, Some(1));
     }
 
     #[test]
