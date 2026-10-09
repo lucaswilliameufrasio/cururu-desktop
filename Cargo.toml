@@ -11,6 +11,7 @@ anyhow = "1"
 cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "3ea5deb" }
 directories = "6"
 gpui = "0.2.2"
+gpui-component = { version = "=0.3.0", default-features = false }
 gix = { version = "=0.85.0", default-features = false, features = ["basic", "parallel", "sha1", "status"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 similar = "2"

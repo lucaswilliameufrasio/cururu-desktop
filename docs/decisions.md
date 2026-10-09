@@ -90,3 +90,11 @@ requires an explicit user action; changing selection or reopening the app never
 deletes a draft. If the repository HEAD differs when drafts are loaded, show the
 draft as stale and preserve its original anchor. Do not automatically relocate,
 publish, or discard stale drafts. Store no source-line snapshots.
+
+The draft editor uses `gpui-component` 0.3.0, pinned exactly because that
+release targets GPUI 0.2.2; newer releases target a different GPUI generation.
+Its Apache-2.0 license is compatible with this project's dual MIT/Apache-2.0
+license. Default features stay disabled. This accepts a wider transitive
+dependency graph in exchange for reusing the library's multiline native text
+input, including platform text-input handling, instead of maintaining a custom
+editor in the app.
