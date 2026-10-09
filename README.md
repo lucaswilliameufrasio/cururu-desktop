@@ -51,9 +51,10 @@ With a valid GitHub session, enter a PR as `owner/repository#number` and choose
 submissions, inline comment threads, and general conversation comments. Inline
 comments whose current line is absent but original line is known are marked as
 outdated locations; this does not mean the concern was resolved. This is
-read-only; missing or oversized patches fail closed instead of showing an
-incomplete diff. Loading a remote PR does not send code to an evaluator or
-publish comments.
+read-only; choosing an inline comment focuses its file and diff line when that
+anchor is present in the loaded patch. Missing or oversized patches fail closed
+instead of showing an incomplete diff. Loading a remote PR does not send code
+to an evaluator or publish comments.
 
 ## Run
 
