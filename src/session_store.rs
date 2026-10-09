@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,7 +8,8 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSession {
@@ -17,6 +18,16 @@ pub struct StoredSession {
     pub head_oid: Option<String>,
     pub created_at: i64,
     pub last_opened_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCommentDraft {
+    pub id: i64,
+    pub draft: cururu_core::ReviewCommentDraft,
+    pub base_head_oid: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub is_stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +103,100 @@ impl SessionStore {
             .context("failed to read the saved local review session")
     }
 
+    pub fn save_comment_draft(
+        &self,
+        repository_root: &Path,
+        base_head_oid: Option<&str>,
+        draft: &cururu_core::ReviewCommentDraft,
+    ) -> anyhow::Result<StoredCommentDraft> {
+        let repository_root = repository_root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("repository path is not UTF-8 and cannot be resumed"))?;
+        validate_draft(draft)?;
+        let line =
+            i64::from(draft.line.ok_or_else(|| {
+                anyhow::anyhow!("a local comment draft requires a new-side line")
+            })?);
+        let stored_head = base_head_oid.unwrap_or_default();
+        let now = unix_timestamp()?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO comment_drafts \
+                 (repository_root, path, line, base_head_oid, body, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+                 ON CONFLICT(repository_root, path, line, base_head_oid) DO UPDATE SET \
+                 body = excluded.body, updated_at = excluded.updated_at",
+                params![
+                    repository_root,
+                    draft.path,
+                    line,
+                    stored_head,
+                    draft.body,
+                    now
+                ],
+            )
+            .context("failed to save the local comment draft")?;
+        connection
+            .query_row(
+                "SELECT id, path, line, base_head_oid, body, created_at, updated_at \
+                 FROM comment_drafts \
+                 WHERE repository_root = ?1 AND path = ?2 AND line = ?3 AND base_head_oid = ?4",
+                params![repository_root, draft.path, line, stored_head],
+                |row| stored_comment_draft_from_row(row, base_head_oid),
+            )
+            .context("failed to read the saved local comment draft")
+    }
+
+    pub fn comment_drafts(
+        &self,
+        repository_root: &Path,
+        current_head_oid: Option<&str>,
+    ) -> anyhow::Result<Vec<StoredCommentDraft>> {
+        let repository_root = repository_root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("repository path is not UTF-8 and cannot be resumed"))?;
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, path, line, base_head_oid, body, created_at, updated_at \
+                 FROM comment_drafts WHERE repository_root = ?1 \
+                 ORDER BY updated_at DESC, id ASC",
+            )
+            .context("failed to prepare local comment draft lookup")?;
+        let rows = statement
+            .query_map([repository_root], |row| {
+                let base_head: String = row.get(3)?;
+                let mut draft = stored_comment_draft_from_row(row, None)?;
+                draft.is_stale = base_head != current_head_oid.unwrap_or_default();
+                Ok(draft)
+            })
+            .context("failed to query local comment drafts")?;
+        let mut drafts = Vec::new();
+        for row in rows {
+            drafts.push(row.context("failed to read a local comment draft")?);
+        }
+        Ok(drafts)
+    }
+
+    pub fn delete_comment_draft(
+        &self,
+        repository_root: &Path,
+        draft_id: i64,
+    ) -> anyhow::Result<bool> {
+        let repository_root = repository_root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("repository path is not UTF-8 and cannot be resumed"))?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "DELETE FROM comment_drafts WHERE repository_root = ?1 AND id = ?2",
+                params![repository_root, draft_id],
+            )
+            .map(|rows_changed| rows_changed > 0)
+            .context("failed to delete the local comment draft")
+    }
+
     fn initialize(&self) -> anyhow::Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -118,14 +223,88 @@ impl SessionStore {
                 )
                 .context("failed to apply local session database migration 1")?;
         }
+        if version < 2 {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE comment_drafts (\
+                         id INTEGER PRIMARY KEY,\
+                         repository_root TEXT NOT NULL REFERENCES local_sessions(repository_root) ON DELETE CASCADE,\
+                         path TEXT NOT NULL,\
+                         line INTEGER NOT NULL CHECK(line > 0),\
+                         base_head_oid TEXT NOT NULL,\
+                         body TEXT NOT NULL,\
+                         created_at INTEGER NOT NULL,\
+                         updated_at INTEGER NOT NULL,\
+                         UNIQUE(repository_root, path, line, base_head_oid)\
+                     );\
+                     CREATE INDEX comment_drafts_by_repository_updated \
+                         ON comment_drafts(repository_root, updated_at DESC);\
+                     PRAGMA user_version = 2;",
+                )
+                .context("failed to apply local session database migration 2")?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
     }
 
     fn connect(&self) -> anyhow::Result<Connection> {
-        Connection::open(&self.database_path).context("failed to open the local session database")
+        let connection = Connection::open(&self.database_path)
+            .context("failed to open the local session database")?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .context("failed to enable local session database constraints")?;
+        Ok(connection)
     }
+}
+
+fn validate_draft(draft: &cururu_core::ReviewCommentDraft) -> anyhow::Result<()> {
+    anyhow::ensure!(!draft.path.is_empty(), "draft path must not be empty");
+    anyhow::ensure!(
+        Path::new(&draft.path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "draft path must be repository-relative and safe"
+    );
+    anyhow::ensure!(
+        !draft.path.chars().any(char::is_control),
+        "draft path must not contain control characters"
+    );
+    anyhow::ensure!(
+        !draft.body.trim().is_empty(),
+        "draft body must not be empty"
+    );
+    anyhow::ensure!(
+        draft.body.len() <= MAX_DRAFT_BODY_BYTES,
+        "draft body exceeds the 64,000-byte local limit"
+    );
+    anyhow::ensure!(
+        draft.line.is_some_and(|line| line > 0),
+        "draft line must be positive"
+    );
+    Ok(())
+}
+
+fn stored_comment_draft_from_row(
+    row: &rusqlite::Row<'_>,
+    current_head_oid: Option<&str>,
+) -> rusqlite::Result<StoredCommentDraft> {
+    let path: String = row.get(1)?;
+    let line: i64 = row.get(2)?;
+    let base_head: String = row.get(3)?;
+    let body: String = row.get(4)?;
+    Ok(StoredCommentDraft {
+        id: row.get(0)?,
+        draft: cururu_core::ReviewCommentDraft {
+            path,
+            line: u32::try_from(line).ok(),
+            body,
+        },
+        base_head_oid: (!base_head.is_empty()).then_some(base_head.clone()),
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        is_stale: base_head != current_head_oid.unwrap_or_default(),
+    })
 }
 
 fn stored_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
@@ -150,6 +329,14 @@ fn unix_timestamp() -> anyhow::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::SessionStore;
+
+    fn draft(path: &str, line: Option<u32>, body: &str) -> cururu_core::ReviewCommentDraft {
+        cururu_core::ReviewCommentDraft {
+            path: path.to_string(),
+            line,
+            body: body.to_string(),
+        }
+    }
 
     #[test]
     fn local_sessions_round_trip_and_update_last_opened_repository_state() {
@@ -198,6 +385,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opening_a_version_one_database_migrates_it_to_comment_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("legacy.sqlite3");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE local_sessions (\
+                     repository_root TEXT PRIMARY KEY NOT NULL,\
+                     branch TEXT,\
+                     head_oid TEXT,\
+                     created_at INTEGER NOT NULL,\
+                     last_opened_at INTEGER NOT NULL\
+                 );\
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SessionStore::open(&database_path).unwrap();
+        let repository_root = directory.path().join("repo");
+        store
+            .record_opened(&repository_root, Some("main"), Some("head"))
+            .unwrap();
+        let saved = store
+            .save_comment_draft(
+                &repository_root,
+                Some("head"),
+                &draft("src/lib.rs", Some(7), "Legacy schema migration works."),
+            )
+            .unwrap();
+
+        assert_eq!(saved.draft.line, Some(7));
+        assert!(!saved.is_stale);
+    }
+
     #[cfg(unix)]
     #[test]
     fn paths_that_cannot_be_represented_as_utf8_are_not_saved_as_lossy_paths() {
@@ -212,5 +435,76 @@ mod tests {
         let result = store.record_opened(&invalid_path, None, None);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn comment_drafts_round_trip_update_and_become_stale_without_being_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_root = directory.path().join("repo");
+        let store = SessionStore::open(directory.path().join("sessions.sqlite3")).unwrap();
+        store
+            .record_opened(&repository_root, Some("main"), Some("base-1"))
+            .unwrap();
+
+        let first = store
+            .save_comment_draft(
+                &repository_root,
+                Some("base-1"),
+                &draft("src/lib.rs", Some(12), "Please handle this case."),
+            )
+            .unwrap();
+        assert!(!first.is_stale);
+        assert_eq!(first.draft.body, "Please handle this case.");
+
+        let updated = store
+            .save_comment_draft(
+                &repository_root,
+                Some("base-1"),
+                &draft("src/lib.rs", Some(12), "Please handle this case safely."),
+            )
+            .unwrap();
+        assert_eq!(updated.id, first.id);
+        assert_eq!(updated.created_at, first.created_at);
+        assert_eq!(updated.draft.body, "Please handle this case safely.");
+
+        let stale = store
+            .comment_drafts(&repository_root, Some("base-2"))
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].is_stale);
+        assert_eq!(stale[0].draft.line, Some(12));
+        assert_eq!(stale[0].draft.body, "Please handle this case safely.");
+
+        assert!(
+            store
+                .delete_comment_draft(&repository_root, first.id)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .comment_drafts(&repository_root, Some("base-1"))
+                .unwrap(),
+            []
+        );
+    }
+
+    #[test]
+    fn comment_drafts_reject_unsafe_paths_missing_lines_and_empty_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_root = directory.path().join("repo");
+        let store = SessionStore::open(directory.path().join("sessions.sqlite3")).unwrap();
+        store.record_opened(&repository_root, None, None).unwrap();
+
+        for invalid in [
+            draft("../outside.rs", Some(1), "comment"),
+            draft("src/lib.rs", None, "comment"),
+            draft("src/lib.rs", Some(1), " \n "),
+        ] {
+            assert!(
+                store
+                    .save_comment_draft(&repository_root, None, &invalid)
+                    .is_err()
+            );
+        }
     }
 }

@@ -79,3 +79,14 @@ stored locally, but must not duplicate source text by default. Cloud sync and
 its conflict, identity, encryption, and authorization semantics are separate
 decisions. Multi-instance write behavior and retention/cleanup policy should be
 revisited before adding durable draft/history records.
+
+### Local comment drafts
+
+Drafts are user-authored and local-only until a future, separately authorized
+publication flow exists. A draft anchors to a repository-relative path, a
+positive line on the new side of the diff, and the HEAD OID observed when the
+draft is saved. Removed-only lines cannot receive a draft in this slice. Saving
+requires an explicit user action; changing selection or reopening the app never
+deletes a draft. If the repository HEAD differs when drafts are loaded, show the
+draft as stale and preserve its original anchor. Do not automatically relocate,
+publish, or discard stale drafts. Store no source-line snapshots.
