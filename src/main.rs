@@ -5,6 +5,7 @@ use gpui::{
 use gpui_component::input::{InputState, TextInput};
 use std::{fmt::Write as _, ops::Range, path::PathBuf};
 
+pub mod github_auth;
 pub mod repository;
 pub mod session_store;
 
