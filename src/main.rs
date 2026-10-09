@@ -7,6 +7,7 @@ use gpui::{
 use gpui_component::input::{InputState, TextInput};
 use std::{
     fmt::Write as _,
+    future::Future,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -17,6 +18,7 @@ use std::{
 };
 
 pub mod github_auth;
+pub mod github_pr;
 pub mod repository;
 pub mod session_store;
 
@@ -69,6 +71,8 @@ struct ReviewWorkspace {
     github_app_client_id: Option<String>,
     github_auth_state: GitHubAuthState,
     github_credentials: Option<github_auth::StoredCredentials>,
+    pull_request_input: Option<Entity<InputState>>,
+    remote_review_state: RemoteReviewState,
     selected_file: Option<usize>,
     selected_line: usize,
 }
@@ -90,6 +94,44 @@ enum GitHubAuthState {
     ReauthorizationRequired,
     Disconnecting,
     Failed(SharedString),
+}
+
+enum RemoteReviewState {
+    Idle,
+    Loading(github_pr::PullRequestRef),
+    Loaded(github_pr::PullRequestSnapshot),
+    Failed {
+        reference: github_pr::PullRequestRef,
+        message: SharedString,
+    },
+}
+
+impl RemoteReviewState {
+    const fn blocks_local_drafts(&self) -> bool {
+        matches!(self, Self::Loading(_) | Self::Loaded(_))
+    }
+}
+
+fn remote_review_status(state: &RemoteReviewState) -> String {
+    match state {
+        RemoteReviewState::Loading(reference) => {
+            format!("Loading {}#{}…", reference.owner, reference.number)
+        }
+        RemoteReviewState::Loaded(snapshot) => format!(
+            "Loaded {}#{} · {} files · {} review comments",
+            snapshot.reference.owner,
+            snapshot.reference.number,
+            snapshot.files.len(),
+            snapshot.comments.len()
+        ),
+        RemoteReviewState::Failed { reference, message } => format!(
+            "Could not load {}#{}: {message}",
+            reference.owner, reference.number
+        ),
+        RemoteReviewState::Idle => {
+            "Read-only GitHub PR review · content is not sent to an evaluator.".to_string()
+        }
+    }
 }
 
 impl ReviewWorkspace {
@@ -119,6 +161,8 @@ impl ReviewWorkspace {
             github_app_client_id: std::env::var("CURURU_GITHUB_APP_CLIENT_ID").ok(),
             github_auth_state: GitHubAuthState::Uninitialized,
             github_credentials: None,
+            pull_request_input: None,
+            remote_review_state: RemoteReviewState::Idle,
             selected_file: Some(0),
             selected_line: 42,
         }
@@ -154,6 +198,7 @@ impl ReviewWorkspace {
         match result {
             Ok(opened) => {
                 let snapshot = opened.snapshot;
+                self.remote_review_state = RemoteReviewState::Idle;
                 self.head_oid.clone_from(&snapshot.head_oid);
                 let files = snapshot
                     .changed_files
@@ -468,6 +513,11 @@ impl Render for ReviewWorkspace {
                     .placeholder("Write a local review comment…")
             }));
         }
+        if self.pull_request_input.is_none() {
+            self.pull_request_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx).placeholder("owner/repository#123")
+            }));
+        }
         div()
             .flex()
             .flex_col()
@@ -476,6 +526,7 @@ impl Render for ReviewWorkspace {
             .text_color(rgb(0x00d5_dee8))
             .child(self.render_header(cx))
             .child(self.render_github_auth_status())
+            .child(self.render_pull_request_loader(cx))
             .children(self.notice.clone().map(|notice| {
                 div()
                     .px_4()
@@ -503,17 +554,125 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn render_pull_request_loader(&self, cx: &Context<Self>) -> impl IntoElement {
+        let input = self.pull_request_input.as_ref().map(TextInput::new);
+        let input_entity = self.pull_request_input.clone();
+        let is_loading = matches!(self.remote_review_state, RemoteReviewState::Loading(_));
+        let label = remote_review_status(&self.remote_review_state);
+        let entity = cx.entity();
+        let http = cx.http_client();
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x002b_3946))
+            .children(input)
+            .child(
+                div()
+                    .id("load-github-pull-request")
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(if is_loading { 0x001b_2732 } else { 0x0026_3442 }))
+                    .cursor_pointer()
+                    .child(if is_loading {
+                        "Loading pull request…"
+                    } else {
+                        "Open GitHub PR"
+                    })
+                    .on_click(move |_event, _window, cx| {
+                        let Some(input) = input_entity.clone() else {
+                            return;
+                        };
+                        let reference_text = input.read(cx).value().to_string();
+                        let reference = match github_pr::PullRequestRef::parse(&reference_text) {
+                            Ok(reference) => reference,
+                            Err(error) => {
+                                entity.update(cx, |this, cx| {
+                                    this.notice = Some(error.to_string().into());
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                        };
+                        let credentials = entity.read(cx).github_credentials.clone();
+                        let Some(credentials) = credentials else {
+                            entity.update(cx, |this, cx| {
+                                this.notice = Some(
+                                    "Connect or refresh GitHub before opening a pull request."
+                                        .into(),
+                                );
+                                cx.notify();
+                            });
+                            return;
+                        };
+                        if credentials.access_token_is_expired() {
+                            entity.update(cx, |this, cx| {
+                                this.github_auth_state = GitHubAuthState::ReauthorizationRequired;
+                                this.notice = Some(
+                                    "GitHub session expired; refresh it before opening a pull request."
+                                        .into(),
+                                );
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        let token = credentials.access_token;
+                        let can_load = entity.update(cx, |this, cx| {
+                            if matches!(this.remote_review_state, RemoteReviewState::Loading(_)) {
+                                return false;
+                            }
+                            this.notice = Some("Loading pull request from GitHub…".into());
+                            this.remote_review_state =
+                                RemoteReviewState::Loading(reference.clone());
+                            cx.notify();
+                            true
+                        });
+                        if can_load {
+                            start_pull_request_load(
+                                entity.clone(),
+                                http.clone(),
+                                token,
+                                reference,
+                                cx,
+                            );
+                        }
+                    }),
+            )
+            .child(div().text_color(rgb(0x009b_aaba)).child(label))
+    }
+
     fn handle_github_auth_action(
         &mut self,
         http: Arc<dyn gpui::http_client::HttpClient>,
         cx: &mut Context<Self>,
     ) {
+        let access_token_expired = self
+            .github_credentials
+            .as_ref()
+            .is_some_and(github_auth::StoredCredentials::access_token_is_expired);
         match &self.github_auth_state {
             GitHubAuthState::AwaitingDeviceAuthorization { cancel, .. } => {
                 cancel.store(true, Ordering::Release);
                 self.github_auth_state = GitHubAuthState::SignedOut;
                 self.notice = Some("GitHub sign-in cancelled.".into());
                 cx.notify();
+            }
+            GitHubAuthState::SignedIn if access_token_expired => {
+                let (Some(client_id), Some(credentials)) = (
+                    self.github_app_client_id.clone(),
+                    self.github_credentials.clone(),
+                ) else {
+                    self.github_auth_state = GitHubAuthState::Failed(
+                        "Configure CURURU_GITHUB_APP_CLIENT_ID before refreshing GitHub.".into(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                self.github_auth_state = GitHubAuthState::RefreshingToken;
+                start_github_refresh(cx.entity(), client_id, http, credentials, cx);
             }
             GitHubAuthState::SignedIn => {
                 self.github_auth_state = GitHubAuthState::Disconnecting;
@@ -634,11 +793,22 @@ impl ReviewWorkspace {
     }
 
     fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
-        let subtitle = match (&self.repository_root, &self.branch) {
-            (Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
-            (Some(root), None) => format!("{root} · detached HEAD → working tree"),
-            (None, None) => "synthetic review workspace".to_string(),
-            (None, Some(branch)) => format!("{branch} → working tree"),
+        let subtitle = match (
+            &self.remote_review_state,
+            &self.repository_root,
+            &self.branch,
+        ) {
+            (RemoteReviewState::Loaded(snapshot), _, _) => format!(
+                "{}#{} · {} · {}",
+                snapshot.reference.owner, snapshot.reference.number, snapshot.state, snapshot.title
+            ),
+            (RemoteReviewState::Loading(reference), _, _) => {
+                format!("Loading {}#{}", reference.owner, reference.number)
+            }
+            (_, Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
+            (_, Some(root), None) => format!("{root} · detached HEAD → working tree"),
+            (_, None, None) => "synthetic review workspace".to_string(),
+            (_, None, Some(branch)) => format!("{branch} → working tree"),
         };
         let entity = cx.entity();
         let store = self.session_store.clone();
@@ -727,6 +897,14 @@ impl ReviewWorkspace {
 
     fn render_github_auth_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let label = match self.github_auth_state {
+            GitHubAuthState::SignedIn
+                if self
+                    .github_credentials
+                    .as_ref()
+                    .is_some_and(github_auth::StoredCredentials::access_token_is_expired) =>
+            {
+                "Refresh GitHub session"
+            }
             GitHubAuthState::SignedIn => "Disconnect GitHub",
             GitHubAuthState::AwaitingDeviceAuthorization { .. } => "Cancel sign-in",
             GitHubAuthState::StartingDeviceFlow => "Connecting…",
@@ -899,18 +1077,38 @@ impl ReviewWorkspace {
         };
         let file = &self.files[selected_file];
         let line = &file.lines[self.selected_line];
-        let (label, title, description) = if self.repository_root.is_some() {
-            (
+        let (label, title, description): (&str, SharedString, &str) = match &self
+            .remote_review_state
+        {
+            RemoteReviewState::Loaded(snapshot) => (
+                "GITHUB PULL REQUEST",
+                snapshot.title.clone().into(),
+                "Read-only review context · remote comments are not local drafts.",
+            ),
+            _ if self.repository_root.is_some() => (
                 "LOCAL CHANGE",
-                "Working-tree diff",
+                "Working-tree diff".into(),
                 "No automated finding is attached to this line.",
-            )
-        } else {
-            (
+            ),
+            _ => (
                 "SYNTHETIC FINDING · HIGH",
-                "Unchecked result can escape",
+                "Unchecked result can escape".into(),
                 "The new calculation may return an invalid value without preserving the parser error.",
-            )
+            ),
+        };
+        let review_controls = if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state
+        {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(render_remote_review_comments(&snapshot.comments))
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(self.render_draft_controls(cx, file.path.as_ref(), line.new_number))
         };
         div()
             .flex()
@@ -941,7 +1139,7 @@ impl ReviewWorkspace {
                     .text_color(rgb(0x00b8_dfc4))
                     .child(line.text.clone()),
             )
-            .child(self.render_draft_controls(cx, file.path.as_ref(), line.new_number))
+            .child(review_controls)
             .child(
                 div()
                     .mt_2()
@@ -957,6 +1155,7 @@ impl ReviewWorkspace {
         selected_line: Option<usize>,
     ) -> impl IntoElement {
         let can_comment = self.repository_root.is_some()
+            && !self.remote_review_state.blocks_local_drafts()
             && (selected_line.is_some() || self.editing_draft.is_some());
         let draft_input = can_comment
             .then(|| self.draft_input.as_ref().map(TextInput::new))
@@ -1145,6 +1344,91 @@ impl ReviewWorkspace {
     }
 }
 
+fn start_pull_request_load(
+    entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: String,
+    reference: github_pr::PullRequestRef,
+    cx: &App,
+) {
+    cx.spawn(async move |cx| {
+        let result = async {
+            let client = github_pr::GitHubPullRequestClient::new(http, access_token)?;
+            with_network_timeout(
+                client.load_pull_request(reference.clone()),
+                cx.background_executor(),
+            )
+            .await
+        }
+        .await;
+        let _ = entity.update(cx, |this, cx| {
+            match result {
+                Ok(snapshot) => {
+                    this.files = snapshot
+                        .files
+                        .iter()
+                        .cloned()
+                        .map(parse_diff_file)
+                        .collect();
+                    this.selected_file = (!this.files.is_empty()).then_some(0);
+                    this.selected_line = 0;
+                    this.remote_review_state = RemoteReviewState::Loaded(snapshot);
+                    this.notice = Some("Pull request loaded read-only from GitHub.".into());
+                }
+                Err(error) => {
+                    this.remote_review_state = RemoteReviewState::Failed {
+                        reference,
+                        message: error.to_string().into(),
+                    };
+                    this.notice = Some(
+                        "GitHub pull request could not be loaded; no partial diff was applied."
+                            .into(),
+                    );
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+async fn with_network_timeout<T>(
+    operation: impl Future<Output = anyhow::Result<T>>,
+    executor: &BackgroundExecutor,
+) -> anyhow::Result<T> {
+    let timeout = executor.timer(Duration::from_secs(30));
+    futures::pin_mut!(operation);
+    futures::pin_mut!(timeout);
+    match futures::future::select(operation, timeout).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), _)) => {
+            anyhow::bail!("GitHub request timed out after 30 seconds")
+        }
+    }
+}
+
+fn render_remote_review_comments(
+    comments: &[github_pr::PullRequestComment],
+) -> impl IntoIterator<Item = impl IntoElement> + '_ {
+    comments.iter().map(|comment| {
+        div()
+            .p_2()
+            .bg(rgb(0x0020_2b36))
+            .child(format!(
+                "{}:{} · @{}",
+                comment.path,
+                comment.line.or(comment.original_line).unwrap_or_default(),
+                comment.author
+            ))
+            .child(
+                div()
+                    .mt_1()
+                    .text_color(rgb(0x00b5_c0cb))
+                    .child(comment.body.clone()),
+            )
+    })
+}
+
 fn start_github_device_login(
     entity: Entity<ReviewWorkspace>,
     client_id: String,
@@ -1155,7 +1439,8 @@ fn start_github_device_login(
         let task_entity = entity.clone();
         let result = async {
             let flow = github_auth::GitHubDeviceFlow::new(client_id, http)?;
-            let authorization = flow.request_device_code().await?;
+            let authorization =
+                with_network_timeout(flow.request_device_code(), cx.background_executor()).await?;
             let cancel = Arc::new(AtomicBool::new(false));
             let verification_url = authorization.verification_uri.to_string();
             cx.update(|app| app.open_url(&verification_url))
@@ -1221,23 +1506,45 @@ async fn poll_for_device_authorization(
 ) -> anyhow::Result<Option<github_auth::StoredCredentials>> {
     let mut interval = authorization.polling_interval;
     loop {
-        if cancel.load(Ordering::Acquire) {
+        if wait_for_poll_interval(interval, authorization.expires_at, cancel, executor).await {
             return Ok(None);
         }
         if Instant::now() >= authorization.expires_at {
             anyhow::bail!("GitHub device code expired; start sign-in again");
         }
-        executor.timer(interval).await;
+        let poll = with_network_timeout(flow.poll(authorization), executor).await?;
         if cancel.load(Ordering::Acquire) {
             return Ok(None);
         }
-        match flow.poll(authorization).await? {
+        match poll {
             github_auth::DevicePoll::Pending => {}
             github_auth::DevicePoll::SlowDown => {
                 interval += Duration::from_secs(5);
             }
             github_auth::DevicePoll::Authorized(credentials) => return Ok(Some(credentials)),
         }
+    }
+}
+
+async fn wait_for_poll_interval(
+    interval: Duration,
+    expires_at: Instant,
+    cancel: &AtomicBool,
+    executor: &BackgroundExecutor,
+) -> bool {
+    let poll_at = Instant::now() + interval;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= poll_at || now >= expires_at {
+            return false;
+        }
+        let remaining = poll_at.saturating_duration_since(now);
+        executor
+            .timer(remaining.min(Duration::from_millis(100)))
+            .await;
     }
 }
 
@@ -1252,7 +1559,8 @@ fn start_github_refresh(
         let task_entity = entity.clone();
         let result = async {
             let flow = github_auth::GitHubDeviceFlow::new(client_id, http)?;
-            let refreshed = flow.refresh(&credentials).await?;
+            let refreshed =
+                with_network_timeout(flow.refresh(&credentials), cx.background_executor()).await?;
             let refreshed_to_store = refreshed.clone();
             cx.background_executor()
                 .spawn(async move { github_auth::CredentialStore::save(&refreshed_to_store) })
@@ -1408,7 +1716,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIFF_LINE_COUNT, DiffKind, ReviewWorkspace, SAMPLE_FILE_PATHS};
+    use super::{DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewWorkspace, SAMPLE_FILE_PATHS};
     use std::fs;
 
     #[test]
@@ -1446,6 +1754,27 @@ mod tests {
             }
         }
         assert_eq!(anchored_lines, file.lines.len() - file.removed);
+    }
+
+    #[test]
+    fn local_drafts_are_blocked_while_loading_or_reviewing_a_remote_pull_request() {
+        let reference = crate::github_pr::PullRequestRef::parse("octo/repo#9").unwrap();
+        assert!(!RemoteReviewState::Idle.blocks_local_drafts());
+        assert!(RemoteReviewState::Loading(reference.clone()).blocks_local_drafts());
+        assert!(
+            RemoteReviewState::Loaded(crate::github_pr::PullRequestSnapshot {
+                reference,
+                title: "remote review".to_string(),
+                state: "open".to_string(),
+                author: "octocat".to_string(),
+                html_url: "https://github.com/octo/repo/pull/9".to_string(),
+                base_sha: "base".to_string(),
+                head_sha: "head".to_string(),
+                files: Vec::new(),
+                comments: Vec::new(),
+            })
+            .blocks_local_drafts()
+        );
     }
 
     #[test]

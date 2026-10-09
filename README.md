@@ -46,6 +46,12 @@ This currently enables authentication only; remote pull-request review and
 publishing are not implemented. **Disconnect GitHub** removes local credentials
 but does not revoke the grant at GitHub.
 
+With a valid GitHub session, enter a PR as `owner/repository#number` and choose
+**Open GitHub PR** to load its metadata, changed-file patches, and review
+comments. This is read-only; missing or oversized patches fail closed instead
+of showing an incomplete diff. Loading a remote PR does not send code to an
+evaluator and does not publish comments.
+
 ## Run
 
 ```sh

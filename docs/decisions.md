@@ -132,3 +132,16 @@ user access, and expiring tokens last 8 hours with refresh tokens lasting 6
 months. Before the flow can run against GitHub, register/configure the app with
 Device Flow enabled and supply its public client ID. App registration itself
 is not part of this repository change.
+
+### Read-only pull-request inspection
+
+The initial remote review journey identifies a PR with an explicit
+`owner/repository#number` supplied by the user. Do not infer the target PR
+repository from a local `origin`: a fork's `origin` can differ from the PR base
+repository. Use named GitHub API operations to read PR metadata, changed-file
+patches, and review comments. Follow only HTTPS pagination links on
+`api.github.com`, use bounded pages/responses/diffs, and fail closed when a
+patch is missing or incomplete. This first remote slice is read-only and does
+not invoke the evaluator or persist remote content. Publication remains a
+separate, explicitly confirmed feature; revisit repository discovery when a
+multi-repository chooser is designed.
