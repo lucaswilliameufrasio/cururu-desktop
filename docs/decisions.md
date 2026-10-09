@@ -105,3 +105,30 @@ license. Default features stay disabled. This accepts a wider transitive
 dependency graph in exchange for reusing the library's multiline native text
 input, including platform text-input handling, instead of maintaining a custom
 editor in the app.
+
+## GitHub authentication
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-09
+
+Use a GitHub App, not an OAuth App, for the desktop's first remote integration.
+Use the OAuth 2.0 Device Flow intended for native/desktop clients; do not embed
+a client secret. Request expiring user access tokens with `offline_access`, and
+store access/refresh tokens only in the operating-system credential store. If
+that store is unavailable, fail closed rather than writing credentials to
+SQLite or plaintext. The public GitHub App client ID is runtime/build
+configuration and is not a secret.
+
+Request only `Contents: read` and `Pull requests: read/write` for the approved
+remote review capabilities; users still need the corresponding repository
+access. Publishing remains a separate, explicit confirmation and is never
+triggered by login or switching review modes. An optional `gh` fallback may be
+used only after the user chooses it; do not copy its token into Cururu storage
+or expose it in logs/output.
+
+GitHub's current documentation states that device flow can be used by desktop
+applications; GitHub App user tokens can be bounded by app permissions and
+user access, and expiring tokens last 8 hours with refresh tokens lasting 6
+months. Before the flow can run against GitHub, register/configure the app with
+Device Flow enabled and supply its public client ID. App registration itself
+is not part of this repository change.
