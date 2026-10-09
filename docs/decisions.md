@@ -91,6 +91,13 @@ deletes a draft. If the repository HEAD differs when drafts are loaded, show the
 draft as stale and preserve its original anchor. Do not automatically relocate,
 publish, or discard stale drafts. Store no source-line snapshots.
 
+Drafts have no automatic expiry: they remain until the user explicitly deletes
+them. Multiple app instances may use the local SQLite store; edits use a
+revision check inside an immediate transaction, and a stale writer receives a
+conflict instead of silently overwriting newer text. This is local concurrency
+only, not cloud synchronization. When a conflict occurs, reload the repository
+and draft before retrying. Revisit if drafts become synchronized or shared.
+
 The draft editor uses `gpui-component` 0.3.0, pinned exactly because that
 release targets GPUI 0.2.2; newer releases target a different GPUI generation.
 Its Apache-2.0 license is compatible with this project's dual MIT/Apache-2.0

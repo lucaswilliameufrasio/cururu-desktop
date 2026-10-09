@@ -34,6 +34,9 @@ In an opened repository, select a line on the new side of the diff to write and
 save a local comment draft. Drafts are anchored to the path, line, and observed
 HEAD; they are never published. Drafts from a different HEAD are marked stale
 and kept at their original anchor rather than silently moved or discarded.
+Click a saved draft to edit it, or explicitly delete it; drafts do not expire
+automatically. Multiple app instances are supported, and conflicting edits are
+rejected rather than silently overwriting newer text.
 
 ## Run
 
