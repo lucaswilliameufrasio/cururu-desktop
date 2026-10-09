@@ -145,6 +145,10 @@ current line with an original line is shown as an outdated location, not as a
 resolved concern. Follow only HTTPS pagination links on `api.github.com`, use
 bounded pages/responses/diffs, and fail closed when a patch is missing or
 incomplete. This remote review slice is read-only and does not invoke the
-evaluator or persist remote content. Publication remains a separate, explicitly
-confirmed feature; revisit repository discovery when a multi-repository chooser
-is designed.
+evaluator or persist remote content. When the user selects an inline comment,
+fetch its source file on demand at `original_commit_id` using the GitHub
+Contents API; cap files at 256 KiB, decode only base64 UTF-8 text, show a small
+bounded excerpt, and retain it only in memory. Do not fetch source files for all
+comments automatically. Publication remains a separate, explicitly confirmed
+feature; revisit repository discovery when a multi-repository chooser is
+designed.

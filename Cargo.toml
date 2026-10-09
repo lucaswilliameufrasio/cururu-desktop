@@ -8,6 +8,7 @@ description = "Desktop code review client for Cururu"
 
 [dependencies]
 anyhow = "1"
+base64 = "=0.22.1"
 cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "3ea5deb" }
 directories = "6"
 futures = "0.3"
