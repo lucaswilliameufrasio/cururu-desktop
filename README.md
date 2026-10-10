@@ -1,8 +1,9 @@
 # Cururu Desktop
 
 Cururu Desktop is a native code-review client built on GPUI and the shared
-`cururu-core` library. The core dependency is pinned to a Git revision so app
-updates adopt engine changes explicitly; no crate release is required.
+`cururu-core` domain crate plus `cururu-engine` review contracts. Both Cururu
+dependencies are pinned to the same Git revision so app updates adopt engine
+changes explicitly; no crate release is required.
 
 ## Current slice
 
