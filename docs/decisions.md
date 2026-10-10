@@ -26,6 +26,24 @@ by passing a path on the command line. Text extraction has bounded inputs and
 uses Cururu's current default diff limits (45,000 bytes/file, 180,000 total);
 binary, symlink, and non-UTF-8 path support remains follow-up work.
 
+### Applying a suggested local change
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-10
+
+The first version may apply a suggested change to the local worktree only after
+showing a preview, validating that the target still matches the reviewed base
+and has no conflicting edits, and receiving an explicit user confirmation.
+Generating or previewing a suggestion must never write files. Application must
+not stage, commit, or push; those remain separate actions and are not part of
+this workflow. If the app cannot establish that the target is still safe to
+change, it must fail closed and preserve the user's current file.
+
+The existing read-only behavior for repository discovery, Git status, and diff
+extraction remains unchanged. This decision authorizes implementation of the
+guarded local-edit workflow, not applying any change during development or
+review of this repository.
+
 ## Local review-session persistence
 
 - **Status:** Accepted
