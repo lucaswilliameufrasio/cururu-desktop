@@ -44,6 +44,26 @@ extraction remains unchanged. This decision authorizes implementation of the
 guarded local-edit workflow, not applying any change during development or
 review of this repository.
 
+### Shared review engine
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-10
+
+`cururu-core` remains a pure domain crate. Reusable asynchronous review
+execution contracts live in `cururu-engine`, a library crate inside the
+existing Cururu Git repository/workspace; this does not create another Git
+repository or publish a crate. Once the engine commit is available from the
+remote Git repository, the desktop must pin both packages to the same revision
+so their shared core types remain identical. Provider configuration,
+credentials, UI, and local-repository adapters remain owned by the desktop.
+
+The initial extraction exposes the existing `ReviewAgent` contract, usage and
+chunk result types, and sequential fail-closed chunk orchestration. It does not
+yet make the desktop produce findings; connecting a real review provider and
+workflow remains a follow-up slice. The extracted commit is currently local to
+the Cururu checkout, so the desktop manifest remains pinned to its previous
+reachable `cururu-core` revision until the engine revision can be fetched.
+
 ## Local review-session persistence
 
 - **Status:** Accepted
