@@ -8,9 +8,10 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
+const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSession {
@@ -37,6 +38,29 @@ pub struct EvaluatorSettings {
     pub openai_endpoint: String,
     pub openai_model: String,
     pub jev_model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalReviewSettings {
+    pub openai_endpoint: String,
+    pub openai_model: String,
+}
+
+impl LocalReviewSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let endpoint = url::Url::parse(&self.openai_endpoint)
+            .context("local review endpoint must be a valid HTTPS URL")?;
+        anyhow::ensure!(
+            endpoint.scheme() == "https"
+                && endpoint.host_str().is_some()
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "local review endpoint must use HTTPS without credentials, query, or fragment"
+        );
+        validate_setting_value("local review model", &self.openai_model)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +364,96 @@ impl SessionStore {
             .context("failed to revoke local evaluator authorization")
     }
 
+    pub fn local_review_settings(&self) -> anyhow::Result<Option<LocalReviewSettings>> {
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT openai_endpoint, openai_model \
+                 FROM local_review_settings WHERE id = 1",
+                [],
+                |row| {
+                    Ok(LocalReviewSettings {
+                        openai_endpoint: row.get(0)?,
+                        openai_model: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read local review settings")
+    }
+
+    pub fn save_local_review_settings(&self, settings: &LocalReviewSettings) -> anyhow::Result<()> {
+        settings.validate()?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO local_review_settings (id, openai_endpoint, openai_model) \
+                 VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 openai_endpoint = excluded.openai_endpoint, \
+                 openai_model = excluded.openai_model",
+                params![settings.openai_endpoint, settings.openai_model],
+            )
+            .context("failed to save local review settings")?;
+        Ok(())
+    }
+
+    pub fn local_review_is_authorized(
+        &self,
+        repository_identity: &str,
+        config_fingerprint: &str,
+    ) -> anyhow::Result<bool> {
+        let repository_identity = normalize_local_review_repository_identity(repository_identity)?;
+        validate_config_fingerprint(config_fingerprint)?;
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_review_authorizations \
+                 WHERE repository_identity = ?1 AND config_fingerprint = ?2)",
+                params![repository_identity, config_fingerprint],
+                |row| row.get(0),
+            )
+            .context("failed to check local review authorization")
+    }
+
+    pub fn authorize_local_review(
+        &self,
+        repository_identity: &str,
+        config_fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        let repository_identity = normalize_local_review_repository_identity(repository_identity)?;
+        validate_config_fingerprint(config_fingerprint)?;
+        let now = unix_timestamp()?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO local_review_authorizations \
+                 (repository_identity, config_fingerprint, authorized_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(repository_identity) DO UPDATE SET \
+                 config_fingerprint = excluded.config_fingerprint, \
+                 authorized_at = excluded.authorized_at",
+                params![repository_identity, config_fingerprint, now],
+            )
+            .context("failed to save local review authorization")?;
+        Ok(())
+    }
+
+    pub fn revoke_local_review_authorization(
+        &self,
+        repository_identity: &str,
+    ) -> anyhow::Result<bool> {
+        let repository_identity = normalize_local_review_repository_identity(repository_identity)?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "DELETE FROM local_review_authorizations WHERE repository_identity = ?1",
+                [repository_identity],
+            )
+            .map(|rows_changed| rows_changed > 0)
+            .context("failed to revoke local review authorization")
+    }
+
     fn initialize(&self) -> anyhow::Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -412,6 +526,23 @@ impl SessionStore {
                 )
                 .context("failed to apply local session database migration 4")?;
         }
+        if version < 5 {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE local_review_settings (\
+                         id INTEGER PRIMARY KEY CHECK(id = 1),\
+                         openai_endpoint TEXT NOT NULL,\
+                         openai_model TEXT NOT NULL\
+                     );\
+                     CREATE TABLE local_review_authorizations (\
+                         repository_identity TEXT PRIMARY KEY NOT NULL,\
+                         config_fingerprint TEXT NOT NULL,\
+                         authorized_at INTEGER NOT NULL\
+                     );\
+                     PRAGMA user_version = 5;",
+                )
+                .context("failed to apply local session database migration 5")?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -479,6 +610,19 @@ fn validate_evaluator_settings(settings: &EvaluatorSettings) -> anyhow::Result<(
     Ok(())
 }
 
+fn validate_setting_value(name: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!value.trim().is_empty(), "{name} must not be empty");
+    anyhow::ensure!(
+        value.len() <= MAX_EVALUATOR_SETTING_BYTES,
+        "{name} exceeds the local settings size limit"
+    );
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "{name} must not contain control characters"
+    );
+    Ok(())
+}
+
 fn normalize_evaluator_repository_identity(value: &str) -> anyhow::Result<String> {
     let (owner, repository) = value
         .split_once('/')
@@ -494,6 +638,23 @@ fn normalize_evaluator_repository_identity(value: &str) -> anyhow::Result<String
         owner.to_ascii_lowercase(),
         repository.to_ascii_lowercase()
     ))
+}
+
+fn normalize_local_review_repository_identity(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES
+            && !value.chars().any(char::is_control)
+            && Path::new(value).is_absolute()
+            && Path::new(value).components().all(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+                )
+            }),
+        "local review authorization requires a canonical absolute repository path"
+    );
+    Ok(value.to_string())
 }
 
 fn valid_github_repository_segment(value: &str) -> bool {
@@ -635,6 +796,117 @@ mod tests {
         store.save_evaluator_settings(&settings).unwrap();
 
         assert_eq!(store.evaluator_settings().unwrap(), Some(settings));
+    }
+
+    #[test]
+    fn local_review_settings_round_trip_without_storing_provider_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("local-review.sqlite3")).unwrap();
+        assert_eq!(store.local_review_settings().unwrap(), None);
+
+        let settings = super::LocalReviewSettings {
+            openai_endpoint: "https://api.example.test/v1".to_string(),
+            openai_model: "review-model".to_string(),
+        };
+        store.save_local_review_settings(&settings).unwrap();
+
+        assert_eq!(store.local_review_settings().unwrap(), Some(settings));
+    }
+
+    #[test]
+    fn local_review_authorization_is_scoped_to_exact_checkout_and_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("local-review-auth.sqlite3")).unwrap();
+        let first_repository = directory.path().join("repo").to_string_lossy().into_owned();
+        let second_repository = directory
+            .path()
+            .join("repo-clone")
+            .to_string_lossy()
+            .into_owned();
+        let fingerprint = "a".repeat(64);
+
+        assert!(
+            !store
+                .local_review_is_authorized(&first_repository, &fingerprint)
+                .unwrap()
+        );
+        store
+            .authorize_local_review(&first_repository, &fingerprint)
+            .unwrap();
+
+        assert!(
+            store
+                .local_review_is_authorized(&first_repository, &fingerprint)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .local_review_is_authorized(&second_repository, &fingerprint)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .local_review_is_authorized(&first_repository, &"b".repeat(64))
+                .unwrap()
+        );
+        assert!(
+            store
+                .revoke_local_review_authorization(&first_repository)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .local_review_is_authorized(&first_repository, &fingerprint)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_review_settings_and_authorizations_reject_unsafe_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SessionStore::open(directory.path().join("local-review-invalid.sqlite3")).unwrap();
+        for endpoint in [
+            "http://api.example.test/v1",
+            "https://user:password@api.example.test/v1",
+            "https://api.example.test/v1?token=unsafe",
+        ] {
+            let settings = super::LocalReviewSettings {
+                openai_endpoint: endpoint.to_string(),
+                openai_model: "review-model".to_string(),
+            };
+            assert!(store.save_local_review_settings(&settings).is_err());
+        }
+        assert!(
+            store
+                .authorize_local_review("relative/repo", &"a".repeat(64))
+                .is_err()
+        );
+        assert!(
+            store
+                .authorize_local_review("/canonical/repo", "invalid")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn opening_a_version_four_database_adds_only_local_review_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("version-four.sqlite3");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+
+        let store = SessionStore::open(&database_path).unwrap();
+
+        assert_eq!(store.local_review_settings().unwrap(), None);
+        assert_eq!(
+            rusqlite::Connection::open(database_path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
     }
 
     #[test]

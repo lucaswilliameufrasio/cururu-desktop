@@ -42,6 +42,18 @@ Click a saved draft to edit it, or explicitly delete it; drafts do not expire
 automatically. Multiple app instances are supported, and conflicting edits are
 rejected rather than silently overwriting newer text.
 
+Local review is an explicit, optional action for an opened worktree. Configure an
+HTTPS OpenAI-compatible endpoint and model; the API key is stored in a dedicated
+OS-keyring entry, separate from evaluator credentials. Saving settings and
+authorizing a checkout send no code. Consent is stored per canonical checkout
+path and provider/prompt fingerprint. Before the send action, the workspace shows
+the destination, changed-file count, and limits. Only changed-file paths and
+bounded unified diffs are sent (up to 100 files, 45,000 bytes per file, and
+180,000 bytes total). The app rechecks consent and the exact diff before sending
+and discards the result if the checkout changes during review. Findings are
+informational: the workflow does not edit files, run commands, stage, commit, or
+publish anything.
+
 GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
 `CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
 GitHub authentication and read-only pull-request inspection are available;

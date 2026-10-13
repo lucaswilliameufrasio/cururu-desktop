@@ -20,6 +20,7 @@ use std::{
 pub mod evaluator;
 pub mod github_auth;
 pub mod github_pr;
+pub mod local_review;
 pub mod repository;
 pub mod session_store;
 
@@ -66,6 +67,16 @@ struct ReviewWorkspace {
     last_session: Option<session_store::StoredSession>,
     session_store_error: Option<SharedString>,
     head_oid: Option<String>,
+    local_repository_snapshot: Option<repository::RepositorySnapshot>,
+    local_review_identity: Option<String>,
+    local_review_authorized_for: Option<(String, String)>,
+    local_review_authorization_error: Option<SharedString>,
+    local_review_settings: Option<session_store::LocalReviewSettings>,
+    local_review_endpoint_input: Option<Entity<InputState>>,
+    local_review_model_input: Option<Entity<InputState>>,
+    local_review_key_input: Option<Entity<InputState>>,
+    local_review_state: LocalReviewState,
+    next_local_review_request_id: u64,
     comment_drafts: Vec<session_store::StoredCommentDraft>,
     editing_draft: Option<session_store::StoredCommentDraft>,
     draft_input: Option<Entity<InputState>>,
@@ -104,6 +115,13 @@ struct EvaluatorSettingsInputs {
     jev_key: Option<Entity<InputState>>,
 }
 
+#[derive(Clone)]
+struct LocalReviewSettingsInputs {
+    endpoint: Option<Entity<InputState>>,
+    model: Option<Entity<InputState>>,
+    api_key: Option<Entity<InputState>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EvaluatorRequestContext {
     request_id: u64,
@@ -119,6 +137,36 @@ struct EvaluatorAnalysisRequest {
     config_fingerprint: String,
     input: evaluator::ReviewAnalysisInput,
     comment_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalReviewRequestContext {
+    request_id: u64,
+    repository_identity: String,
+    config_fingerprint: String,
+    snapshot_fingerprint: String,
+}
+
+#[derive(Clone)]
+struct LocalReviewRequest {
+    context: LocalReviewRequestContext,
+    repository_root: PathBuf,
+    settings: session_store::LocalReviewSettings,
+}
+
+enum LocalReviewState {
+    Idle,
+    SavingSettings,
+    Authorizing {
+        repository_identity: String,
+        config_fingerprint: String,
+    },
+    Revoking {
+        repository_identity: String,
+    },
+    Running(LocalReviewRequestContext),
+    Complete(local_review::LocalReviewResult),
+    Failed(SharedString),
 }
 
 enum GitHubAuthState {
@@ -227,6 +275,16 @@ impl ReviewWorkspace {
             last_session: None,
             session_store_error: None,
             head_oid: None,
+            local_repository_snapshot: None,
+            local_review_identity: None,
+            local_review_authorized_for: None,
+            local_review_authorization_error: None,
+            local_review_settings: None,
+            local_review_endpoint_input: None,
+            local_review_model_input: None,
+            local_review_key_input: None,
+            local_review_state: LocalReviewState::Idle,
+            next_local_review_request_id: 0,
             comment_drafts: Vec::new(),
             editing_draft: None,
             draft_input: None,
@@ -268,6 +326,13 @@ impl ReviewWorkspace {
                             Some(format!("Could not read evaluator settings: {error}").into());
                     }
                 }
+                match store.local_review_settings() {
+                    Ok(settings) => workspace.local_review_settings = settings,
+                    Err(error) => {
+                        workspace.local_review_authorization_error =
+                            Some(format!("Could not read local review settings: {error}").into());
+                    }
+                }
                 match store.most_recent() {
                     Ok(session) => workspace.last_session = session,
                     Err(error) => {
@@ -283,7 +348,7 @@ impl ReviewWorkspace {
             }
         }
         if let Some(path) = std::env::args_os().nth(1) {
-            let result = load_repository_session(path.into(), workspace.session_store.clone());
+            let result = load_repository_session(path.into(), workspace.session_store.as_ref());
             workspace.apply_repository_result(result);
         }
         workspace
@@ -299,13 +364,20 @@ impl ReviewWorkspace {
                 self.head_oid.clone_from(&snapshot.head_oid);
                 let files = snapshot
                     .changed_files
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(parse_diff_file)
                     .collect::<Vec<_>>();
                 let selected_file = (!files.is_empty()).then_some(0);
                 self.files = files;
                 self.repository_root = Some(snapshot.root.display().to_string().into());
-                self.branch = snapshot.branch.map(Into::into);
+                self.branch = snapshot.branch.clone().map(Into::into);
+                self.local_repository_snapshot = Some(snapshot);
+                self.local_review_identity = opened.local_review_identity;
+                self.local_review_authorized_for = opened.local_review_authorized_for;
+                self.local_review_authorization_error =
+                    opened.local_review_authorization_error.map(Into::into);
+                self.local_review_state = LocalReviewState::Idle;
                 self.load_error = None;
                 self.notice = Some("Repository opened · local access is read-only".into());
                 if let Some(session_result) = opened.session_result {
@@ -421,6 +493,9 @@ struct OpenedRepository {
     snapshot: repository::RepositorySnapshot,
     session_result: Option<anyhow::Result<session_store::StoredSession>>,
     drafts_result: Option<anyhow::Result<Vec<session_store::StoredCommentDraft>>>,
+    local_review_identity: Option<String>,
+    local_review_authorized_for: Option<(String, String)>,
+    local_review_authorization_error: Option<String>,
 }
 
 struct DraftSave {
@@ -434,10 +509,15 @@ struct DraftSave {
 
 fn load_repository_session(
     path: PathBuf,
-    store: Option<session_store::SessionStore>,
+    store: Option<&session_store::SessionStore>,
 ) -> anyhow::Result<OpenedRepository> {
     let snapshot = repository::RepositorySnapshot::open(path)?;
-    let (session_result, drafts_result) = match store {
+    let (local_review_identity, identity_error) =
+        match local_review::repository_identity(&snapshot.root) {
+            Ok(identity) => (Some(identity), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+    let (session_result, drafts_result) = match store.as_ref() {
         Some(store) => {
             let session_result = store.record_opened(
                 &snapshot.root,
@@ -449,10 +529,32 @@ fn load_repository_session(
         }
         None => (None, None),
     };
+    let (local_review_authorized_for, local_review_authorization_error) =
+        match (store.as_ref(), local_review_identity.as_deref()) {
+            (Some(store), Some(identity)) => match store.local_review_settings() {
+                Ok(Some(settings)) => match local_review::config_fingerprint(&settings) {
+                    Ok(fingerprint) => {
+                        match store.local_review_is_authorized(identity, &fingerprint) {
+                            Ok(true) => (Some((identity.to_string(), fingerprint)), None),
+                            Ok(false) => (None, None),
+                            Err(error) => (None, Some(error.to_string())),
+                        }
+                    }
+                    Err(error) => (None, Some(error.to_string())),
+                },
+                Ok(None) => (None, None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            (_, None) => (None, identity_error),
+            (None, Some(_)) => (None, None),
+        };
     Ok(OpenedRepository {
         snapshot,
         session_result,
         drafts_result,
+        local_review_identity,
+        local_review_authorized_for,
+        local_review_authorization_error,
     })
 }
 
@@ -502,7 +604,7 @@ fn start_repository_picker(
         });
         let result = cx
             .background_executor()
-            .spawn(async move { load_repository_session(path, store) })
+            .spawn(async move { load_repository_session(path, store.as_ref()) })
             .await;
         let _ = entity.update(cx, |this, cx| {
             this.apply_repository_result(result);
@@ -525,7 +627,7 @@ fn start_reopen_last_session(
         });
         let result = cx
             .background_executor()
-            .spawn(async move { load_repository_session(path, store) })
+            .spawn(async move { load_repository_session(path, store.as_ref()) })
             .await;
         let _ = entity.update(cx, |this, cx| {
             this.apply_repository_result(result);
@@ -658,9 +760,8 @@ fn sample_unified_diff() -> String {
     diff
 }
 
-impl Render for ReviewWorkspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_github_credentials_loaded(cx);
+impl ReviewWorkspace {
+    fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.draft_input.is_none() {
             self.draft_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx)
@@ -672,6 +773,35 @@ impl Render for ReviewWorkspace {
         if self.pull_request_input.is_none() {
             self.pull_request_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
+            }));
+        }
+        if self.local_review_endpoint_input.is_none() {
+            let value = self.local_review_settings.as_ref().map_or_else(
+                || local_review::DEFAULT_LOCAL_REVIEW_ENDPOINT.to_string(),
+                |settings| settings.openai_endpoint.clone(),
+            );
+            self.local_review_endpoint_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("https://api.openai.com/v1")
+                    .default_value(value)
+            }));
+        }
+        if self.local_review_model_input.is_none() {
+            let value = self
+                .local_review_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| settings.openai_model.clone());
+            self.local_review_model_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("OpenAI-compatible model")
+                    .default_value(value)
+            }));
+        }
+        if self.local_review_key_input.is_none() {
+            self.local_review_key_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .placeholder("API key · stored only in OS keyring")
+                    .masked(true)
             }));
         }
         if self.evaluator_endpoint_input.is_none() {
@@ -721,6 +851,13 @@ impl Render for ReviewWorkspace {
                     .masked(true)
             }));
         }
+    }
+}
+
+impl Render for ReviewWorkspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_github_credentials_loaded(cx);
+        self.ensure_inputs(window, cx);
         div()
             .flex()
             .flex_col()
@@ -729,6 +866,11 @@ impl Render for ReviewWorkspace {
             .text_color(rgb(0x00d5_dee8))
             .child(self.render_header(cx))
             .child(self.render_mode_switch(cx))
+            .children(
+                (self.review_mode == ReviewMode::ReviewChanges
+                    && matches!(self.remote_review_state, RemoteReviewState::Idle))
+                .then(|| self.render_local_review_settings(cx)),
+            )
             .child(self.render_github_auth_status())
             .child(self.render_pull_request_loader(cx))
             .children(
@@ -762,6 +904,77 @@ impl Render for ReviewWorkspace {
 }
 
 impl ReviewWorkspace {
+    fn render_local_review_settings(&self, cx: &Context<Self>) -> impl IntoElement {
+        let endpoint = self
+            .local_review_endpoint_input
+            .as_ref()
+            .map(TextInput::new);
+        let model = self.local_review_model_input.as_ref().map(TextInput::new);
+        let api_key = self.local_review_key_input.as_ref().map(TextInput::new);
+        let inputs = LocalReviewSettingsInputs {
+            endpoint: self.local_review_endpoint_input.clone(),
+            model: self.local_review_model_input.clone(),
+            api_key: self.local_review_key_input.clone(),
+        };
+        let entity = cx.entity();
+        let is_saving = matches!(self.local_review_state, LocalReviewState::SavingSettings);
+        let save_label = if is_saving {
+            "Saving local review settings…"
+        } else {
+            "Save provider settings"
+        };
+        let save_button = div()
+            .id("save-local-review-settings")
+            .px_3()
+            .py_2()
+            .bg(rgb(if is_saving { 0x001b_2732 } else { 0x0026_3442 }))
+            .child(save_label);
+        let save_button = if is_saving {
+            save_button
+        } else {
+            save_button
+                .cursor_pointer()
+                .on_click(move |_event, window, cx| {
+                    save_local_review_configuration(&entity, inputs.clone(), window, cx);
+                })
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(rgb(0x002b_3946))
+            .child("Local review · only changed-file diffs are sent")
+            .child("Provider base URL (HTTPS)")
+            .children(endpoint)
+            .child("Model")
+            .children(model)
+            .child("API key · stored only in the OS keyring")
+            .children(api_key)
+            .child(save_button)
+            .child(
+                div()
+                    .text_color(rgb(0x009b_aaba))
+                    .child("Saving settings sends no code. Authorization and each review are separate actions."),
+            )
+            .children(
+                local_review_state_message(&self.local_review_state).map(|message| {
+                    div()
+                        .text_color(rgb(local_review_state_color(
+                            &self.local_review_state,
+                        )))
+                        .child(message)
+                }),
+            )
+            .children(
+                self.local_review_authorization_error
+                    .clone()
+                    .map(|error| div().text_color(rgb(0x00e5_b6ba)).child(error)),
+            )
+    }
+
     fn render_evaluator_settings(&self, cx: &Context<Self>) -> impl IntoElement {
         let endpoint = self.evaluator_endpoint_input.as_ref().map(TextInput::new);
         let openai_model = self
@@ -1504,8 +1717,137 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .gap_2()
+                .child(self.render_local_review_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
+    }
+
+    fn render_local_review_action(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(snapshot) = self.local_repository_snapshot.as_ref() else {
+            return div()
+                .p_2()
+                .text_color(rgb(0x009b_aaba))
+                .child("Open a local repository to review its working-tree changes.");
+        };
+        let Some(identity) = self.local_review_identity.clone() else {
+            let message = self
+                .local_review_authorization_error
+                .clone()
+                .unwrap_or_else(|| "Could not identify this local checkout.".into());
+            return div().p_2().text_color(rgb(0x00e5_b6ba)).child(message);
+        };
+        let Some(settings) = self.local_review_settings.clone() else {
+            return div().p_2().text_color(rgb(0x009b_aaba)).child(
+                "Save an HTTPS provider URL, model, and API key above to enable local review.",
+            );
+        };
+        self.render_local_review_for_checkout(cx, snapshot, &identity, &settings)
+    }
+
+    fn render_local_review_for_checkout(
+        &self,
+        cx: &Context<Self>,
+        snapshot: &repository::RepositorySnapshot,
+        identity: &str,
+        settings: &session_store::LocalReviewSettings,
+    ) -> gpui::Div {
+        let fingerprint = match local_review::config_fingerprint(settings) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return div()
+                    .p_2()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child(format!("Local review settings are invalid: {error}"));
+            }
+        };
+        let snapshot_fingerprint = local_review::snapshot_fingerprint(snapshot);
+        let is_authorized = self.local_review_authorized_for.as_ref().is_some_and(
+            |(authorized_identity, authorized_fingerprint)| {
+                authorized_identity == identity && authorized_fingerprint == &fingerprint
+            },
+        );
+        let is_authorization_busy = matches!(
+            self.local_review_state,
+            LocalReviewState::SavingSettings
+                | LocalReviewState::Authorizing { .. }
+                | LocalReviewState::Revoking { .. }
+        );
+        let is_review_running = matches!(self.local_review_state, LocalReviewState::Running(_));
+        let store = self.session_store.clone();
+        let authorization_button = render_local_review_authorization_button(
+            &cx.entity(),
+            store.clone(),
+            identity,
+            &fingerprint,
+            is_authorized,
+            store.is_some() && !is_authorization_busy,
+        );
+        let validation = local_review::validate_snapshot(snapshot);
+        let request = validation.as_ref().ok().map(|_| LocalReviewRequest {
+            context: LocalReviewRequestContext {
+                request_id: 0,
+                repository_identity: identity.to_string(),
+                config_fingerprint: fingerprint.clone(),
+                snapshot_fingerprint: snapshot_fingerprint.clone(),
+            },
+            repository_root: snapshot.root.clone(),
+            settings: (*settings).clone(),
+        });
+        let send_button = render_local_review_send_button(
+            &cx.entity(),
+            request,
+            store.is_some() && is_authorized && !is_review_running && !is_authorization_busy,
+        );
+        let validation_message = match validation {
+            Ok(chunks) => format!(
+                "{} changed files · {} bytes · {chunks} bounded chunk(s)",
+                snapshot.changed_files.len(),
+                local_review::diff_byte_count(snapshot)
+            ),
+            Err(error) => format!("Local review unavailable: {error}"),
+        };
+        let authorization_message = if is_authorized {
+            "Consent is active for this checkout and provider configuration.".to_string()
+        } else {
+            "Authorize this checkout before sending any code. Authorization sends no code."
+                .to_string()
+        };
+        let result = match &self.local_review_state {
+            LocalReviewState::Complete(result)
+                if result.diff_fingerprint == snapshot_fingerprint =>
+            {
+                Some(render_local_review_result(result, &cx.entity()))
+            }
+            _ => None,
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_2()
+            .p_2()
+            .border_t_1()
+            .border_color(rgb(0x003b_4c5c))
+            .child("Review local changes")
+            .child(format!("Checkout: {}", snapshot.root.display()))
+            .child(format!(
+                "Destination: {} · model {}",
+                settings.openai_endpoint, settings.openai_model
+            ))
+            .child(validation_message)
+            .child(render_local_review_limits())
+            .child(authorization_message)
+            .child(authorization_button)
+            .child(send_button)
+            .children(
+                local_review_state_message(&self.local_review_state).map(|message| {
+                    div()
+                        .text_color(rgb(local_review_state_color(&self.local_review_state)))
+                        .child(message)
+                }),
+            )
+            .children(result)
     }
 
     fn render_evaluator_action(
@@ -1801,6 +2143,546 @@ impl ReviewWorkspace {
                 )
         })
     }
+}
+
+fn local_review_state_message(state: &LocalReviewState) -> Option<SharedString> {
+    match state {
+        LocalReviewState::Idle => None,
+        LocalReviewState::SavingSettings => Some("Saving settings and keyring credential…".into()),
+        LocalReviewState::Authorizing { .. } => {
+            Some("Recording local consent; no code is being sent.".into())
+        }
+        LocalReviewState::Revoking { .. } => {
+            Some("Revoking local consent and discarding any in-flight result…".into())
+        }
+        LocalReviewState::Running(_) => {
+            Some("Review is running. No partial findings will be shown.".into())
+        }
+        LocalReviewState::Complete(_) => Some(
+            "Review completed. Findings are informational; nothing was changed or published."
+                .into(),
+        ),
+        LocalReviewState::Failed(message) => Some(message.clone()),
+    }
+}
+
+const fn local_review_state_color(state: &LocalReviewState) -> u32 {
+    if matches!(state, LocalReviewState::Failed(_)) {
+        0x00e5_b6ba
+    } else {
+        0x00b8_dfc4
+    }
+}
+
+fn render_local_review_limits() -> gpui::Div {
+    div()
+        .text_color(rgb(0x009b_aaba))
+        .child(format!(
+            "Outbound limit: {} files, {} bytes total, {} bytes per file. Only changed-file paths and unified diffs are sent; no repository snapshot.",
+            local_review::MAX_LOCAL_REVIEW_FILES,
+            local_review::MAX_LOCAL_DIFF_BYTES,
+            local_review::MAX_LOCAL_FILE_DIFF_BYTES
+        ))
+}
+
+fn save_local_review_configuration(
+    entity: &Entity<ReviewWorkspace>,
+    inputs: LocalReviewSettingsInputs,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (Some(endpoint_input), Some(model_input), Some(api_key_input)) =
+        (inputs.endpoint, inputs.model, inputs.api_key)
+    else {
+        return;
+    };
+    let settings = session_store::LocalReviewSettings {
+        openai_endpoint: endpoint_input.read(cx).value().to_string(),
+        openai_model: model_input.read(cx).value().to_string(),
+    };
+    let api_key = api_key_input.read(cx).value().to_string();
+    api_key_input.update(cx, |state, input_cx| {
+        state.set_value("", window, input_cx);
+    });
+    if let Err(error) = settings.validate() {
+        entity.update(cx, |this, cx| {
+            this.local_review_state = LocalReviewState::Failed(error.to_string().into());
+            cx.notify();
+        });
+        return;
+    }
+    let Some(store) = entity.read(cx).session_store.clone() else {
+        entity.update(cx, |this, cx| {
+            this.local_review_state = LocalReviewState::Failed(
+                "Local database is unavailable; settings were not saved.".into(),
+            );
+            cx.notify();
+        });
+        return;
+    };
+    entity.update(cx, |this, cx| {
+        this.next_local_review_request_id = this.next_local_review_request_id.saturating_add(1);
+        this.local_review_state = LocalReviewState::SavingSettings;
+        cx.notify();
+    });
+    let entity_for_task = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                if api_key.is_empty() {
+                    anyhow::ensure!(
+                        local_review::LocalReviewSecrets::load()?.is_some(),
+                        "enter an API key before saving; credentials are stored only in the OS keyring"
+                    );
+                } else {
+                    local_review::LocalReviewSecrets::save(&api_key)?;
+                }
+                store.save_local_review_settings(&settings)?;
+                Ok::<_, anyhow::Error>(settings)
+            })
+            .await;
+        let _ = entity_for_task.update(cx, |this, cx| {
+            match result {
+                Ok(settings) => {
+                    let fingerprint = local_review::config_fingerprint(&settings).ok();
+                    let authorization_still_matches = this
+                        .local_review_identity
+                        .as_ref()
+                        .zip(fingerprint.as_ref())
+                        .is_some_and(|(identity, fingerprint)| {
+                            this.local_review_authorized_for.as_ref()
+                                == Some(&(identity.clone(), fingerprint.clone()))
+                        });
+                    if !authorization_still_matches {
+                        this.local_review_authorized_for = None;
+                    }
+                    this.local_review_settings = Some(settings);
+                    this.local_review_authorization_error = None;
+                    this.local_review_state = LocalReviewState::Idle;
+                    this.notice = Some(
+                        "Local review settings saved. No code was sent; authorize the checkout separately."
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    this.local_review_state = LocalReviewState::Failed(error.to_string().into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn render_local_review_authorization_button(
+    entity: &Entity<ReviewWorkspace>,
+    store: Option<session_store::SessionStore>,
+    identity: &str,
+    fingerprint: &str,
+    is_authorized: bool,
+    can_change: bool,
+) -> impl IntoElement + use<> {
+    let label = if is_authorized {
+        "Revoke consent for this checkout"
+    } else {
+        "Authorize this checkout for local review"
+    };
+    let button = div()
+        .id("authorize-local-review-checkout")
+        .px_3()
+        .py_2()
+        .bg(rgb(if can_change { 0x0030_3b2e } else { 0x001b_2732 }))
+        .child(label);
+    if !can_change {
+        return button;
+    }
+    let entity = entity.clone();
+    let identity = identity.to_string();
+    let fingerprint = fingerprint.to_string();
+    button
+        .cursor_pointer()
+        .on_click(move |_event, _window, cx| {
+            start_local_review_authorization(
+                &entity,
+                store.clone(),
+                identity.clone(),
+                fingerprint.clone(),
+                is_authorized,
+                cx,
+            );
+        })
+}
+
+fn start_local_review_authorization(
+    entity: &Entity<ReviewWorkspace>,
+    store: Option<session_store::SessionStore>,
+    identity: String,
+    fingerprint: String,
+    is_authorized: bool,
+    cx: &mut App,
+) {
+    let Some(store) = store else {
+        entity.update(cx, |this, cx| {
+            this.local_review_state = LocalReviewState::Failed(
+                "Local database is unavailable; checkout consent was not changed.".into(),
+            );
+            cx.notify();
+        });
+        return;
+    };
+    entity.update(cx, |this, cx| {
+        this.next_local_review_request_id = this.next_local_review_request_id.saturating_add(1);
+        this.local_review_state = if is_authorized {
+            this.local_review_authorized_for = None;
+            LocalReviewState::Revoking {
+                repository_identity: identity.clone(),
+            }
+        } else {
+            LocalReviewState::Authorizing {
+                repository_identity: identity.clone(),
+                config_fingerprint: fingerprint.clone(),
+            }
+        };
+        cx.notify();
+    });
+    let entity_for_task = entity.clone();
+    let identity_for_store = identity.clone();
+    let fingerprint_for_store = fingerprint.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                if is_authorized {
+                    store
+                        .revoke_local_review_authorization(&identity_for_store)
+                        .map(|_| false)
+                } else {
+                    store
+                        .authorize_local_review(&identity_for_store, &fingerprint_for_store)
+                        .map(|()| true)
+                }
+            })
+            .await;
+        let _ = entity_for_task.update(cx, |this, cx| {
+            complete_local_review_authorization(
+                this,
+                result,
+                is_authorized,
+                &identity,
+                &fingerprint,
+            );
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn complete_local_review_authorization(
+    workspace: &mut ReviewWorkspace,
+    result: anyhow::Result<bool>,
+    is_authorized: bool,
+    identity: &str,
+    fingerprint: &str,
+) {
+    let operation_is_current = match (&workspace.local_review_state, is_authorized) {
+        (
+            LocalReviewState::Revoking {
+                repository_identity,
+            },
+            true,
+        ) => repository_identity == identity,
+        (
+            LocalReviewState::Authorizing {
+                repository_identity,
+                config_fingerprint,
+            },
+            false,
+        ) => repository_identity == identity && config_fingerprint == fingerprint,
+        _ => false,
+    };
+    if !operation_is_current {
+        return;
+    }
+    match result {
+        Ok(true) => {
+            workspace.local_review_authorized_for =
+                Some((identity.to_string(), fingerprint.to_string()));
+            workspace.local_review_state = LocalReviewState::Idle;
+            workspace.notice = Some(
+                "Checkout consent recorded. No code was sent; start a review explicitly when ready."
+                    .into(),
+            );
+        }
+        Ok(false) => {
+            workspace.local_review_authorized_for = None;
+            workspace.local_review_state = LocalReviewState::Idle;
+            workspace.notice = Some(
+                "Local review consent revoked. Any in-flight result will be discarded.".into(),
+            );
+        }
+        Err(error) => {
+            workspace.local_review_state = LocalReviewState::Failed(error.to_string().into());
+        }
+    }
+}
+
+fn render_local_review_send_button(
+    entity: &Entity<ReviewWorkspace>,
+    request: Option<LocalReviewRequest>,
+    can_review: bool,
+) -> impl IntoElement + use<> {
+    let label = if can_review {
+        "Send these bounded changes for local review"
+    } else {
+        "Local review requires settings, checkout consent, and valid diffs"
+    };
+    let button = div()
+        .id("send-local-changes-to-reviewer")
+        .px_3()
+        .py_2()
+        .bg(rgb(if can_review { 0x0030_3b2e } else { 0x001b_2732 }))
+        .child(label);
+    if !can_review {
+        return button;
+    }
+    let entity = entity.clone();
+    button
+        .cursor_pointer()
+        .on_click(move |_event, _window, cx| {
+            let Some(request) = request.clone() else {
+                return;
+            };
+            start_local_review(&entity, request, cx);
+        })
+}
+
+fn start_local_review(
+    entity: &Entity<ReviewWorkspace>,
+    mut request: LocalReviewRequest,
+    cx: &mut App,
+) {
+    let Some(store) = entity.read(cx).session_store.clone() else {
+        entity.update(cx, |this, cx| {
+            this.local_review_state = LocalReviewState::Failed(
+                "Local database is unavailable; review is blocked.".into(),
+            );
+            cx.notify();
+        });
+        return;
+    };
+    let request_context = entity.update(cx, |this, cx| {
+        this.next_local_review_request_id = this.next_local_review_request_id.saturating_add(1);
+        request.context.request_id = this.next_local_review_request_id;
+        this.local_review_state = LocalReviewState::Running(request.context.clone());
+        this.notice =
+            Some("Preparing a fresh snapshot, then sending only the confirmed local diffs…".into());
+        cx.notify();
+        request.context.clone()
+    });
+    let entity_for_task = entity.clone();
+    cx.spawn(async move |cx| {
+        let executor = cx.background_executor();
+        let result = run_local_review(store, request.clone(), executor.clone()).await;
+        let _ = entity_for_task.update(cx, |this, cx| {
+            if !matches!(
+                &this.local_review_state,
+                LocalReviewState::Running(active) if active == &request_context
+            ) {
+                return;
+            }
+            let current_identity = this.local_review_identity.as_deref();
+            let current_fingerprint = this
+                .local_review_settings
+                .as_ref()
+                .and_then(|settings| local_review::config_fingerprint(settings).ok());
+            let current_snapshot_fingerprint = this
+                .local_repository_snapshot
+                .as_ref()
+                .map(local_review::snapshot_fingerprint);
+            let still_matches = current_identity == Some(request_context.repository_identity.as_str())
+                && current_fingerprint.as_deref()
+                    == Some(request_context.config_fingerprint.as_str())
+                && current_snapshot_fingerprint.as_deref()
+                    == Some(request_context.snapshot_fingerprint.as_str());
+            if !still_matches {
+                this.local_review_state = LocalReviewState::Idle;
+                this.notice = Some(
+                    "Local review result discarded because the checkout, settings, or diff changed."
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+            match result {
+                Ok(review) => {
+                    this.local_review_state = LocalReviewState::Complete(review);
+                    this.notice = Some(
+                        "Local review completed. Findings are informational; no files were changed or published."
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    this.local_review_state = LocalReviewState::Failed(error.to_string().into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+async fn run_local_review(
+    store: session_store::SessionStore,
+    request: LocalReviewRequest,
+    executor: BackgroundExecutor,
+) -> anyhow::Result<local_review::LocalReviewResult> {
+    let preflight_store = store.clone();
+    let preflight_request = request.clone();
+    let (snapshot, secrets) = executor
+        .spawn(async move {
+            validate_local_review_request(&preflight_store, &preflight_request)?;
+            let snapshot =
+                repository::RepositorySnapshot::open(&preflight_request.repository_root)?;
+            validate_local_review_snapshot(&preflight_request, &snapshot)?;
+            let secrets = local_review::LocalReviewSecrets::load()?
+                .context("local review API key is unavailable in the OS keyring")?;
+            Ok::<_, anyhow::Error>((snapshot, secrets))
+        })
+        .await?;
+
+    let result = local_review::review_snapshot(&request.settings, &secrets, &snapshot).await?;
+
+    let postflight_store = store;
+    let postflight_request = request;
+    executor
+        .spawn(async move {
+            validate_local_review_request(&postflight_store, &postflight_request)?;
+            let current_snapshot =
+                repository::RepositorySnapshot::open(&postflight_request.repository_root)?;
+            validate_local_review_snapshot(&postflight_request, &current_snapshot)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(result)
+}
+
+fn validate_local_review_request(
+    store: &session_store::SessionStore,
+    request: &LocalReviewRequest,
+) -> anyhow::Result<()> {
+    let identity = local_review::repository_identity(&request.repository_root)?;
+    anyhow::ensure!(
+        identity == request.context.repository_identity,
+        "local repository identity changed; reopen it before reviewing"
+    );
+    let settings = store
+        .local_review_settings()?
+        .context("local review settings are unavailable")?;
+    anyhow::ensure!(
+        settings == request.settings,
+        "local review settings changed; save and authorize the current configuration"
+    );
+    let fingerprint = local_review::config_fingerprint(&settings)?;
+    anyhow::ensure!(
+        fingerprint == request.context.config_fingerprint,
+        "local review configuration changed; authorize it again"
+    );
+    anyhow::ensure!(
+        store.local_review_is_authorized(&identity, &fingerprint)?,
+        "local consent is missing or no longer matches this checkout and provider configuration"
+    );
+    Ok(())
+}
+
+fn validate_local_review_snapshot(
+    request: &LocalReviewRequest,
+    snapshot: &repository::RepositorySnapshot,
+) -> anyhow::Result<()> {
+    let identity = local_review::repository_identity(&snapshot.root)?;
+    anyhow::ensure!(
+        identity == request.context.repository_identity,
+        "repository changed during local review; the result was discarded"
+    );
+    anyhow::ensure!(
+        local_review::snapshot_fingerprint(snapshot) == request.context.snapshot_fingerprint,
+        "working-tree changes differ from the reviewed preview; reopen the repository and try again"
+    );
+    local_review::validate_snapshot(snapshot)?;
+    Ok(())
+}
+
+fn render_local_review_result(
+    result: &local_review::LocalReviewResult,
+    entity: &Entity<ReviewWorkspace>,
+) -> gpui::Div {
+    let entity = entity.clone();
+    let rows = result
+        .review
+        .findings
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| {
+            let path = finding.path.clone();
+            let line = finding.line;
+            let finding_for_display = finding.clone();
+            let entity = entity.clone();
+            div()
+                .id(("local-review-finding", index))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .bg(rgb(0x0020_2b36))
+                .cursor_pointer()
+                .child(format!(
+                    "{} · {}:{}",
+                    finding_for_display.severity,
+                    finding_for_display.path,
+                    finding_for_display.line.unwrap_or_default()
+                ))
+                .child(finding_for_display.title)
+                .child(finding_for_display.message)
+                .children((!finding_for_display.suggestion.is_empty()).then(|| {
+                    div()
+                        .text_color(rgb(0x00b8_dfc4))
+                        .child(finding_for_display.suggestion)
+                }))
+                .on_click(move |_event, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        let line_number = line.and_then(|line| usize::try_from(line).ok());
+                        if let Some(file_index) = this
+                            .files
+                            .iter()
+                            .position(|file| file.path.as_ref() == path)
+                            && let Some(line_index) = this.files[file_index]
+                                .lines
+                                .iter()
+                                .position(|diff_line| diff_line.new_number == line_number)
+                        {
+                            this.selected_file = Some(file_index);
+                            this.selected_line = line_index;
+                            this.diff_scroll_handle
+                                .scroll_to_item(line_index, ScrollStrategy::Center);
+                        }
+                        cx.notify();
+                    });
+                })
+        });
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .mt_2()
+        .child(format!(
+            "{} · {} finding(s) · {} chunk(s) · {} diff bytes",
+            result.review.model,
+            result.review.findings.len(),
+            result.chunk_count,
+            result.diff_bytes
+        ))
+        .child(result.review.summary.clone())
+        .children(rows)
 }
 
 fn render_evaluator_authorization_button(
@@ -2854,8 +3736,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_LINE_COUNT, DiffKind, RemoteReviewState, ReviewMode, ReviewWorkspace,
-        SAMPLE_FILE_PATHS, locate_remote_comment, parse_diff_file, source_excerpt,
+        DIFF_LINE_COUNT, DiffKind, LocalReviewRequest, LocalReviewRequestContext,
+        RemoteReviewState, ReviewMode, ReviewWorkspace, SAMPLE_FILE_PATHS, locate_remote_comment,
+        parse_diff_file, source_excerpt, validate_local_review_request,
+        validate_local_review_snapshot,
     };
     use std::fs;
 
@@ -3030,6 +3914,8 @@ mod tests {
         assert_eq!(workspace.selected_file, Some(0));
         assert_eq!(workspace.selected_line, 0);
         assert!(workspace.repository_root.is_some());
+        assert!(workspace.local_repository_snapshot.is_some());
+        assert!(workspace.local_review_identity.is_some());
         assert!(workspace.notice.as_ref().unwrap().contains("read-only"));
     }
 
@@ -3043,9 +3929,18 @@ mod tests {
             directory.path().join("app-data/sessions.sqlite3"),
         )
         .unwrap();
+        let settings = super::session_store::LocalReviewSettings {
+            openai_endpoint: "https://api.example.test/v1".to_string(),
+            openai_model: "review-model".to_string(),
+        };
+        store.save_local_review_settings(&settings).unwrap();
+        let identity = super::local_review::repository_identity(&repository_root).unwrap();
+        let fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
+        store
+            .authorize_local_review(&identity, &fingerprint)
+            .unwrap();
 
-        let opened =
-            super::load_repository_session(repository_root.clone(), Some(store.clone())).unwrap();
+        let opened = super::load_repository_session(repository_root.clone(), Some(&store)).unwrap();
         let mut workspace = ReviewWorkspace::sample();
         workspace.apply_repository_result(Ok(opened));
 
@@ -3053,5 +3948,55 @@ mod tests {
         assert_eq!(saved.repository_root, repository_root);
         assert_eq!(saved.branch.as_deref(), Some("main"));
         assert_eq!(workspace.last_session, Some(saved));
+        assert_eq!(
+            workspace.local_review_authorized_for,
+            Some((identity, fingerprint))
+        );
+    }
+
+    #[test]
+    fn local_review_preflight_requires_current_consent_and_the_previewed_diff() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_root = directory.path().join("repo");
+        gix::init(&repository_root).unwrap();
+        let changed_file = repository_root.join("notes.txt");
+        fs::write(&changed_file, "first local change\n").unwrap();
+        let snapshot = super::repository::RepositorySnapshot::open(&repository_root).unwrap();
+        let store = super::session_store::SessionStore::open(
+            directory.path().join("app-data/sessions.sqlite3"),
+        )
+        .unwrap();
+        let settings = super::session_store::LocalReviewSettings {
+            openai_endpoint: "https://api.example.test/v1".to_string(),
+            openai_model: "review-model".to_string(),
+        };
+        store.save_local_review_settings(&settings).unwrap();
+        let identity = super::local_review::repository_identity(&repository_root).unwrap();
+        let config_fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
+        let snapshot_fingerprint = super::local_review::snapshot_fingerprint(&snapshot);
+        let request = LocalReviewRequest {
+            context: LocalReviewRequestContext {
+                request_id: 1,
+                repository_identity: identity.clone(),
+                config_fingerprint: config_fingerprint.clone(),
+                snapshot_fingerprint,
+            },
+            repository_root: repository_root.clone(),
+            settings,
+        };
+
+        store
+            .authorize_local_review(&identity, &config_fingerprint)
+            .unwrap();
+        assert!(validate_local_review_request(&store, &request).is_ok());
+        assert!(validate_local_review_snapshot(&request, &snapshot).is_ok());
+
+        fs::write(&changed_file, "changed after preview\n").unwrap();
+        let changed_snapshot =
+            super::repository::RepositorySnapshot::open(&repository_root).unwrap();
+        assert!(validate_local_review_snapshot(&request, &changed_snapshot).is_err());
+
+        store.revoke_local_review_authorization(&identity).unwrap();
+        assert!(validate_local_review_request(&store, &request).is_err());
     }
 }

@@ -1,0 +1,442 @@
+use std::{fmt, path::Path};
+
+use anyhow::Context as _;
+use sha2::{Digest as _, Sha256};
+
+use crate::{repository::RepositorySnapshot, session_store::LocalReviewSettings};
+
+const KEYRING_SERVICE: &str = "com.cururu.desktop.local-review";
+const OPENAI_KEY_ACCOUNT: &str = "openai-compatible";
+pub const DEFAULT_LOCAL_REVIEW_ENDPOINT: &str = "https://api.openai.com/v1";
+pub const MAX_LOCAL_FILE_DIFF_BYTES: usize = 45_000;
+pub const MAX_LOCAL_DIFF_BYTES: usize = 180_000;
+pub const MAX_LOCAL_REVIEW_FILES: usize = 100;
+pub const MAX_LOCAL_REVIEW_CHUNKS: usize = 4;
+const REVIEW_CHUNK_BYTES: usize = MAX_LOCAL_FILE_DIFF_BYTES;
+const MAX_REVIEW_FINDINGS: usize = 100;
+const REVIEW_MAX_OUTPUT_TOKENS: u32 = 4_000;
+const REVIEW_TEMPERATURE: f32 = 0.1;
+const LOCAL_REVIEW_NOTE: &str = "Desktop-local review note: proposed changes are informational suggestions only. Never claim that a file was modified or that a check was run.";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalReviewSecrets {
+    api_key: String,
+}
+
+impl fmt::Debug for LocalReviewSecrets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalReviewSecrets")
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl LocalReviewSecrets {
+    pub fn load() -> anyhow::Result<Option<Self>> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, OPENAI_KEY_ACCOUNT)
+            .map_err(|_| anyhow::anyhow!("operating-system credential store is unavailable"))?;
+        match entry.get_password() {
+            Ok(api_key) => {
+                validate_api_key(&api_key)?;
+                Ok(Some(Self { api_key }))
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => anyhow::bail!("could not read local review credentials from the OS keyring"),
+        }
+    }
+
+    pub fn save(api_key: &str) -> anyhow::Result<()> {
+        validate_api_key(api_key)?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, OPENAI_KEY_ACCOUNT)
+            .map_err(|_| anyhow::anyhow!("operating-system credential store is unavailable"))?;
+        entry.set_password(api_key).map_err(|_| {
+            anyhow::anyhow!("could not save local review credentials to the OS keyring")
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.api_key
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalReviewResult {
+    pub review: cururu_core::ReviewResult,
+    pub usage: Option<cururu_engine::ReviewUsage>,
+    pub diff_fingerprint: String,
+    pub head_oid: Option<String>,
+    pub diff_bytes: usize,
+    pub chunk_count: usize,
+    pub discarded_findings: usize,
+}
+
+pub fn repository_identity(root: &Path) -> anyhow::Result<String> {
+    let canonical_root = root
+        .canonicalize()
+        .context("could not resolve the local repository path")?;
+    let identity = canonical_root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("local repository path is not UTF-8"))?;
+    anyhow::ensure!(
+        canonical_root.is_absolute() && !identity.chars().any(char::is_control),
+        "local repository path is not a safe absolute path"
+    );
+    Ok(identity.to_string())
+}
+
+pub fn config_fingerprint(settings: &LocalReviewSettings) -> anyhow::Result<String> {
+    settings.validate()?;
+    let mut digest = Sha256::new();
+    digest.update(b"cururu-desktop-local-review-v1\0");
+    digest.update(settings.openai_endpoint.as_bytes());
+    digest.update([0]);
+    digest.update(settings.openai_model.as_bytes());
+    digest.update([0]);
+    digest.update(system_prompt().as_bytes());
+    digest.update(MAX_LOCAL_FILE_DIFF_BYTES.to_be_bytes());
+    digest.update(MAX_LOCAL_DIFF_BYTES.to_be_bytes());
+    digest.update(MAX_LOCAL_REVIEW_FILES.to_be_bytes());
+    digest.update(MAX_LOCAL_REVIEW_CHUNKS.to_be_bytes());
+    digest.update(MAX_REVIEW_FINDINGS.to_be_bytes());
+    digest.update(REVIEW_MAX_OUTPUT_TOKENS.to_be_bytes());
+    digest.update(REVIEW_TEMPERATURE.to_bits().to_be_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn system_prompt() -> String {
+    format!(
+        "{}\n\n{}",
+        cururu_engine::DEFAULT_REVIEW_PROMPT.trim(),
+        LOCAL_REVIEW_NOTE
+    )
+}
+
+#[must_use]
+pub fn snapshot_fingerprint(snapshot: &RepositorySnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cururu-desktop-local-review-diff-v1\0");
+    digest.update(
+        snapshot
+            .head_oid
+            .as_deref()
+            .unwrap_or("<unborn>")
+            .as_bytes(),
+    );
+    digest.update([0]);
+    for file in &snapshot.changed_files {
+        digest.update(file.path.as_bytes());
+        digest.update([0]);
+        digest.update(file.patch.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[must_use]
+pub fn diff_byte_count(snapshot: &RepositorySnapshot) -> usize {
+    snapshot
+        .changed_files
+        .iter()
+        .map(|file| file.patch.len())
+        .sum()
+}
+
+pub fn validate_snapshot(snapshot: &RepositorySnapshot) -> anyhow::Result<usize> {
+    bounded_chunks(snapshot).map(|chunks| chunks.len())
+}
+
+pub async fn review_snapshot(
+    settings: &LocalReviewSettings,
+    secrets: &LocalReviewSecrets,
+    snapshot: &RepositorySnapshot,
+) -> anyhow::Result<LocalReviewResult> {
+    settings.validate()?;
+    let chunks = bounded_chunks(snapshot)?;
+    let agent = cururu_engine::OpenAiCompatibleAgent::new(
+        cururu_engine::OpenAiCompatibleSettings {
+            base_url: settings.openai_endpoint.clone(),
+            api_key: secrets.as_str().to_string(),
+            model: settings.openai_model.clone(),
+            temperature: REVIEW_TEMPERATURE,
+            max_output_tokens: REVIEW_MAX_OUTPUT_TOKENS,
+        },
+        system_prompt(),
+    )?;
+    let chunk_results = cururu_engine::review_chunks(&agent, &chunks).await?;
+    assemble_review_result(settings, snapshot, chunk_results)
+}
+
+fn bounded_chunks(snapshot: &RepositorySnapshot) -> anyhow::Result<Vec<cururu_core::DiffChunk>> {
+    anyhow::ensure!(
+        !snapshot.changed_files.is_empty(),
+        "there are no changed-file diffs to review"
+    );
+    anyhow::ensure!(
+        snapshot.changed_files.len() <= MAX_LOCAL_REVIEW_FILES,
+        "local review is limited to 100 changed files per request"
+    );
+    cururu_core::ensure_review_diff_limits(
+        &snapshot.changed_files,
+        MAX_LOCAL_FILE_DIFF_BYTES,
+        MAX_LOCAL_DIFF_BYTES,
+    )
+    .map_err(|error| anyhow::anyhow!(error).context("local review diff exceeds its size limit"))?;
+    let chunks = cururu_core::chunk_files(
+        &snapshot.changed_files,
+        REVIEW_CHUNK_BYTES,
+        MAX_LOCAL_DIFF_BYTES,
+    );
+    anyhow::ensure!(
+        !chunks.is_empty() && chunks.len() <= MAX_LOCAL_REVIEW_CHUNKS,
+        "local review exceeds the bounded chunk limit"
+    );
+    Ok(chunks)
+}
+
+fn assemble_review_result(
+    settings: &LocalReviewSettings,
+    snapshot: &RepositorySnapshot,
+    chunk_results: Vec<cururu_engine::ChunkResult>,
+) -> anyhow::Result<LocalReviewResult> {
+    let chunk_count = chunk_results.len();
+    anyhow::ensure!(
+        chunk_count > 0 && chunk_count <= MAX_LOCAL_REVIEW_CHUNKS,
+        "local review did not return a complete bounded chunk set"
+    );
+    let usage = cururu_engine::merge_usage(&chunk_results);
+    let reviews = chunk_results
+        .into_iter()
+        .map(|chunk_result| chunk_result.review)
+        .collect();
+    let mut review = cururu_core::collect_review_candidates(
+        settings.openai_model.clone(),
+        snapshot.changed_files.len(),
+        reviews,
+        Vec::new(),
+        cururu_core::CandidateOptions {
+            include_suggested_changes: true,
+            synthesize: false,
+        },
+    );
+
+    let candidate_count = review.findings.len();
+    review.findings.retain(|finding| {
+        let has_valid_severity = cururu_core::Severity::from_name(&finding.severity).is_some();
+        let has_valid_confidence =
+            finding.confidence.is_finite() && (0.0..=1.0).contains(&finding.confidence);
+        let has_valid_anchor = finding.line.is_some_and(|line| {
+            cururu_core::is_valid_anchor(&snapshot.changed_files, &finding.path, line)
+        });
+        has_valid_severity && has_valid_confidence && has_valid_anchor
+    });
+    review.findings.truncate(MAX_REVIEW_FINDINGS);
+    let discarded_findings = candidate_count.saturating_sub(review.findings.len());
+    review.summary = format!(
+        "Found {} anchored review finding(s); discarded {} invalid or excess candidate(s).",
+        review.findings.len(),
+        discarded_findings
+    );
+
+    Ok(LocalReviewResult {
+        review,
+        usage,
+        diff_fingerprint: snapshot_fingerprint(snapshot),
+        head_oid: snapshot.head_oid.clone(),
+        diff_bytes: diff_byte_count(snapshot),
+        chunk_count,
+        discarded_findings,
+    })
+}
+
+fn validate_api_key(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!value.is_empty(), "local review API key must not be empty");
+    anyhow::ensure!(
+        value.len() <= 16_384,
+        "local review API key exceeds the size limit"
+    );
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\'),
+        "local review API key contains invalid header characters"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LocalReviewSecrets, MAX_LOCAL_DIFF_BYTES, MAX_LOCAL_FILE_DIFF_BYTES,
+        assemble_review_result, bounded_chunks, config_fingerprint, diff_byte_count,
+        repository_identity, snapshot_fingerprint, validate_api_key,
+    };
+    use crate::{repository::RepositorySnapshot, session_store::LocalReviewSettings};
+    use cururu_core::{ChangedFile, ReviewFinding, ReviewResult};
+
+    fn settings(endpoint: &str, model: &str) -> LocalReviewSettings {
+        LocalReviewSettings {
+            openai_endpoint: endpoint.to_string(),
+            openai_model: model.to_string(),
+        }
+    }
+
+    fn changed_file(path: &str, diff: &str, right_lines: &[u32]) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            patch: diff.to_string(),
+            right_lines: right_lines.to_vec(),
+        }
+    }
+
+    fn finding(path: &str, line: Option<u32>) -> ReviewFinding {
+        ReviewFinding {
+            severity: "high".to_string(),
+            path: path.to_string(),
+            line,
+            title: "Possible bug".to_string(),
+            message: "Concrete issue".to_string(),
+            suggestion: "Use a safe fallback".to_string(),
+            confidence: 0.9,
+            suggested_change: None,
+            source: None,
+            rule: None,
+        }
+    }
+
+    fn snapshot(files: Vec<ChangedFile>) -> RepositorySnapshot {
+        RepositorySnapshot {
+            root: std::path::PathBuf::from("/repo"),
+            branch: Some("main".to_string()),
+            head_oid: Some("abc123".to_string()),
+            changed_paths: files.iter().map(|file| file.path.clone()).collect(),
+            changed_files: files,
+        }
+    }
+
+    #[test]
+    fn local_review_fingerprint_tracks_provider_and_canonical_prompt() {
+        let base = config_fingerprint(&settings("https://api.example.test/v1", "model-a")).unwrap();
+        let other_endpoint =
+            config_fingerprint(&settings("https://other.example.test/v1", "model-a")).unwrap();
+        let other_model =
+            config_fingerprint(&settings("https://api.example.test/v1", "model-b")).unwrap();
+
+        assert_ne!(base, other_endpoint);
+        assert_ne!(base, other_model);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_repository_identity_uses_the_canonical_checkout_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let alias = directory.path().join("repo-link");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+
+        assert_eq!(
+            repository_identity(&alias).unwrap(),
+            repository_identity(directory.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_diff_fingerprint_and_size_change_with_reviewed_evidence() {
+        let first = snapshot(vec![changed_file("src/lib.rs", "diff one", &[3])]);
+        let second = snapshot(vec![changed_file("src/lib.rs", "diff two", &[3])]);
+
+        assert_ne!(snapshot_fingerprint(&first), snapshot_fingerprint(&second));
+        assert_eq!(diff_byte_count(&first), "diff one".len());
+    }
+
+    #[test]
+    fn local_diff_chunks_preserve_limits_and_reject_oversized_files() {
+        let valid = snapshot(vec![changed_file("src/lib.rs", &"x".repeat(1_000), &[1])]);
+        let chunks = bounded_chunks(&valid).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.len() <= MAX_LOCAL_FILE_DIFF_BYTES + 1);
+
+        let oversized = snapshot(vec![changed_file(
+            "src/lib.rs",
+            &"x".repeat(MAX_LOCAL_FILE_DIFF_BYTES + 1),
+            &[1],
+        )]);
+        assert!(bounded_chunks(&oversized).is_err());
+
+        let too_many_bytes = snapshot(vec![changed_file(
+            "src/lib.rs",
+            &"x".repeat(MAX_LOCAL_DIFF_BYTES + 1),
+            &[1],
+        )]);
+        assert!(bounded_chunks(&too_many_bytes).is_err());
+    }
+
+    #[test]
+    fn local_review_discards_untrusted_findings_without_valid_changed_line_anchors() {
+        let snapshot = snapshot(vec![changed_file("src/lib.rs", "+changed", &[3])]);
+        let mut valid = finding("src/lib.rs", Some(3));
+        valid.suggested_change = Some(cururu_core::SuggestedChange {
+            replacement: "safe_call()".to_string(),
+        });
+        let mut invalid_confidence = finding("src/lib.rs", Some(3));
+        invalid_confidence.confidence = f32::NAN;
+        let invalid_severity = ReviewFinding {
+            severity: "<LEVEL>".to_string(),
+            ..finding("src/lib.rs", Some(3))
+        };
+        let chunk = cururu_engine::ChunkResult {
+            review: ReviewResult {
+                model: "untrusted-model-name".to_string(),
+                files_reviewed: 99,
+                summary: "untrusted summary".to_string(),
+                findings: vec![
+                    valid,
+                    finding("outside.rs", Some(3)),
+                    finding("src/lib.rs", Some(4)),
+                    finding("src/lib.rs", None),
+                    invalid_confidence,
+                    invalid_severity,
+                ],
+            },
+            usage: None,
+        };
+
+        let result = assemble_review_result(
+            &settings("https://api.example.test/v1", "configured-model"),
+            &snapshot,
+            vec![chunk],
+        )
+        .unwrap();
+
+        assert_eq!(result.review.model, "configured-model");
+        assert_eq!(result.review.files_reviewed, 1);
+        assert_eq!(result.review.findings.len(), 1);
+        assert_eq!(result.discarded_findings, 5);
+        assert!(result.review.findings[0].suggested_change.is_some());
+    }
+
+    #[test]
+    fn local_review_rejects_partial_or_empty_chunk_results() {
+        let snapshot = snapshot(vec![changed_file("src/lib.rs", "+changed", &[3])]);
+
+        assert!(
+            assemble_review_result(
+                &settings("https://api.example.test/v1", "model"),
+                &snapshot,
+                Vec::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_review_secrets_redact_debug_and_validate_header_values() {
+        let secrets = LocalReviewSecrets {
+            api_key: "secret-value".to_string(),
+        };
+
+        assert!(format!("{secrets:?}").contains("[REDACTED]"));
+        assert!(!format!("{secrets:?}").contains("secret-value"));
+        assert!(validate_api_key("valid-key").is_ok());
+        assert!(validate_api_key("invalid\nkey").is_err());
+    }
+}

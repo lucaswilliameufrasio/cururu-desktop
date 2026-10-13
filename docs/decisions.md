@@ -57,10 +57,35 @@ revision so their shared core types remain identical. Provider configuration,
 credentials, UI, and local-repository adapters remain owned by the desktop.
 
 The initial extraction exposes the existing `ReviewAgent` contract, usage and
-chunk result types, and sequential fail-closed chunk orchestration. It does not
-yet make the desktop produce findings; connecting a real review provider and
-workflow remains a follow-up slice. The initial engine commit is available at
-`46c0d17`; the desktop manifest pins both crates there.
+chunk result types, sequential fail-closed chunk orchestration, and the
+canonical Cururu review prompt. The desktop consumes these contracts for its
+local OpenAI-compatible reviewer; both crates are pinned to engine commit
+`90b8869`.
+
+### Local code review and provider consent
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-10
+
+The first local reviewer uses Cururu's shared OpenAI-compatible engine and
+canonical prompt. It sends only bounded changed-file unified diffs and paths,
+never a repository snapshot. The endpoint and model are app-local settings;
+the API key lives in a dedicated OS-keyring entry, separate from evaluator
+credentials. Endpoints must use HTTPS.
+
+Consent is separate from configuring credentials and separate from the dual
+evaluator consent. It is stored per canonical local checkout path and
+configuration fingerprint. Saving settings or authorizing sends no code. A
+separate user action starts a review and displays the repository, destination,
+file count, and diff-size limits before sending. Missing or mismatched local
+consent, stale worktree state, invalid model anchors, or a failed chunk aborts
+the run without showing partial findings. Results remain informational; this
+decision does not authorize applying suggestions, staging, committing, or
+publishing them.
+
+Keep reviewer policy and prompt behavior in Cururu rather than copying review
+heuristics into the desktop. Revisit consent fingerprint versioning if the
+outbound evidence boundary or destination semantics change.
 
 ## Local review-session persistence
 
