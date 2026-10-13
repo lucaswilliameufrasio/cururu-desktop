@@ -7,8 +7,9 @@ changes explicitly; no crate release is required.
 
 ## Current slice
 
-The current desktop slice includes local review, read-only GitHub PR context,
-and a dual-provider second-opinion workflow. The review workspace includes:
+The current desktop slice includes local review with guarded suggestions,
+GitHub PR context with explicitly confirmed inline-thread replies, and a
+dual-provider second-opinion workflow. The review workspace includes:
 
 - a repository file rail;
 - a virtualized diff with 10,000 rows;
@@ -51,26 +52,35 @@ the destination, changed-file count, and limits. Only changed-file paths and
 bounded unified diffs are sent (up to 100 files, 45,000 bytes per file, and
 180,000 bytes total). The app rechecks consent and the exact diff before sending
 and discards the result if the checkout changes during review. Findings are
-informational: the workflow does not edit files, run commands, stage, commit, or
-publish anything.
+informational and are never applied automatically. A structured single-line
+suggestion can be previewed as a local diff; only a separate confirmation applies
+it after rechecking the reviewed diff and exact file contents. This action does
+not run commands, stage, commit, or push.
 
 GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
 `CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
 GitHub authentication and read-only pull-request inspection are available;
-remote comment publication is not implemented. **Disconnect GitHub** removes
-local credentials but does not revoke the grant at GitHub.
+individual thread replies use the separate explicit write flow below.
+**Disconnect GitHub** removes local credentials but does not revoke the grant at
+GitHub.
 
 With a valid GitHub session, enter a PR as `owner/repository#number` and choose
 **Open GitHub PR** to load its metadata, changed-file patches, review
 submissions, inline comment threads, and general conversation comments. Inline
 comments whose current line is absent but original line is known are marked as
-outdated locations; this does not mean the concern was resolved. This is
-read-only; choosing an inline comment focuses its file and diff line when that
-anchor is present in the loaded patch, and loads a bounded source excerpt at
-the comment's original commit. Missing or oversized patches fail closed instead
-of showing an incomplete diff. Remote source is fetched only on selection and
-kept in memory. Loading a remote PR does not send code to an evaluator or
-publish comments.
+outdated locations; this does not mean the concern was resolved. PR loading is
+read-only; choosing an inline comment focuses its file and diff
+line when that anchor is present in the loaded patch, and loads a bounded source
+excerpt at the comment's original commit. Missing or oversized patches fail
+closed instead of showing an incomplete diff. Remote source is fetched only on
+selection and kept in memory. Loading a remote PR does not send code to an
+evaluator or publish comments. For a selected inline thread, you can compose an
+individual reply. The app previews the exact PR, head, target comment, and body;
+only **Confirm and publish this reply** sends it. Before sending, the app
+rechecks that the PR is open, its head is unchanged, and the target comment
+still exists. It does not automatically retry an ambiguous request; refresh the
+PR before deciding whether to retry. Batch review submission and general
+conversation comments are not implemented yet.
 
 “Understand a review” can optionally run a second opinion through both a
 user-configured OpenAI-compatible chat-completions endpoint and Jev. Configure
