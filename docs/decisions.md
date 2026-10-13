@@ -39,6 +39,14 @@ not stage, commit, or push; those remain separate actions and are not part of
 this workflow. If the app cannot establish that the target is still safe to
 change, it must fail closed and preserve the user's current file.
 
+The initial implementation accepts only a single-line replacement on a valid
+changed-line anchor. It previews the exact unified diff, rejects symbolic-link
+path components, and requires both the reviewed worktree diff and complete file
+contents to remain unchanged between preview and confirmation. After the final
+recheck, write through a same-directory temporary file and atomic rename while
+preserving file permissions. Applying a suggestion invalidates the prior local
+review findings; run a new review before applying another suggestion.
+
 The existing read-only behavior for repository discovery, Git status, and diff
 extraction remains unchanged. This decision authorizes implementation of the
 guarded local-edit workflow, not applying any change during development or
@@ -218,6 +226,30 @@ bounded excerpt, and retain it only in memory. Do not fetch source files for all
 comments automatically. Publication remains a separate, explicitly confirmed
 feature; revisit repository discovery when a multi-repository chooser is
 designed.
+
+### Explicit inline-thread replies
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-13
+
+The first GitHub publication slice supports one reply to a selected inline
+review-thread comment. It does not publish a batch review, a review summary, or
+a general issue-conversation comment. Drafting and previewing are local-only.
+Before publication, show the exact pull request URL and title, confirmed head,
+target comment and author, and complete reply body; the user must then choose a
+separate **Confirm and publish this reply** action. Changing review modes or
+selecting another thread never publishes.
+
+Immediately before the write, reload the pull request and fail closed unless it
+is still open, its head SHA matches the preview, and the target comment still
+exists. Send one request to GitHub's pull-request review-comment reply endpoint;
+do not retry automatically. If the outcome cannot be confirmed, tell the user
+to refresh the pull request before deciding whether to retry, since the server
+may have accepted a request whose response was lost. During revalidation, refuse
+to publish when the same reply body already exists in the selected thread. The
+UI also keeps the exact successful reply visible and blocks an accidental
+identical repeat in that thread. This workflow does not modify local files,
+stage, commit, or push.
 
 ### Review understanding evaluators
 

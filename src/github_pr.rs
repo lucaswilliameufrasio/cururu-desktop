@@ -6,7 +6,7 @@ use gpui::http_client::{
     AsyncBody, HttpClient, HttpRequestExt as _, Method, RedirectPolicy, Request, StatusCode, Url,
 };
 use http_body_util::BodyExt as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const API_ROOT: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -17,6 +17,8 @@ const MAX_COLLECTION_PAGES: usize = 50;
 const MAX_REMOTE_DIFF_FILE_BYTES: usize = 45_000;
 const MAX_REMOTE_DIFF_BYTES: usize = 180_000;
 const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024;
+const MAX_THREAD_REPLY_BYTES: usize = 10_000;
+const MAX_MUTATION_RESPONSE_BYTES: usize = 64_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PullRequestRef {
@@ -65,6 +67,41 @@ fn valid_segment(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn validate_pull_request_reference(reference: &PullRequestRef) -> anyhow::Result<()> {
+    ensure!(
+        valid_segment(&reference.owner)
+            && valid_segment(&reference.repository)
+            && reference.number > 0,
+        "pull request reference is invalid"
+    );
+    Ok(())
+}
+
+pub fn validate_thread_reply_body(body: &str) -> anyhow::Result<()> {
+    ensure!(
+        !body.trim().is_empty(),
+        "a GitHub thread reply cannot be empty"
+    );
+    ensure!(
+        body.len() <= MAX_THREAD_REPLY_BYTES,
+        "a GitHub thread reply cannot exceed 10,000 bytes"
+    );
+    ensure!(
+        !body.chars().any(|character| {
+            character == '\0'
+                || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        }),
+        "a GitHub thread reply contains unsupported control characters"
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CreateThreadReplyRequest<'a> {
+    body: &'a str,
+    in_reply_to: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +200,7 @@ impl GitHubPullRequestClient {
         &self,
         reference: PullRequestRef,
     ) -> anyhow::Result<PullRequestSnapshot> {
+        validate_pull_request_reference(&reference)?;
         let pull_request: PullRequestResponse = self
             .get_json(&format!(
                 "{API_ROOT}/repos/{}/{}/pulls/{}",
@@ -225,6 +263,7 @@ impl GitHubPullRequestClient {
         path: &str,
         commit_sha: &str,
     ) -> anyhow::Result<PullRequestSourceFile> {
+        validate_pull_request_reference(reference)?;
         validate_relative_path(path)?;
         ensure!(
             valid_commit_sha(commit_sha),
@@ -278,6 +317,147 @@ impl GitHubPullRequestClient {
             commit_sha: commit_sha.to_string(),
             content,
         })
+    }
+
+    pub async fn publish_thread_reply(
+        &self,
+        reference: &PullRequestRef,
+        expected_head_sha: &str,
+        expected_target: &PullRequestComment,
+        body: &str,
+    ) -> anyhow::Result<PullRequestComment> {
+        validate_pull_request_reference(reference)?;
+        validate_thread_reply_body(body)?;
+        ensure!(
+            valid_commit_sha(expected_head_sha),
+            "the confirmed pull request head is not a valid commit identifier"
+        );
+        ensure!(
+            expected_target.id > 0,
+            "the reply target must be a positive comment id"
+        );
+
+        let target = self
+            .revalidate_thread_reply_target(reference, expected_head_sha, expected_target, body)
+            .await?;
+        self.send_thread_reply(reference, &target, body).await
+    }
+
+    async fn revalidate_thread_reply_target(
+        &self,
+        reference: &PullRequestRef,
+        expected_head_sha: &str,
+        expected_target: &PullRequestComment,
+        body: &str,
+    ) -> anyhow::Result<PullRequestComment> {
+        let pull_request: PullRequestResponse = self
+            .get_json(&format!(
+                "{API_ROOT}/repos/{}/{}/pulls/{}",
+                reference.owner, reference.repository, reference.number
+            ))
+            .await
+            .context("could not revalidate the GitHub pull request before publishing")?;
+        ensure!(
+            pull_request.number == reference.number,
+            "GitHub returned a different pull request during publication preflight"
+        );
+        ensure!(
+            pull_request.state == "open",
+            "the pull request is no longer open; refresh it before publishing"
+        );
+        ensure!(
+            safe_web_url(&pull_request.html_url),
+            "GitHub returned an invalid pull request URL during publication preflight"
+        );
+        ensure!(
+            pull_request.head.sha == expected_head_sha,
+            "the pull request head changed; refresh it and review the reply again"
+        );
+        let comments_path = format!("{API_ROOT}{}", reference.api_path("/comments"));
+        let remote_comments: Vec<PullRequestReviewComment> = self
+            .get_all_pages(&comments_path)
+            .await
+            .context("could not revalidate the selected GitHub review comment")?;
+        let comments = parse_pull_request_comments(remote_comments)?;
+        let target = comments
+            .iter()
+            .find(|comment| comment.id == expected_target.id)
+            .context("the selected review comment no longer exists; refresh the pull request")?;
+        ensure!(
+            target == expected_target,
+            "the selected review comment changed; refresh it before publishing"
+        );
+        ensure!(
+            !comments.iter().any(|comment| {
+                comment.in_reply_to_id == Some(expected_target.id) && comment.body == body
+            }),
+            "an identical reply already exists in this thread; refresh the pull request before publishing"
+        );
+        Ok(target.clone())
+    }
+
+    async fn send_thread_reply(
+        &self,
+        reference: &PullRequestRef,
+        target: &PullRequestComment,
+        body: &str,
+    ) -> anyhow::Result<PullRequestComment> {
+        let request_body = serde_json::to_string(&CreateThreadReplyRequest {
+            body,
+            in_reply_to: target.id,
+        })
+        .context("could not encode the GitHub reply request")?;
+        let url = format!(
+            "{API_ROOT}/repos/{}/{}/pulls/{}/comments",
+            reference.owner, reference.repository, reference.number
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(&url)
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header("User-Agent", "Cururu-Desktop")
+            .body(AsyncBody::from(request_body))
+            .context("could not build the GitHub thread-reply request")?;
+        let response = self
+            .http
+            .send(request)
+            .await
+            .context("GitHub did not confirm whether the reply was published")?;
+        let (parts, mut response_body) = response.into_parts();
+        ensure!(
+            parts.status == StatusCode::CREATED,
+            "GitHub API returned HTTP {} while publishing the reply",
+            parts.status
+        );
+        let mut response_bytes = Vec::new();
+        while let Some(frame) = response_body.frame().await {
+            let frame = frame.context("could not read GitHub's reply response")?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            ensure!(
+                response_bytes.len().saturating_add(data.len()) <= MAX_MUTATION_RESPONSE_BYTES,
+                "GitHub reply response exceeded the size limit"
+            );
+            response_bytes.extend_from_slice(&data);
+        }
+        let response_comment: PullRequestReviewComment = serde_json::from_slice(&response_bytes)
+            .context("GitHub did not return a valid created-reply record")?;
+        let mut comments = parse_pull_request_comments(vec![response_comment])?;
+        let comment = comments
+            .pop()
+            .context("GitHub did not return the created reply")?;
+        ensure!(
+            comment.in_reply_to_id == Some(target.id)
+                && comment.path == target.path
+                && comment.body == body,
+            "GitHub returned a reply that did not match the confirmed target and body"
+        );
+        Ok(comment)
     }
 
     async fn get_all_pages<T>(&self, first_url: &str) -> anyhow::Result<Vec<T>>
@@ -705,22 +885,26 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use gpui::http_client::{AsyncBody, HttpClient, Request, Response, Url};
+    use gpui::http_client::{AsyncBody, HttpClient, Method, Request, Response, StatusCode, Url};
+    use http_body_util::BodyExt as _;
 
     use super::{
         GitHubPullRequestClient, PullRequestRef, group_review_threads, next_page_url,
-        parse_pull_request_comments, parse_pull_request_files,
+        parse_pull_request_comments, parse_pull_request_files, validate_thread_reply_body,
     };
 
     struct FakeHttpClient {
         responses: Mutex<VecDeque<Response<AsyncBody>>>,
-        requests: Mutex<Vec<RequestInfo>>,
+        requests: Arc<Mutex<Vec<RequestInfo>>>,
     }
 
     struct RequestInfo {
         uri: String,
+        method: String,
         authorization: Option<String>,
         api_version: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
     }
 
     impl HttpClient for FakeHttpClient {
@@ -736,22 +920,34 @@ mod tests {
             &self,
             request: Request<AsyncBody>,
         ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
-            let request_info = RequestInfo {
-                uri: request.uri().to_string(),
-                authorization: request
-                    .headers()
+            let (parts, body) = request.into_parts();
+            let mut request_info = RequestInfo {
+                uri: parts.uri.to_string(),
+                method: parts.method.to_string(),
+                authorization: parts
+                    .headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string),
-                api_version: request
-                    .headers()
+                api_version: parts
+                    .headers
                     .get("x-github-api-version")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string),
+                content_type: parts
+                    .headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                body: Vec::new(),
             };
             let response = self.responses.lock().unwrap().pop_front();
-            self.requests.lock().unwrap().push(request_info);
-            Box::pin(async move { response.ok_or_else(|| anyhow::anyhow!("no fake response")) })
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                request_info.body = body.collect().await?.to_bytes().to_vec();
+                requests.lock().unwrap().push(request_info);
+                response.ok_or_else(|| anyhow::anyhow!("no fake response"))
+            })
         }
 
         fn proxy(&self) -> Option<&Url> {
@@ -760,8 +956,12 @@ mod tests {
     }
 
     fn response(body: &'static str) -> Response<AsyncBody> {
+        response_with_status(StatusCode::OK, body)
+    }
+
+    fn response_with_status(status: StatusCode, body: &'static str) -> Response<AsyncBody> {
         Response::builder()
-            .status(200)
+            .status(status)
             .body(AsyncBody::from(body))
             .unwrap()
     }
@@ -777,11 +977,29 @@ mod tests {
     fn api_client(responses: &[&'static str]) -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
         let http = Arc::new(FakeHttpClient {
             responses: Mutex::new(responses.iter().map(|body| response(body)).collect()),
-            requests: Mutex::new(Vec::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         });
         let client =
             GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string()).unwrap();
         (client, http)
+    }
+
+    fn expected_thread_comment() -> super::PullRequestComment {
+        super::PullRequestComment {
+            id: 7,
+            path: "src/lib.rs".to_string(),
+            line: Some(8),
+            original_line: Some(8),
+            body: "Please keep this check.".to_string(),
+            author: "reviewer".to_string(),
+            html_url: "https://github.com/octo-org/review_repo/pull/42#discussion_r7".to_string(),
+            commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            original_commit_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            in_reply_to_id: None,
+            is_outdated: false,
+            subject_type: None,
+            side: None,
+        }
     }
 
     #[test]
@@ -836,6 +1054,333 @@ mod tests {
             );
             assert_eq!(requests[0].api_version.as_deref(), Some("2022-11-28"));
         });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_revalidates_the_pr_and_posts_one_bounded_reply() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                    ),
+                    response(
+                        r#"[{"id":7,"path":"src/lib.rs","line":8,"original_line":8,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","user":{"login":"reviewer"}}]"#,
+                    ),
+                    response_with_status(
+                        StatusCode::CREATED,
+                        r#"{"id":8,"path":"src/lib.rs","line":8,"original_line":8,"body":"I kept the check and added a regression test.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r8","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","in_reply_to_id":7,"user":{"login":"octocat"}}"#,
+                    ),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let body = "I kept the check and added a regression test.";
+            let target = expected_thread_comment();
+
+            let created = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    body,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(created.id, 8);
+            assert_eq!(created.in_reply_to_id, Some(7));
+            assert_eq!(created.body, body);
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let post = &requests[2];
+            assert_eq!(post.method, Method::POST.as_str());
+            assert_eq!(
+                post.uri,
+                "https://api.github.com/repos/octo-org/review_repo/pulls/42/comments"
+            );
+            assert_eq!(
+                post.authorization.as_deref(),
+                Some("Bearer test-token-not-real")
+            );
+            assert_eq!(post.api_version.as_deref(), Some("2022-11-28"));
+            assert_eq!(post.content_type.as_deref(), Some("application/json"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&post.body).unwrap(),
+                serde_json::json!({"body": body, "in_reply_to": 7})
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_does_not_retry_after_a_github_rejection() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                    ),
+                    response(
+                        r#"[{"id":7,"path":"src/lib.rs","line":8,"original_line":8,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","user":{"login":"reviewer"}}]"#,
+                    ),
+                    response_with_status(StatusCode::UNPROCESSABLE_ENTITY, "{}"),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == Method::POST.as_str())
+                    .count(),
+                1
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_blocks_an_identical_existing_reply() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                    ),
+                    response(
+                        r#"[{"id":7,"path":"src/lib.rs","line":8,"original_line":8,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","user":{"login":"reviewer"}},{"id":8,"path":"src/lib.rs","line":8,"original_line":8,"body":"A safe reply","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r8","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","in_reply_to_id":7,"user":{"login":"octocat"}}]"#,
+                    ),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == Method::GET.as_str())
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_fails_closed_if_the_pull_request_head_changed() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}"#,
+                    ),
+                    response(
+                        r#"[{"id":7,"path":"src/lib.rs","line":8,"original_line":8,"body":"Please keep this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"cccccccccccccccccccccccccccccccccccccccc","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","user":{"login":"reviewer"}}]"#,
+                    ),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == Method::GET.as_str())
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_fails_closed_if_the_pull_request_is_closed() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([response(
+                    r#"{"number":42,"title":"Review a parser","state":"closed","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                )])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, Method::GET.as_str());
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_fails_closed_if_the_target_was_removed() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                    ),
+                    response("[]"),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == Method::GET.as_str())
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn publishing_a_thread_reply_fails_closed_if_the_target_changed_since_preview() {
+        futures::executor::block_on(async {
+            let http = Arc::new(FakeHttpClient {
+                responses: Mutex::new(VecDeque::from([
+                    response(
+                        r#"{"number":42,"title":"Review a parser","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"octocat"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+                    ),
+                    response(
+                        r#"[{"id":7,"path":"src/lib.rs","line":8,"original_line":8,"body":"Updated comment text.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","user":{"login":"reviewer"}}]"#,
+                    ),
+                ])),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            });
+            let client =
+                GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
+                    .unwrap();
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    "A safe reply",
+                )
+                .await;
+
+            assert!(result.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == Method::GET.as_str())
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn invalid_thread_reply_is_rejected_before_any_network_request() {
+        futures::executor::block_on(async {
+            let (client, http) = api_client(&[]);
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let target = expected_thread_comment();
+
+            let result = client
+                .publish_thread_reply(
+                    &reference,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &target,
+                    " \n\t",
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(http.requests.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn thread_reply_body_is_bounded_and_allows_markdown_line_breaks() {
+        assert!(validate_thread_reply_body("A reply\nwith Markdown.").is_ok());
+        assert!(validate_thread_reply_body(" \n\t").is_err());
+        assert!(validate_thread_reply_body("bad\0body").is_err());
+        assert!(validate_thread_reply_body(&"x".repeat(10_001)).is_err());
     }
 
     #[test]
@@ -924,7 +1469,7 @@ mod tests {
                     ),
                     response("[]"),
                 ])),
-                requests: Mutex::new(Vec::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
             });
             let client =
                 GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string())
@@ -955,7 +1500,7 @@ mod tests {
                 .unwrap();
             let http = Arc::new(FakeHttpClient {
                 responses: Mutex::new(VecDeque::from([response])),
-                requests: Mutex::new(Vec::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
             });
             let client =
                 GitHubPullRequestClient::new(http, "test-token-not-real".to_string()).unwrap();

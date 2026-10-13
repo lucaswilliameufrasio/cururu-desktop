@@ -5,11 +5,15 @@ use gpui::{
     div, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::input::{InputState, TextInput};
+use gpui_component::{
+    Disableable as _,
+    button::{Button, ButtonVariants as _},
+};
 use std::{
     fmt::Write as _,
     future::Future,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -23,6 +27,7 @@ pub mod github_pr;
 pub mod local_review;
 pub mod repository;
 pub mod session_store;
+pub mod suggested_change;
 
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
@@ -77,6 +82,8 @@ struct ReviewWorkspace {
     local_review_key_input: Option<Entity<InputState>>,
     local_review_state: LocalReviewState,
     next_local_review_request_id: u64,
+    suggested_change_state: SuggestedChangeState,
+    next_suggestion_request_id: u64,
     comment_drafts: Vec<session_store::StoredCommentDraft>,
     editing_draft: Option<session_store::StoredCommentDraft>,
     draft_input: Option<Entity<InputState>>,
@@ -86,6 +93,8 @@ struct ReviewWorkspace {
     pull_request_input: Option<Entity<InputState>>,
     remote_review_state: RemoteReviewState,
     remote_source_context: RemoteSourceContextState,
+    remote_reply_input: Option<Entity<InputState>>,
+    thread_reply_state: ThreadReplyState,
     review_mode: ReviewMode,
     selected_remote_comment: Option<github_pr::PullRequestComment>,
     evaluator_settings: Option<session_store::EvaluatorSettings>,
@@ -152,6 +161,77 @@ struct LocalReviewRequest {
     context: LocalReviewRequestContext,
     repository_root: PathBuf,
     settings: session_store::LocalReviewSettings,
+}
+
+#[derive(Clone)]
+struct SuggestedChangeRequest {
+    request_id: u64,
+    repository_root: PathBuf,
+    repository_identity: String,
+    reviewed_diff_fingerprint: String,
+    finding: cururu_core::ReviewFinding,
+}
+
+#[derive(Clone)]
+struct PendingSuggestedChange {
+    request_id: u64,
+    preview: suggested_change::Preview,
+}
+
+enum SuggestedChangeState {
+    Idle,
+    Preparing(u64),
+    Preview(PendingSuggestedChange),
+    Applying(PendingSuggestedChange),
+    Applied { path: String, line: u32 },
+    Failed(SharedString),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestedChangePreviewDecision {
+    IgnoreBusy,
+    RejectStale,
+    Start,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingThreadReply {
+    reference: github_pr::PullRequestRef,
+    pull_request_title: String,
+    pull_request_url: String,
+    expected_head_sha: String,
+    target_comment: github_pr::PullRequestComment,
+    body: String,
+}
+
+struct ThreadReplyComposer<'a> {
+    snapshot: &'a github_pr::PullRequestSnapshot,
+    comment: &'a github_pr::PullRequestComment,
+    input: &'a Entity<InputState>,
+    body: String,
+    validation_message: Option<String>,
+    access_token: Option<String>,
+}
+
+struct ThreadReplyComposerStatus {
+    is_confirming: bool,
+    failed_for_current_body: bool,
+    already_published: bool,
+    element: Option<gpui::Div>,
+}
+
+enum ThreadReplyState {
+    Idle,
+    Confirming(PendingThreadReply),
+    Publishing(PendingThreadReply),
+    Published {
+        pending: PendingThreadReply,
+        comment_url: String,
+    },
+    Failed {
+        pending: PendingThreadReply,
+        message: SharedString,
+    },
 }
 
 enum LocalReviewState {
@@ -285,6 +365,8 @@ impl ReviewWorkspace {
             local_review_key_input: None,
             local_review_state: LocalReviewState::Idle,
             next_local_review_request_id: 0,
+            suggested_change_state: SuggestedChangeState::Idle,
+            next_suggestion_request_id: 0,
             comment_drafts: Vec::new(),
             editing_draft: None,
             draft_input: None,
@@ -294,6 +376,8 @@ impl ReviewWorkspace {
             pull_request_input: None,
             remote_review_state: RemoteReviewState::Idle,
             remote_source_context: RemoteSourceContextState::Idle,
+            remote_reply_input: None,
+            thread_reply_state: ThreadReplyState::Idle,
             review_mode: ReviewMode::ReviewChanges,
             selected_remote_comment: None,
             evaluator_settings: None,
@@ -378,6 +462,7 @@ impl ReviewWorkspace {
                 self.local_review_authorization_error =
                     opened.local_review_authorization_error.map(Into::into);
                 self.local_review_state = LocalReviewState::Idle;
+                self.suggested_change_state = SuggestedChangeState::Idle;
                 self.load_error = None;
                 self.notice = Some("Repository opened · local access is read-only".into());
                 if let Some(session_result) = opened.session_result {
@@ -775,6 +860,14 @@ impl ReviewWorkspace {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
             }));
         }
+        if self.remote_reply_input.is_none() {
+            self.remote_reply_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx)
+                    .multi_line()
+                    .rows(4)
+                    .placeholder("Write a reply to this GitHub review thread…")
+            }));
+        }
         if self.local_review_endpoint_input.is_none() {
             let value = self.local_review_settings.as_ref().map_or_else(
                 || local_review::DEFAULT_LOCAL_REVIEW_ENDPOINT.to_string(),
@@ -1073,10 +1166,34 @@ impl ReviewWorkspace {
     fn render_pull_request_loader(&self, cx: &Context<Self>) -> impl IntoElement {
         let input = self.pull_request_input.as_ref().map(TextInput::new);
         let input_entity = self.pull_request_input.clone();
-        let is_loading = matches!(self.remote_review_state, RemoteReviewState::Loading(_));
+        let is_publishing_reply =
+            matches!(&self.thread_reply_state, ThreadReplyState::Publishing(_));
+        let is_applying_suggestion = matches!(
+            &self.suggested_change_state,
+            SuggestedChangeState::Applying(_)
+        );
+        let is_loading = matches!(self.remote_review_state, RemoteReviewState::Loading(_))
+            || is_publishing_reply
+            || is_applying_suggestion;
         let label = remote_review_status(&self.remote_review_state);
         let entity = cx.entity();
         let http = cx.http_client();
+        let load_button = Button::new("load-github-pull-request")
+            .label(if is_loading {
+                if is_publishing_reply {
+                    "Publishing reply…"
+                } else if is_applying_suggestion {
+                    "Applying local suggestion…"
+                } else {
+                    "Loading pull request…"
+                }
+            } else {
+                "Open GitHub PR"
+            })
+            .disabled(is_loading)
+            .on_click(move |_event, _window, cx| {
+                handle_open_pull_request(&entity, http.clone(), input_entity.clone(), cx);
+            });
         div()
             .flex()
             .items_center()
@@ -1086,84 +1203,7 @@ impl ReviewWorkspace {
             .border_b_1()
             .border_color(rgb(0x002b_3946))
             .children(input)
-            .child(
-                div()
-                    .id("load-github-pull-request")
-                    .px_3()
-                    .py_2()
-                    .bg(rgb(if is_loading { 0x001b_2732 } else { 0x0026_3442 }))
-                    .cursor_pointer()
-                    .child(if is_loading {
-                        "Loading pull request…"
-                    } else {
-                        "Open GitHub PR"
-                    })
-                    .on_click(move |_event, _window, cx| {
-                        let Some(input) = input_entity.clone() else {
-                            return;
-                        };
-                        let reference_text = input.read(cx).value().to_string();
-                        let reference = match github_pr::PullRequestRef::parse(&reference_text) {
-                            Ok(reference) => reference,
-                            Err(error) => {
-                                entity.update(cx, |this, cx| {
-                                    this.notice = Some(error.to_string().into());
-                                    cx.notify();
-                                });
-                                return;
-                            }
-                        };
-                        let credentials = entity.read(cx).github_credentials.clone();
-                        let Some(credentials) = credentials else {
-                            entity.update(cx, |this, cx| {
-                                this.notice = Some(
-                                    "Connect or refresh GitHub before opening a pull request."
-                                        .into(),
-                                );
-                                cx.notify();
-                            });
-                            return;
-                        };
-                        if credentials.access_token_is_expired() {
-                            entity.update(cx, |this, cx| {
-                                this.github_auth_state = GitHubAuthState::ReauthorizationRequired;
-                                this.notice = Some(
-                                    "GitHub session expired; refresh it before opening a pull request."
-                                        .into(),
-                                );
-                                cx.notify();
-                            });
-                            return;
-                        }
-                        let token = credentials.access_token;
-                        let can_load = entity.update(cx, |this, cx| {
-                            if matches!(this.remote_review_state, RemoteReviewState::Loading(_)) {
-                                return false;
-                            }
-                            this.notice = Some("Loading pull request from GitHub…".into());
-                            this.remote_source_context = RemoteSourceContextState::Idle;
-                            this.selected_remote_comment = None;
-                            this.evaluator_authorized_repository = None;
-                            this.evaluator_result = None;
-                            this.evaluator_result_comment_id = None;
-                            this.active_evaluator_context = None;
-                            this.is_evaluator_running = false;
-                            this.remote_review_state =
-                                RemoteReviewState::Loading(reference.clone());
-                            cx.notify();
-                            true
-                        });
-                        if can_load {
-                            start_pull_request_load(
-                                entity.clone(),
-                                http.clone(),
-                                token,
-                                reference,
-                                cx,
-                            );
-                        }
-                    }),
-            )
+            .child(load_button)
             .child(div().text_color(rgb(0x009b_aaba)).child(label))
     }
 
@@ -1333,65 +1373,6 @@ impl ReviewWorkspace {
             (_, None, None) => "synthetic review workspace".to_string(),
             (_, None, Some(branch)) => format!("{branch} → working tree"),
         };
-        let entity = cx.entity();
-        let store = self.session_store.clone();
-        let reopen_button = self.last_session.clone().map(|session| {
-            let entity = entity.clone();
-            let path = session.repository_root;
-            let store = store.clone();
-            div()
-                .id("reopen-last-session")
-                .px_3()
-                .py_2()
-                .bg(rgb(0x0020_2b36))
-                .cursor_pointer()
-                .child("Reopen last session")
-                .on_click(move |_event, _window, cx| {
-                    let entity = entity.clone();
-                    let can_open = entity.update(cx, |this, cx| {
-                        if this.is_opening_repository {
-                            return false;
-                        }
-                        this.is_opening_repository = true;
-                        cx.notify();
-                        true
-                    });
-                    if can_open {
-                        start_reopen_last_session(cx, entity, path.clone(), store.clone());
-                    }
-                })
-        });
-        let open_button = div()
-            .id("open-repository")
-            .px_3()
-            .py_2()
-            .bg(rgb(if self.is_opening_repository {
-                0x001b_2732
-            } else {
-                0x0026_3442
-            }))
-            .cursor_pointer()
-            .child(if self.is_opening_repository {
-                "Opening repository…"
-            } else {
-                "Open repository…"
-            })
-            .on_click(move |_event, _window, cx| {
-                let entity = entity.clone();
-                let can_open = entity.update(cx, |this, cx| {
-                    if this.is_opening_repository {
-                        return false;
-                    }
-                    this.is_opening_repository = true;
-                    this.notice = Some("Choose a repository folder to open".into());
-                    cx.notify();
-                    true
-                });
-                if can_open {
-                    start_repository_picker(cx, entity, store.clone());
-                }
-            });
-        let auth_button = self.render_github_auth_button(cx);
         div()
             .flex()
             .items_center()
@@ -1408,14 +1389,93 @@ impl ReviewWorkspace {
                     .child(div().text_color(rgb(0x009b_aaba)).child("review workspace")),
             )
             .child(div().text_color(rgb(0x009b_aaba)).child(subtitle))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .children(reopen_button)
-                    .child(auth_button)
-                    .child(open_button),
-            )
+            .child(self.render_header_actions(cx))
+    }
+
+    fn render_header_actions(&self, cx: &Context<Self>) -> gpui::Div {
+        let entity = cx.entity();
+        let store = self.session_store.clone();
+        let is_applying_suggestion = matches!(
+            &self.suggested_change_state,
+            SuggestedChangeState::Applying(_)
+        );
+        let reopen_button = self.last_session.clone().map(|session| {
+            let entity = entity.clone();
+            let path = session.repository_root;
+            let store = store.clone();
+            div()
+                .id("reopen-last-session")
+                .px_3()
+                .py_2()
+                .bg(rgb(0x0020_2b36))
+                .cursor_pointer()
+                .child("Reopen last session")
+                .on_click(move |_event, _window, cx| {
+                    let entity = entity.clone();
+                    let can_open = entity.update(cx, |this, cx| {
+                        if this.is_opening_repository
+                            || matches!(
+                                &this.suggested_change_state,
+                                SuggestedChangeState::Applying(_)
+                            )
+                        {
+                            return false;
+                        }
+                        this.is_opening_repository = true;
+                        cx.notify();
+                        true
+                    });
+                    if can_open {
+                        start_reopen_last_session(cx, entity, path.clone(), store.clone());
+                    }
+                })
+        });
+        let open_button = div()
+            .id("open-repository")
+            .px_3()
+            .py_2()
+            .bg(rgb(
+                if self.is_opening_repository || is_applying_suggestion {
+                    0x001b_2732
+                } else {
+                    0x0026_3442
+                },
+            ))
+            .cursor_pointer()
+            .child(if is_applying_suggestion {
+                "Applying local suggestion…"
+            } else if self.is_opening_repository {
+                "Opening repository…"
+            } else {
+                "Open repository…"
+            })
+            .on_click(move |_event, _window, cx| {
+                let entity = entity.clone();
+                let can_open = entity.update(cx, |this, cx| {
+                    if this.is_opening_repository
+                        || matches!(
+                            &this.suggested_change_state,
+                            SuggestedChangeState::Applying(_)
+                        )
+                    {
+                        return false;
+                    }
+                    this.is_opening_repository = true;
+                    this.notice = Some("Choose a repository folder to open".into());
+                    cx.notify();
+                    true
+                });
+                if can_open {
+                    start_repository_picker(cx, entity, store.clone());
+                }
+            });
+        let auth_button = self.render_github_auth_button(cx);
+        div()
+            .flex()
+            .gap_2()
+            .children(reopen_button)
+            .child(auth_button)
+            .child(open_button)
     }
 
     fn render_github_auth_button(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1696,6 +1756,7 @@ impl ReviewWorkspace {
                             .map(render_remote_conversation_comment),
                     )
                     .child(self.render_evaluator_action(cx, snapshot))
+                    .child(self.render_thread_reply_composer(cx))
             }
             (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
                 .flex()
@@ -1773,6 +1834,10 @@ impl ReviewWorkspace {
                 | LocalReviewState::Revoking { .. }
         );
         let is_review_running = matches!(self.local_review_state, LocalReviewState::Running(_));
+        let is_suggestion_busy = matches!(
+            &self.suggested_change_state,
+            SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+        );
         let store = self.session_store.clone();
         let authorization_button = render_local_review_authorization_button(
             &cx.entity(),
@@ -1796,31 +1861,14 @@ impl ReviewWorkspace {
         let send_button = render_local_review_send_button(
             &cx.entity(),
             request,
-            store.is_some() && is_authorized && !is_review_running && !is_authorization_busy,
+            store.is_some()
+                && is_authorized
+                && !is_review_running
+                && !is_authorization_busy
+                && !is_suggestion_busy,
         );
-        let validation_message = match validation {
-            Ok(chunks) => format!(
-                "{} changed files · {} bytes · {chunks} bounded chunk(s)",
-                snapshot.changed_files.len(),
-                local_review::diff_byte_count(snapshot)
-            ),
-            Err(error) => format!("Local review unavailable: {error}"),
-        };
-        let authorization_message = if is_authorized {
-            "Consent is active for this checkout and provider configuration.".to_string()
-        } else {
-            "Authorize this checkout before sending any code. Authorization sends no code."
-                .to_string()
-        };
-        let result = match &self.local_review_state {
-            LocalReviewState::Complete(result)
-                if result.diff_fingerprint == snapshot_fingerprint =>
-            {
-                Some(render_local_review_result(result, &cx.entity()))
-            }
-            _ => None,
-        };
-
+        let validation_message = local_review_validation_message(snapshot, validation);
+        let authorization_message = local_review_authorization_message(is_authorized);
         div()
             .flex()
             .flex_col()
@@ -1847,7 +1895,36 @@ impl ReviewWorkspace {
                         .child(message)
                 }),
             )
-            .children(result)
+            .child(self.render_local_review_results(snapshot, identity, &snapshot_fingerprint, cx))
+    }
+
+    fn render_local_review_results(
+        &self,
+        snapshot: &repository::RepositorySnapshot,
+        identity: &str,
+        snapshot_fingerprint: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let result = match &self.local_review_state {
+            LocalReviewState::Complete(result)
+                if result.diff_fingerprint == snapshot_fingerprint =>
+            {
+                Some(render_local_review_result(
+                    result,
+                    &cx.entity(),
+                    &snapshot.root,
+                    identity,
+                    &self.suggested_change_state,
+                ))
+            }
+            _ => None,
+        };
+        let suggestion_status = render_suggested_change_state(
+            &cx.entity(),
+            &self.suggested_change_state,
+            Some(snapshot_fingerprint),
+        );
+        div().children(result).children(suggestion_status)
     }
 
     fn render_evaluator_action(
@@ -1947,6 +2024,55 @@ impl ReviewWorkspace {
                     .filter(|_| self.evaluator_result_comment_id == Some(comment.id))
                     .map(render_evaluator_result),
             )
+    }
+
+    fn render_thread_reply_composer(&self, cx: &Context<Self>) -> gpui::Div {
+        let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state else {
+            return div();
+        };
+        if let ThreadReplyState::Publishing(pending) = &self.thread_reply_state {
+            return div().p_2().text_color(rgb(0x00b8_dfc4)).child(format!(
+                "Publishing one reply to @{} in {}#{}…",
+                pending.target_comment.author, pending.reference.owner, pending.reference.number
+            ));
+        }
+        let Some(comment) = self.selected_remote_comment.as_ref() else {
+            return div();
+        };
+        let Some(input) = self.remote_reply_input.as_ref() else {
+            return div();
+        };
+        let comment_is_current = snapshot.review_threads.iter().any(|thread| {
+            thread.root.id == comment.id
+                || thread.replies.iter().any(|reply| reply.id == comment.id)
+        });
+        if !comment_is_current {
+            return div()
+                .p_2()
+                .text_color(rgb(0x00e5_b6ba))
+                .child("The selected review comment is no longer in the loaded pull request.");
+        }
+        let body = input.read(cx).value().to_string();
+        let validation_message = github_pr::validate_thread_reply_body(&body)
+            .err()
+            .map(|error| error.to_string());
+        let access_token = self.github_credentials.as_ref().and_then(|credentials| {
+            (!credentials.access_token_is_expired()
+                && matches!(&self.github_auth_state, GitHubAuthState::SignedIn))
+            .then(|| credentials.access_token.clone())
+        });
+        render_thread_reply_editor(
+            ThreadReplyComposer {
+                snapshot,
+                comment,
+                input,
+                body,
+                validation_message,
+                access_token,
+            },
+            &self.thread_reply_state,
+            cx,
+        )
     }
 
     fn render_draft_controls(
@@ -2145,6 +2271,318 @@ impl ReviewWorkspace {
     }
 }
 
+fn render_thread_reply_editor(
+    editor: ThreadReplyComposer<'_>,
+    state: &ThreadReplyState,
+    cx: &Context<ReviewWorkspace>,
+) -> gpui::Div {
+    let status = render_thread_reply_status(&editor, state, cx);
+    let pending = editor
+        .validation_message
+        .is_none()
+        .then(|| PendingThreadReply {
+            reference: editor.snapshot.reference.clone(),
+            pull_request_title: editor.snapshot.title.clone(),
+            pull_request_url: editor.snapshot.html_url.clone(),
+            expected_head_sha: editor.snapshot.head_sha.clone(),
+            target_comment: editor.comment.clone(),
+            body: editor.body.clone(),
+        });
+    let can_prepare = editor.snapshot.state == "open"
+        && editor.access_token.is_some()
+        && pending.is_some()
+        && !status.is_confirming
+        && !status.failed_for_current_body
+        && !status.already_published;
+    let prepare_label = if can_prepare {
+        "Preview reply before publishing"
+    } else if status.failed_for_current_body {
+        "Refresh the pull request before retrying"
+    } else if status.already_published {
+        "This exact reply was already published"
+    } else if editor.snapshot.state != "open" {
+        "Replies are available only on open pull requests"
+    } else if editor.access_token.is_none() {
+        "Connect or refresh GitHub to publish"
+    } else {
+        "Enter a reply to preview"
+    };
+    let mut prepare_button = Button::new("preview-github-thread-reply")
+        .label(prepare_label)
+        .disabled(!can_prepare);
+    if let Some(pending) = pending.filter(|_| can_prepare) {
+        let entity = cx.entity();
+        prepare_button = prepare_button.on_click(move |_event, _window, cx| {
+            begin_thread_reply_confirmation(&entity, pending.clone(), cx);
+        });
+    }
+    let show_input = !status.is_confirming;
+    let validation_message = editor
+        .validation_message
+        .map(|message| div().text_color(rgb(0x00e5_b6ba)).child(message));
+    let connection_message = if editor.access_token.is_some() {
+        "The reply stays local until you confirm the exact preview below."
+    } else {
+        "Connect or refresh GitHub to publish; this text has not been sent."
+    };
+    let target_line = editor.comment.line.or(editor.comment.original_line);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .mt_2()
+        .p_2()
+        .border_t_1()
+        .border_color(rgb(0x003b_4c5c))
+        .child("Reply to selected GitHub thread")
+        .child(format!(
+            "{}#{} · @{} · {}:{}",
+            editor.snapshot.reference.owner,
+            editor.snapshot.reference.number,
+            editor.comment.author,
+            editor.comment.path,
+            target_line.unwrap_or_default()
+        ))
+        .child(connection_message)
+        .children(show_input.then_some(div().child("Reply text")))
+        .children(show_input.then(|| TextInput::new(editor.input)))
+        .children(validation_message)
+        .children((!status.is_confirming).then_some(prepare_button))
+        .children(status.element)
+}
+
+fn render_thread_reply_status(
+    editor: &ThreadReplyComposer<'_>,
+    state: &ThreadReplyState,
+    cx: &Context<ReviewWorkspace>,
+) -> ThreadReplyComposerStatus {
+    let matches_context = |pending: &PendingThreadReply| {
+        pending_reply_matches_context(pending, editor.snapshot, editor.comment)
+    };
+    let is_confirming = matches!(
+        state,
+        ThreadReplyState::Confirming(pending) if matches_context(pending)
+    );
+    let failed_for_current_body = matches!(
+        state,
+        ThreadReplyState::Failed { pending, .. }
+            if matches_context(pending) && pending.body == editor.body
+    );
+    let already_published = matches!(
+        state,
+        ThreadReplyState::Published { pending, .. }
+            if matches_context(pending) && pending.body == editor.body
+    );
+    let element = match state {
+        ThreadReplyState::Confirming(pending) if matches_context(pending) => Some(
+            render_thread_reply_confirmation(
+                &cx.entity(),
+                cx.http_client(),
+                editor.access_token.clone(),
+                pending.clone(),
+            ),
+        ),
+        ThreadReplyState::Published {
+            pending,
+            comment_url,
+        } if matches_context(pending) && pending.body == editor.body => Some(
+            div()
+                .p_2()
+                .text_color(rgb(0x00b8_dfc4))
+                .child(format!("Reply published: {comment_url}")),
+        ),
+        ThreadReplyState::Failed { pending, message }
+            if matches_context(pending) && pending.body == editor.body =>
+        {
+            Some(
+                div()
+                    .p_2()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child(format!(
+                        "Publication was not confirmed: {message}. Refresh the pull request before retrying; the request may have reached GitHub."
+                    )),
+            )
+        }
+        _ => None,
+    };
+    ThreadReplyComposerStatus {
+        is_confirming,
+        failed_for_current_body,
+        already_published,
+        element,
+    }
+}
+
+fn render_thread_reply_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: Option<String>,
+    pending: PendingThreadReply,
+) -> gpui::Div {
+    let has_access_token = access_token.is_some();
+    let target_line = pending
+        .target_comment
+        .line
+        .or(pending.target_comment.original_line)
+        .unwrap_or_default();
+    let mut confirm_button = Button::new("confirm-github-thread-reply")
+        .label("Confirm and publish this reply")
+        .warning()
+        .disabled(!has_access_token);
+    if let Some(access_token) = access_token {
+        let confirm_entity = entity.clone();
+        let confirm_pending = pending.clone();
+        confirm_button = confirm_button.on_click(move |_event, _window, cx| {
+            start_thread_reply_publication(
+                confirm_entity.clone(),
+                http.clone(),
+                access_token.clone(),
+                confirm_pending.clone(),
+                cx,
+            );
+        });
+    }
+
+    let cancel_entity = entity.clone();
+    let cancel_pending = pending.clone();
+    let cancel_button = Button::new("cancel-github-thread-reply")
+        .label("Cancel")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            close_thread_reply_confirmation(&cancel_entity, &cancel_pending, cx);
+        });
+    let edit_entity = entity.clone();
+    let edit_pending = pending.clone();
+    let edit_button = Button::new("edit-github-thread-reply")
+        .label("Edit reply")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            close_thread_reply_confirmation(&edit_entity, &edit_pending, cx);
+        });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .bg(rgb(0x0020_2b36))
+        .border_1()
+        .border_color(rgb(0x00e5_a84b))
+        .child("PUBLICATION PREVIEW · confirmation required")
+        .child(format!(
+            "{}#{} · {} · HEAD {}",
+            pending.reference.owner,
+            pending.reference.number,
+            pending.pull_request_title,
+            short_sha(&pending.expected_head_sha)
+        ))
+        .child(pending.pull_request_url)
+        .child(format!(
+            "Replying to @{} at {}:{}",
+            pending.target_comment.author,
+            pending.target_comment.path,
+            target_line
+        ))
+        .child(format!("Selected comment: {}", pending.target_comment.body))
+        .child("This will create a visible GitHub review-thread reply. It will not change local files, stage, commit, or push.")
+        .child(div().p_2().bg(rgb(0x0011_1820)).child(pending.body))
+        .children((!has_access_token).then(|| {
+            div()
+                .text_color(rgb(0x00e5_b6ba))
+                .child("Reconnect or refresh GitHub before confirming this publication.")
+        }))
+        .child(div().flex().gap_2().child(cancel_button).child(edit_button).child(confirm_button))
+}
+
+fn close_thread_reply_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    pending: &PendingThreadReply,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        if matches!(
+            &this.thread_reply_state,
+            ThreadReplyState::Confirming(active) if active == pending
+        ) {
+            this.thread_reply_state = ThreadReplyState::Idle;
+            this.notice = Some("Reply remains in the editor and was not sent.".into());
+            cx.notify();
+        }
+    });
+}
+
+fn begin_thread_reply_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    pending: PendingThreadReply,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        let pull_request_matches = matches!(
+            &this.remote_review_state,
+            RemoteReviewState::Loaded(snapshot)
+                if snapshot.state == "open"
+                    && snapshot.reference.eq(&pending.reference)
+                    && snapshot
+                        .head_sha
+                        .as_str()
+                        .eq(pending.expected_head_sha.as_str())
+                    && snapshot_has_review_comment(snapshot, pending.target_comment.id)
+        );
+        let selected_comment_matches = this
+            .selected_remote_comment
+            .as_ref()
+            .is_some_and(|comment| comment.id == pending.target_comment.id);
+        let credentials_are_current = matches!(
+            &this.github_auth_state,
+            GitHubAuthState::SignedIn
+        ) && this.github_credentials.as_ref().is_some_and(|credentials| {
+            !credentials.access_token_is_expired()
+        });
+        let body_is_valid = github_pr::validate_thread_reply_body(&pending.body).is_ok();
+        let no_publication_is_running =
+            !matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_));
+        if !pull_request_matches
+            || !selected_comment_matches
+            || !body_is_valid
+            || !no_publication_is_running
+        {
+            this.notice = Some(
+                "The pull request, selected thread, or reply changed. Review the current state before confirming."
+                    .into(),
+            );
+        } else if !credentials_are_current {
+            this.notice = Some("Reconnect or refresh GitHub before publishing.".into());
+        } else {
+            this.thread_reply_state = ThreadReplyState::Confirming(pending);
+            this.notice = Some(
+                "Review the exact public reply and target below. Nothing is sent until you confirm."
+                    .into(),
+            );
+        }
+        cx.notify();
+    });
+}
+
+fn snapshot_has_review_comment(snapshot: &github_pr::PullRequestSnapshot, comment_id: u64) -> bool {
+    snapshot.review_threads.iter().any(|thread| {
+        thread.root.id == comment_id || thread.replies.iter().any(|reply| reply.id == comment_id)
+    })
+}
+
+fn pending_reply_matches_context(
+    pending: &PendingThreadReply,
+    snapshot: &github_pr::PullRequestSnapshot,
+    comment: &github_pr::PullRequestComment,
+) -> bool {
+    pending.reference.eq(&snapshot.reference)
+        && pending
+            .expected_head_sha
+            .as_str()
+            .eq(snapshot.head_sha.as_str())
+        && pending.target_comment.id.eq(&comment.id)
+}
+
 fn local_review_state_message(state: &LocalReviewState) -> Option<SharedString> {
     match state {
         LocalReviewState::Idle => None,
@@ -2183,6 +2621,28 @@ fn render_local_review_limits() -> gpui::Div {
             local_review::MAX_LOCAL_DIFF_BYTES,
             local_review::MAX_LOCAL_FILE_DIFF_BYTES
         ))
+}
+
+fn local_review_validation_message(
+    snapshot: &repository::RepositorySnapshot,
+    validation: anyhow::Result<usize>,
+) -> String {
+    match validation {
+        Ok(chunks) => format!(
+            "{} changed files · {} bytes · {chunks} bounded chunk(s)",
+            snapshot.changed_files.len(),
+            local_review::diff_byte_count(snapshot)
+        ),
+        Err(error) => format!("Local review unavailable: {error}"),
+    }
+}
+
+const fn local_review_authorization_message(is_authorized: bool) -> &'static str {
+    if is_authorized {
+        "Consent is active for this checkout and provider configuration."
+    } else {
+        "Authorize this checkout before sending any code. Authorization sends no code."
+    }
 }
 
 fn save_local_review_configuration(
@@ -2472,14 +2932,29 @@ fn start_local_review(
         return;
     };
     let request_context = entity.update(cx, |this, cx| {
+        if matches!(
+            &this.suggested_change_state,
+            SuggestedChangeState::Applying(_)
+        ) {
+            this.notice = Some(
+                "Wait for the confirmed local suggestion to finish before starting another review."
+                    .into(),
+            );
+            cx.notify();
+            return None;
+        }
         this.next_local_review_request_id = this.next_local_review_request_id.saturating_add(1);
         request.context.request_id = this.next_local_review_request_id;
         this.local_review_state = LocalReviewState::Running(request.context.clone());
+        this.suggested_change_state = SuggestedChangeState::Idle;
         this.notice =
             Some("Preparing a fresh snapshot, then sending only the confirmed local diffs…".into());
         cx.notify();
-        request.context.clone()
+        Some(request.context.clone())
     });
+    let Some(request_context) = request_context else {
+        return;
+    };
     let entity_for_task = entity.clone();
     cx.spawn(async move |cx| {
         let executor = cx.background_executor();
@@ -2615,8 +3090,15 @@ fn validate_local_review_snapshot(
 fn render_local_review_result(
     result: &local_review::LocalReviewResult,
     entity: &Entity<ReviewWorkspace>,
+    repository_root: &Path,
+    repository_identity: &str,
+    suggestion_state: &SuggestedChangeState,
 ) -> gpui::Div {
     let entity = entity.clone();
+    let is_suggestion_busy = matches!(
+        suggestion_state,
+        SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+    );
     let rows = result
         .review
         .findings
@@ -2627,6 +3109,26 @@ fn render_local_review_result(
             let line = finding.line;
             let finding_for_display = finding.clone();
             let entity = entity.clone();
+            let request = SuggestedChangeRequest {
+                request_id: 0,
+                repository_root: repository_root.to_path_buf(),
+                repository_identity: repository_identity.to_string(),
+                reviewed_diff_fingerprint: result.diff_fingerprint.clone(),
+                finding: finding.clone(),
+            };
+            let apply_button = if finding.suggested_change.is_some() {
+                let entity_for_action = entity.clone();
+                Some(
+                    Button::new(("preview-local-suggested-change", index))
+                        .label("Preview suggested change")
+                        .disabled(is_suggestion_busy)
+                        .on_click(move |_event, _window, cx| {
+                            begin_suggested_change_preview(&entity_for_action, request.clone(), cx);
+                        }),
+                )
+            } else {
+                None
+            };
             div()
                 .id(("local-review-finding", index))
                 .flex()
@@ -2648,6 +3150,7 @@ fn render_local_review_result(
                         .text_color(rgb(0x00b8_dfc4))
                         .child(finding_for_display.suggestion)
                 }))
+                .children(apply_button)
                 .on_click(move |_event, _window, cx| {
                     entity.update(cx, |this, cx| {
                         let line_number = line.and_then(|line| usize::try_from(line).ok());
@@ -2683,6 +3186,361 @@ fn render_local_review_result(
         ))
         .child(result.review.summary.clone())
         .children(rows)
+}
+
+fn render_suggested_change_state(
+    entity: &Entity<ReviewWorkspace>,
+    state: &SuggestedChangeState,
+    current_review_fingerprint: Option<&str>,
+) -> Option<gpui::Div> {
+    match state {
+        SuggestedChangeState::Idle => None,
+        SuggestedChangeState::Preparing(_) => Some(
+            div()
+                .p_2()
+                .text_color(rgb(0x00b8_dfc4))
+                .child("Checking the reviewed file and preparing a local-only preview…"),
+        ),
+        SuggestedChangeState::Preview(pending) => current_review_fingerprint
+            .is_some_and(|fingerprint| {
+                fingerprint == pending.preview.reviewed_diff_fingerprint()
+            })
+            .then(|| render_suggested_change_preview(entity, pending)),
+        SuggestedChangeState::Applying(pending) => Some(
+            div()
+                .p_2()
+                .text_color(rgb(0x00b8_dfc4))
+                .child(format!(
+                    "Rechecking the preview and applying {}:{} atomically…",
+                    pending.preview.path, pending.preview.line
+                )),
+        ),
+        SuggestedChangeState::Applied { path, line } => Some(
+            div()
+                .p_2()
+                .text_color(rgb(0x00b8_dfc4))
+                .child(format!(
+                    "Applied the confirmed change to {path}:{line}. The previous findings were invalidated; run local review again. No stage, commit, or push was performed."
+                )),
+        ),
+        SuggestedChangeState::Failed(message) => Some(
+            div()
+                .p_2()
+                .text_color(rgb(0x00e5_b6ba))
+                .child(format!("Suggested change was not applied: {message}")),
+        ),
+    }
+}
+
+fn render_suggested_change_preview(
+    entity: &Entity<ReviewWorkspace>,
+    pending: &PendingSuggestedChange,
+) -> gpui::Div {
+    let cancel_entity = entity.clone();
+    let request_id = pending.request_id;
+    let cancel_button = Button::new("discard-local-suggestion-preview")
+        .label("Discard preview")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            cancel_suggested_change_preview(&cancel_entity, request_id, cx);
+        });
+    let apply_entity = entity.clone();
+    let pending_for_apply = pending.clone();
+    let apply_button = Button::new("confirm-apply-local-suggestion")
+        .label("Apply this change to the worktree")
+        .warning()
+        .on_click(move |_event, _window, cx| {
+            start_suggested_change_application(&apply_entity, pending_for_apply.clone(), cx);
+        });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .mt_2()
+        .p_3()
+        .bg(rgb(0x0020_2b36))
+        .border_1()
+        .border_color(rgb(0x00e5_a84b))
+        .child("LOCAL CHANGE PREVIEW · no file has been modified")
+        .child(format!(
+            "{}:{} · {}",
+            pending.preview.path, pending.preview.line, pending.preview.title
+        ))
+        .child("Only the selected worktree line will change. This will not stage, commit, or push.")
+        .child(
+            div()
+                .p_2()
+                .bg(rgb(0x0011_1820))
+                .child(pending.preview.diff.clone()),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(cancel_button)
+                .child(apply_button),
+        )
+}
+
+fn begin_suggested_change_preview(
+    entity: &Entity<ReviewWorkspace>,
+    mut request: SuggestedChangeRequest,
+    cx: &mut App,
+) {
+    let request_id = entity.update(cx, |this, cx| {
+        let already_busy = matches!(
+            &this.suggested_change_state,
+            SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+        );
+        let review_matches = matches!(
+            &this.local_review_state,
+            LocalReviewState::Complete(result)
+                if result.diff_fingerprint == request.reviewed_diff_fingerprint
+        );
+        let snapshot_matches = this.local_repository_snapshot.as_ref().is_some_and(|snapshot| {
+            local_review::snapshot_fingerprint(snapshot) == request.reviewed_diff_fingerprint
+                && snapshot.root == request.repository_root
+        });
+        let identity_matches = this.local_review_identity.as_deref()
+            == Some(request.repository_identity.as_str());
+        match suggested_change_preview_decision(
+            already_busy,
+            review_matches && snapshot_matches && identity_matches,
+        ) {
+            SuggestedChangePreviewDecision::IgnoreBusy => return None,
+            SuggestedChangePreviewDecision::RejectStale => {
+                this.suggested_change_state = SuggestedChangeState::Failed(
+                    "The local review or checkout is no longer current; reopen the repository and review it again.".into(),
+                );
+                this.notice = Some("Suggestion preview was blocked because its review context changed.".into());
+                cx.notify();
+                return None;
+            }
+            SuggestedChangePreviewDecision::Start => {}
+        }
+        this.next_suggestion_request_id = this.next_suggestion_request_id.saturating_add(1);
+        request.request_id = this.next_suggestion_request_id;
+        let request_id = request.request_id;
+        this.suggested_change_state = SuggestedChangeState::Preparing(request_id);
+        this.notice = Some("Checking the reviewed file; no local file will be changed during preview.".into());
+        cx.notify();
+        Some(request_id)
+    });
+    let Some(request_id) = request_id else {
+        return;
+    };
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                suggested_change::prepare(
+                    &request.repository_root,
+                    &request.repository_identity,
+                    &request.reviewed_diff_fingerprint,
+                    &request.finding,
+                )
+            })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            if !matches!(
+                &this.suggested_change_state,
+                SuggestedChangeState::Preparing(active_id) if *active_id == request_id
+            ) {
+                return;
+            }
+            match result {
+                Ok(preview) => {
+                    this.suggested_change_state =
+                        SuggestedChangeState::Preview(PendingSuggestedChange {
+                            request_id,
+                            preview,
+                        });
+                    this.notice =
+                        Some("Review the complete local diff; nothing has been applied.".into());
+                }
+                Err(error) => {
+                    this.suggested_change_state =
+                        SuggestedChangeState::Failed(format!("{error:#}").into());
+                    this.notice =
+                        Some("Suggestion preview failed closed; no file was changed.".into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn cancel_suggested_change_preview(
+    entity: &Entity<ReviewWorkspace>,
+    request_id: u64,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        if matches!(
+            &this.suggested_change_state,
+            SuggestedChangeState::Preview(pending) if pending.request_id == request_id
+        ) {
+            this.suggested_change_state = SuggestedChangeState::Idle;
+            this.notice = Some("Suggestion preview discarded; no file was changed.".into());
+            cx.notify();
+        }
+    });
+}
+
+fn start_suggested_change_application(
+    entity: &Entity<ReviewWorkspace>,
+    pending: PendingSuggestedChange,
+    cx: &mut App,
+) {
+    let store = entity.read(cx).session_store.clone();
+    let can_apply = entity.update(cx, |this, cx| {
+        let is_current_preview = matches!(
+            &this.suggested_change_state,
+            SuggestedChangeState::Preview(active)
+                if active.request_id == pending.request_id
+        );
+        let current_review_matches = matches!(
+            &this.local_review_state,
+            LocalReviewState::Complete(result)
+                if result.diff_fingerprint == pending.preview.reviewed_diff_fingerprint()
+        );
+        let current_snapshot_matches =
+            this.local_repository_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.root == pending.preview.repository_root()
+                        && local_review::snapshot_fingerprint(snapshot)
+                            == pending.preview.reviewed_diff_fingerprint()
+                });
+        let identity_matches =
+            this.local_review_identity.as_deref() == Some(pending.preview.repository_identity());
+        if !suggested_change_application_is_current(
+            this.is_opening_repository,
+            is_current_preview
+                && current_review_matches
+                && current_snapshot_matches
+                && identity_matches,
+        ) {
+            this.suggested_change_state = SuggestedChangeState::Failed(
+                "The review or checkout changed after preview; no file was modified.".into(),
+            );
+            this.notice =
+                Some("Suggestion application was blocked because the preview is stale.".into());
+            cx.notify();
+            return false;
+        }
+        this.suggested_change_state = SuggestedChangeState::Applying(pending.clone());
+        this.notice =
+            Some("Rechecking the file and applying only the confirmed local change…".into());
+        cx.notify();
+        true
+    });
+    if !can_apply {
+        return;
+    }
+    let entity = entity.clone();
+    let request_id = pending.request_id;
+    cx.spawn(async move |cx| {
+        let task_result = cx
+            .background_executor()
+            .spawn(async move {
+                suggested_change::apply(&pending.preview)?;
+                let refreshed = load_repository_session(
+                    pending.preview.repository_root().to_path_buf(),
+                    store.as_ref(),
+                );
+                Ok::<_, anyhow::Error>((pending, refreshed))
+            })
+            .await;
+        let _ = entity.update(cx, |this, cx| match task_result {
+            Ok((pending, refreshed)) => {
+                finish_successful_suggested_change(this, &pending, refreshed, cx);
+            }
+            Err(error) => {
+                finish_failed_suggested_change(this, request_id, &error, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+const fn suggested_change_preview_decision(
+    is_busy: bool,
+    review_context_is_current: bool,
+) -> SuggestedChangePreviewDecision {
+    if is_busy {
+        SuggestedChangePreviewDecision::IgnoreBusy
+    } else if review_context_is_current {
+        SuggestedChangePreviewDecision::Start
+    } else {
+        SuggestedChangePreviewDecision::RejectStale
+    }
+}
+
+const fn suggested_change_application_is_current(
+    is_opening_repository: bool,
+    application_context_is_current: bool,
+) -> bool {
+    !is_opening_repository && application_context_is_current
+}
+
+fn finish_successful_suggested_change(
+    this: &mut ReviewWorkspace,
+    pending: &PendingSuggestedChange,
+    refreshed: anyhow::Result<OpenedRepository>,
+    cx: &mut Context<ReviewWorkspace>,
+) {
+    if !matches!(
+        &this.suggested_change_state,
+        SuggestedChangeState::Applying(active) if active.request_id == pending.request_id
+    ) {
+        return;
+    }
+    let path = pending.preview.path.clone();
+    let line = pending.preview.line;
+    match refreshed {
+        Ok(opened) => this.apply_repository_result(Ok(opened)),
+        Err(error) => {
+            this.files.clear();
+            this.selected_file = None;
+            this.repository_root = None;
+            this.branch = None;
+            this.head_oid = None;
+            this.local_repository_snapshot = None;
+            this.local_review_identity = None;
+            this.local_review_authorized_for = None;
+            this.local_review_state = LocalReviewState::Idle;
+            this.load_error = Some(format!(
+                "The change was applied to {path}:{line}, but the repository could not be reloaded: {error}"
+            ).into());
+        }
+    }
+    this.suggested_change_state = SuggestedChangeState::Applied { path, line };
+    this.notice = Some(
+        "The confirmed suggestion was applied locally. Previous findings are stale; nothing was staged, committed, or pushed.".into(),
+    );
+    cx.notify();
+}
+
+fn finish_failed_suggested_change(
+    this: &mut ReviewWorkspace,
+    request_id: u64,
+    error: &anyhow::Error,
+    cx: &mut Context<ReviewWorkspace>,
+) {
+    if !matches!(
+        &this.suggested_change_state,
+        SuggestedChangeState::Applying(pending) if pending.request_id == request_id
+    ) {
+        return;
+    }
+    this.suggested_change_state = SuggestedChangeState::Failed(format!("{error:#}").into());
+    this.notice =
+        Some("Suggestion application failed closed; the reviewed file was preserved.".into());
+    cx.notify();
 }
 
 fn render_evaluator_authorization_button(
@@ -2974,6 +3832,164 @@ fn render_evaluator_result(result: &evaluator::CombinedReviewAnalysis) -> impl I
         ))
 }
 
+fn start_thread_reply_publication(
+    entity: Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    access_token: String,
+    pending: PendingThreadReply,
+    cx: &mut App,
+) {
+    let can_publish = entity.update(cx, |this, cx| {
+        let confirmation_is_current = matches!(
+            &this.thread_reply_state,
+            ThreadReplyState::Confirming(active) if active == &pending
+        );
+        let pull_request_is_current = matches!(
+            &this.remote_review_state,
+            RemoteReviewState::Loaded(snapshot)
+                if snapshot.state == "open"
+                    && snapshot.reference == pending.reference
+                    && snapshot.head_sha == pending.expected_head_sha
+                    && snapshot_has_review_comment(snapshot, pending.target_comment.id)
+        );
+        let selected_comment_is_current = this
+            .selected_remote_comment
+            .as_ref()
+            .is_some_and(|comment| comment.id == pending.target_comment.id);
+        let credentials_are_current = matches!(
+            &this.github_auth_state,
+            GitHubAuthState::SignedIn
+        ) && this.github_credentials.as_ref().is_some_and(|credentials| {
+            !credentials.access_token_is_expired()
+                && credentials.access_token.eq(&access_token)
+        });
+        if !confirmation_is_current
+            || !pull_request_is_current
+            || !selected_comment_is_current
+            || !credentials_are_current
+            || github_pr::validate_thread_reply_body(&pending.body).is_err()
+        {
+            this.notice = Some(
+                "Publication was blocked because the confirmation, pull request, thread, or GitHub session changed."
+                    .into(),
+            );
+            cx.notify();
+            return false;
+        }
+        this.thread_reply_state = ThreadReplyState::Publishing(pending.clone());
+        this.notice = Some(
+            "Publishing the confirmed reply once. No automatic retry will be made.".into(),
+        );
+        cx.notify();
+        true
+    });
+    if !can_publish {
+        return;
+    }
+
+    cx.spawn(async move |cx| {
+        let result =
+            publish_thread_reply_once(&http, access_token, &pending, cx.background_executor())
+                .await;
+        let _ = entity.update(cx, |this, cx| {
+            finish_thread_reply_publication(this, pending, result, cx);
+        });
+    })
+    .detach();
+}
+
+async fn publish_thread_reply_once(
+    http: &Arc<dyn gpui::http_client::HttpClient>,
+    access_token: String,
+    pending: &PendingThreadReply,
+    executor: &BackgroundExecutor,
+) -> anyhow::Result<github_pr::PullRequestComment> {
+    let client = github_pr::GitHubPullRequestClient::new(Arc::clone(http), access_token)?;
+    with_network_timeout(
+        client.publish_thread_reply(
+            &pending.reference,
+            &pending.expected_head_sha,
+            &pending.target_comment,
+            &pending.body,
+        ),
+        executor,
+    )
+    .await
+}
+
+fn finish_thread_reply_publication(
+    this: &mut ReviewWorkspace,
+    pending: PendingThreadReply,
+    result: anyhow::Result<github_pr::PullRequestComment>,
+    cx: &mut Context<ReviewWorkspace>,
+) {
+    if !matches!(
+        &this.thread_reply_state,
+        ThreadReplyState::Publishing(active) if active == &pending
+    ) {
+        return;
+    }
+    match result {
+        Ok(comment) => {
+            let updated_current_view = match &mut this.remote_review_state {
+                RemoteReviewState::Loaded(snapshot)
+                    if snapshot.reference.eq(&pending.reference)
+                        && snapshot
+                            .head_sha
+                            .as_str()
+                            .eq(pending.expected_head_sha.as_str()) =>
+                {
+                    append_reply_to_snapshot(snapshot, pending.target_comment.id, comment.clone())
+                }
+                _ => false,
+            };
+            this.thread_reply_state = ThreadReplyState::Published {
+                pending,
+                comment_url: comment.html_url,
+            };
+            this.notice = Some(if updated_current_view {
+                "Reply published to GitHub and added to the visible thread.".into()
+            } else {
+                "Reply published to GitHub. The open pull-request view changed; reload it to refresh the thread."
+                    .into()
+            });
+        }
+        Err(error) => {
+            this.thread_reply_state = ThreadReplyState::Failed {
+                pending,
+                message: format!("{error:#}").into(),
+            };
+            this.notice = Some(
+                "GitHub did not confirm the publication outcome. Refresh the pull request before retrying; the request may have reached GitHub."
+                    .into(),
+            );
+        }
+    }
+    cx.notify();
+}
+
+fn append_reply_to_snapshot(
+    snapshot: &mut github_pr::PullRequestSnapshot,
+    target_comment_id: u64,
+    comment: github_pr::PullRequestComment,
+) -> bool {
+    for thread in &mut snapshot.review_threads {
+        let target_is_in_thread = thread.root.id == target_comment_id
+            || thread
+                .replies
+                .iter()
+                .any(|reply| reply.id == target_comment_id);
+        if !target_is_in_thread {
+            continue;
+        }
+        if !thread.replies.iter().any(|reply| reply.id == comment.id) {
+            thread.replies.push(comment);
+        }
+        return true;
+    }
+    false
+}
+
 fn start_review_analysis(
     entity: Entity<ReviewWorkspace>,
     http: Arc<dyn gpui::http_client::HttpClient>,
@@ -3090,6 +4106,77 @@ async fn run_review_analysis(
         .context("both provider keys must be available in the OS keyring")?;
     let client = evaluator::DualReviewEvaluator::new(http, request.settings, secrets)?;
     with_evaluator_timeout(client.analyze(&request.input), executor).await
+}
+
+fn handle_open_pull_request(
+    entity: &Entity<ReviewWorkspace>,
+    http: Arc<dyn gpui::http_client::HttpClient>,
+    input_entity: Option<Entity<InputState>>,
+    cx: &mut App,
+) {
+    let Some(input) = input_entity else {
+        return;
+    };
+    let reference_text = input.read(cx).value().to_string();
+    let reference = match github_pr::PullRequestRef::parse(&reference_text) {
+        Ok(reference) => reference,
+        Err(error) => {
+            entity.update(cx, |this, cx| {
+                this.notice = Some(error.to_string().into());
+                cx.notify();
+            });
+            return;
+        }
+    };
+    let credentials = entity.read(cx).github_credentials.clone();
+    let Some(credentials) = credentials else {
+        entity.update(cx, |this, cx| {
+            this.notice = Some("Connect or refresh GitHub before opening a pull request.".into());
+            cx.notify();
+        });
+        return;
+    };
+    if credentials.access_token_is_expired() {
+        entity.update(cx, |this, cx| {
+            this.github_auth_state = GitHubAuthState::ReauthorizationRequired;
+            this.notice =
+                Some("GitHub session expired; refresh it before opening a pull request.".into());
+            cx.notify();
+        });
+        return;
+    }
+    let token = credentials.access_token;
+    let can_load = entity.update(cx, |this, cx| {
+        if matches!(this.remote_review_state, RemoteReviewState::Loading(_))
+            || matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
+            || matches!(
+                &this.suggested_change_state,
+                SuggestedChangeState::Applying(_)
+            )
+        {
+            return false;
+        }
+        this.notice = Some("Loading pull request from GitHub…".into());
+        this.remote_source_context = RemoteSourceContextState::Idle;
+        this.selected_remote_comment = None;
+        if matches!(
+            &this.thread_reply_state,
+            ThreadReplyState::Confirming(_) | ThreadReplyState::Failed { .. }
+        ) {
+            this.thread_reply_state = ThreadReplyState::Idle;
+        }
+        this.evaluator_authorized_repository = None;
+        this.evaluator_result = None;
+        this.evaluator_result_comment_id = None;
+        this.active_evaluator_context = None;
+        this.is_evaluator_running = false;
+        this.remote_review_state = RemoteReviewState::Loading(reference.clone());
+        cx.notify();
+        true
+    });
+    if can_load {
+        start_pull_request_load(entity.clone(), http, token, reference, cx);
+    }
 }
 
 fn start_pull_request_load(
@@ -3323,6 +4410,9 @@ fn render_remote_inline_comment(
             entity.update(cx, |this, cx| {
                 let found_in_diff = this.focus_remote_comment(&clicked_comment);
                 this.selected_remote_comment = Some(clicked_comment.clone());
+                if matches!(&this.thread_reply_state, ThreadReplyState::Confirming(_)) {
+                    this.thread_reply_state = ThreadReplyState::Idle;
+                }
                 this.evaluator_result = None;
                 this.evaluator_result_comment_id = None;
                 this.begin_source_context_load(&clicked_comment);
@@ -3737,11 +4827,35 @@ fn main() {
 mod tests {
     use super::{
         DIFF_LINE_COUNT, DiffKind, LocalReviewRequest, LocalReviewRequestContext,
-        RemoteReviewState, ReviewMode, ReviewWorkspace, SAMPLE_FILE_PATHS, locate_remote_comment,
-        parse_diff_file, source_excerpt, validate_local_review_request,
+        RemoteReviewState, ReviewMode, ReviewWorkspace, SAMPLE_FILE_PATHS,
+        SuggestedChangePreviewDecision, append_reply_to_snapshot, locate_remote_comment,
+        parse_diff_file, source_excerpt, suggested_change_application_is_current,
+        suggested_change_preview_decision, validate_local_review_request,
         validate_local_review_snapshot,
     };
     use std::fs;
+
+    #[test]
+    fn suggestion_preview_does_not_replace_an_in_flight_application() {
+        assert_eq!(
+            suggested_change_preview_decision(true, true),
+            SuggestedChangePreviewDecision::IgnoreBusy
+        );
+        assert_eq!(
+            suggested_change_preview_decision(false, false),
+            SuggestedChangePreviewDecision::RejectStale
+        );
+        assert_eq!(
+            suggested_change_preview_decision(false, true),
+            SuggestedChangePreviewDecision::Start
+        );
+    }
+
+    #[test]
+    fn suggestion_application_waits_for_repository_open_to_finish() {
+        assert!(!suggested_change_application_is_current(true, true));
+        assert!(suggested_change_application_is_current(false, true));
+    }
 
     #[test]
     fn review_workspace_generates_large_diff_and_initial_selection() {
@@ -3840,6 +4954,64 @@ mod tests {
         assert!(excerpt.contains("   55 line 55"));
         assert!(!excerpt.contains("line 44"));
         assert!(!excerpt.contains("line 56"));
+    }
+
+    #[test]
+    fn published_reply_is_added_to_its_thread_without_creating_duplicates() {
+        let reference = crate::github_pr::PullRequestRef::parse("octo/repo#9").unwrap();
+        let target = crate::github_pr::PullRequestComment {
+            id: 7,
+            path: "src/lib.rs".to_string(),
+            line: Some(8),
+            original_line: Some(8),
+            body: "Please keep this check.".to_string(),
+            author: "reviewer".to_string(),
+            html_url: "https://github.com/octo/repo/pull/9#discussion_r7".to_string(),
+            commit_id: "head".to_string(),
+            original_commit_id: "base".to_string(),
+            in_reply_to_id: None,
+            is_outdated: false,
+            subject_type: Some("line".to_string()),
+            side: Some("RIGHT".to_string()),
+        };
+        let mut snapshot = crate::github_pr::PullRequestSnapshot {
+            reference,
+            title: "Review parser".to_string(),
+            state: "open".to_string(),
+            author: "octocat".to_string(),
+            html_url: "https://github.com/octo/repo/pull/9".to_string(),
+            base_sha: "base".to_string(),
+            head_sha: "head".to_string(),
+            files: Vec::new(),
+            reviews: Vec::new(),
+            review_threads: vec![crate::github_pr::PullRequestReviewThread {
+                root: target,
+                replies: Vec::new(),
+            }],
+            conversation_comments: Vec::new(),
+        };
+        let reply = crate::github_pr::PullRequestComment {
+            id: 8,
+            path: "src/lib.rs".to_string(),
+            line: Some(8),
+            original_line: Some(8),
+            body: "I kept it and added a test.".to_string(),
+            author: "octocat".to_string(),
+            html_url: "https://github.com/octo/repo/pull/9#discussion_r8".to_string(),
+            commit_id: "head".to_string(),
+            original_commit_id: "base".to_string(),
+            in_reply_to_id: Some(7),
+            is_outdated: false,
+            subject_type: Some("line".to_string()),
+            side: Some("RIGHT".to_string()),
+        };
+
+        assert!(append_reply_to_snapshot(&mut snapshot, 7, reply.clone()));
+        assert!(append_reply_to_snapshot(&mut snapshot, 7, reply));
+        assert_eq!(snapshot.review_threads[0].replies.len(), 1);
+        assert_eq!(snapshot.review_threads[0].replies[0].id, 8);
+        let orphaned_reply = snapshot.review_threads[0].replies[0].clone();
+        assert!(!append_reply_to_snapshot(&mut snapshot, 99, orphaned_reply));
     }
 
     #[test]
