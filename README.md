@@ -65,12 +65,16 @@ each run. It launches directly without shell expansion, does not load repository
 environment files or pass Cururu provider credentials, captures at most 32 KiB
 per output stream, stops a run after 10 minutes, and never persists command
 output. On Linux, a verified Bubblewrap sandbox makes the checkout read-only,
-disables networking, and hides the user's home and credential stores. If that
-sandbox is unavailable for the command, running without isolation requires a
+disables networking, and hides the user's home and credential stores. On macOS,
+Seatbelt uses a deny-by-default profile: the checkout is read-only, networking
+is disabled, writes are limited to a private temporary directory plus required
+system device nodes, and the home directory is hidden except for the
+checkout and allowlisted Rust toolchain/cache paths. Apple's system
+`sandbox-exec` command is marked deprecated; if it or the
+required profile is unavailable, the app offers only the explicit
+unsandboxed-confirmation path. Otherwise, running without isolation requires a
 separate confirmation and may access or modify anything permitted to the OS
-user. The macOS sandbox backend is not implemented yet, so macOS commands use
-that explicit unsandboxed-confirmation path. Remote PR text never supplies or
-authorizes a command.
+user. Remote PR text never supplies or authorizes a command.
 
 GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
 `CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
@@ -111,6 +115,8 @@ modify code, or publish the draft reply. No evaluator is contacted during PR
 loading or comment selection.
 
 ## Run
+
+Requires Rust 1.99.0 or newer.
 
 ```sh
 cargo run
