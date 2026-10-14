@@ -5070,7 +5070,7 @@ async fn with_evaluator_timeout<T>(
     operation: impl Future<Output = anyhow::Result<T>>,
     executor: &BackgroundExecutor,
 ) -> anyhow::Result<T> {
-    let timeout = executor.timer(Duration::from_secs(120));
+    let timeout = executor.timer(Duration::from_mins(2));
     futures::pin_mut!(operation);
     futures::pin_mut!(timeout);
     match futures::future::select(operation, timeout).await {

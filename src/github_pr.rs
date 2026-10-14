@@ -1042,17 +1042,20 @@ mod tests {
             );
             assert_eq!(snapshot.reviews[0].state, "COMMENTED");
             assert_eq!(snapshot.conversation_comments[0].author, "author");
-            let requests = http.requests.lock().unwrap();
-            assert_eq!(requests.len(), 5);
-            assert_eq!(
-                requests[0].uri,
-                "https://api.github.com/repos/octo-org/review_repo/pulls/42"
-            );
-            assert_eq!(
-                requests[0].authorization.as_deref(),
-                Some("Bearer test-token-not-real")
-            );
-            assert_eq!(requests[0].api_version.as_deref(), Some("2022-11-28"));
+            {
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(requests.len(), 5);
+                assert_eq!(
+                    requests[0].uri,
+                    "https://api.github.com/repos/octo-org/review_repo/pulls/42"
+                );
+                assert_eq!(
+                    requests[0].authorization.as_deref(),
+                    Some("Bearer test-token-not-real")
+                );
+                assert_eq!(requests[0].api_version.as_deref(), Some("2022-11-28"));
+                drop(requests);
+            }
         });
     }
 
@@ -1401,13 +1404,16 @@ mod tests {
             assert_eq!(source.path, "src/lib.rs");
             assert_eq!(source.commit_sha, commit_sha);
             assert_eq!(source.content, "fn main() {}\n");
-            let requests = http.requests.lock().unwrap();
-            assert_eq!(
-                requests[0].uri,
-                format!(
-                    "https://api.github.com/repos/octo-org/review_repo/contents/src/lib.rs?ref={commit_sha}"
-                )
-            );
+            {
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(
+                    requests[0].uri,
+                    format!(
+                        "https://api.github.com/repos/octo-org/review_repo/contents/src/lib.rs?ref={commit_sha}"
+                    )
+                );
+                drop(requests);
+            }
         });
     }
 
@@ -1481,12 +1487,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(comments.is_empty());
-            let requests = http.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(
-                requests[1].uri,
-                "https://api.github.com/repos/org/repo/pulls/1/comments?page=2"
-            );
+            {
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(
+                    requests[1].uri,
+                    "https://api.github.com/repos/org/repo/pulls/1/comments?page=2"
+                );
+                drop(requests);
+            }
         });
     }
 
