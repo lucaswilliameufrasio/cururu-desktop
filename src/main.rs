@@ -24,6 +24,7 @@ use std::{
 pub mod evaluator;
 pub mod github_auth;
 pub mod github_pr;
+pub mod local_command;
 pub mod local_review;
 pub mod repository;
 pub mod session_store;
@@ -82,6 +83,9 @@ struct ReviewWorkspace {
     local_review_key_input: Option<Entity<InputState>>,
     local_review_state: LocalReviewState,
     next_local_review_request_id: u64,
+    local_command_input: Option<Entity<InputState>>,
+    local_command_state: LocalCommandState,
+    next_local_command_request_id: u64,
     suggested_change_state: SuggestedChangeState,
     next_suggestion_request_id: u64,
     comment_drafts: Vec<session_store::StoredCommentDraft>,
@@ -161,6 +165,12 @@ struct LocalReviewRequest {
     context: LocalReviewRequestContext,
     repository_root: PathBuf,
     settings: session_store::LocalReviewSettings,
+}
+
+#[derive(Clone)]
+struct PendingLocalCommand {
+    request_id: u64,
+    plan: local_command::CommandPlan,
 }
 
 #[derive(Clone)]
@@ -246,6 +256,22 @@ enum LocalReviewState {
     },
     Running(LocalReviewRequestContext),
     Complete(local_review::LocalReviewResult),
+    Failed(SharedString),
+}
+
+enum LocalCommandState {
+    Idle,
+    Preparing(u64),
+    Confirming(PendingLocalCommand),
+    ConfirmingUnsandboxed(PendingLocalCommand),
+    Running {
+        pending: PendingLocalCommand,
+        cancelled: Arc<AtomicBool>,
+    },
+    Complete {
+        pending: PendingLocalCommand,
+        output: local_command::CommandOutput,
+    },
     Failed(SharedString),
 }
 
@@ -365,6 +391,9 @@ impl ReviewWorkspace {
             local_review_key_input: None,
             local_review_state: LocalReviewState::Idle,
             next_local_review_request_id: 0,
+            local_command_input: None,
+            local_command_state: LocalCommandState::Idle,
+            next_local_command_request_id: 0,
             suggested_change_state: SuggestedChangeState::Idle,
             next_suggestion_request_id: 0,
             comment_drafts: Vec::new(),
@@ -442,6 +471,8 @@ impl ReviewWorkspace {
         self.is_opening_repository = false;
         match result {
             Ok(opened) => {
+                self.cancel_local_command_run();
+                self.local_command_state = LocalCommandState::Idle;
                 let snapshot = opened.snapshot;
                 self.remote_review_state = RemoteReviewState::Idle;
                 self.remote_source_context = RemoteSourceContextState::Idle;
@@ -545,11 +576,29 @@ impl ReviewWorkspace {
     }
 
     fn select_review_mode(&mut self, mode: ReviewMode) {
+        if self.review_mode != mode && mode == ReviewMode::UnderstandReview {
+            self.cancel_local_command_run();
+            if !matches!(self.local_command_state, LocalCommandState::Running { .. }) {
+                self.local_command_state = LocalCommandState::Idle;
+            }
+        }
         self.review_mode = mode;
         self.notice = Some(match mode {
             ReviewMode::ReviewChanges => "Review changes mode selected.".into(),
             ReviewMode::UnderstandReview => "Understand a review mode selected.".into(),
         });
+    }
+
+    fn cancel_local_command_run(&self) {
+        if let LocalCommandState::Running { cancelled, .. } = &self.local_command_state {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for ReviewWorkspace {
+    fn drop(&mut self) {
+        self.cancel_local_command_run();
     }
 }
 
@@ -855,6 +904,7 @@ impl ReviewWorkspace {
                     .placeholder("Write a local review comment…")
             }));
         }
+        self.ensure_local_command_input(window, cx);
         if self.pull_request_input.is_none() {
             self.pull_request_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
@@ -942,6 +992,14 @@ impl ReviewWorkspace {
                 InputState::new(window, input_cx)
                     .placeholder("Jev API key")
                     .masked(true)
+            }));
+        }
+    }
+
+    fn ensure_local_command_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.local_command_input.is_none() {
+            self.local_command_input = Some(cx.new(|input_cx| {
+                InputState::new(window, input_cx).placeholder("cargo test --locked --workspace")
             }));
         }
     }
@@ -1172,9 +1230,14 @@ impl ReviewWorkspace {
             &self.suggested_change_state,
             SuggestedChangeState::Applying(_)
         );
+        let is_running_local_command = matches!(
+            self.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+        );
         let is_loading = matches!(self.remote_review_state, RemoteReviewState::Loading(_))
             || is_publishing_reply
-            || is_applying_suggestion;
+            || is_applying_suggestion
+            || is_running_local_command;
         let label = remote_review_status(&self.remote_review_state);
         let entity = cx.entity();
         let http = cx.http_client();
@@ -1184,6 +1247,8 @@ impl ReviewWorkspace {
                     "Publishing reply…"
                 } else if is_applying_suggestion {
                     "Applying local suggestion…"
+                } else if is_running_local_command {
+                    "Finish or cancel the local command first…"
                 } else {
                     "Loading pull request…"
                 }
@@ -1421,6 +1486,7 @@ impl ReviewWorkspace {
                         {
                             return false;
                         }
+                        this.cancel_local_command_run();
                         this.is_opening_repository = true;
                         cx.notify();
                         true
@@ -1460,6 +1526,7 @@ impl ReviewWorkspace {
                     {
                         return false;
                     }
+                    this.cancel_local_command_run();
                     this.is_opening_repository = true;
                     this.notice = Some("Choose a repository folder to open".into());
                     cx.notify();
@@ -1779,8 +1846,70 @@ impl ReviewWorkspace {
                 .flex_col()
                 .gap_2()
                 .child(self.render_local_review_action(cx))
+                .child(self.render_local_command_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
+    }
+
+    fn render_local_command_action(&self, cx: &Context<Self>) -> gpui::Div {
+        let Some(snapshot) = self.local_repository_snapshot.as_ref() else {
+            return div();
+        };
+        let Some(input) = self.local_command_input.as_ref() else {
+            return div();
+        };
+        let context = match local_command::CommandContext::from_snapshot(snapshot) {
+            Ok(context) => context,
+            Err(error) => {
+                return div()
+                    .p_2()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child(format!("Local command preview is unavailable: {error}"));
+            }
+        };
+        let entity = cx.entity();
+        let prepare_entity = entity.clone();
+        let input_entity = input.clone();
+        let is_busy = matches!(
+            self.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+        );
+        let is_other_work_running = matches!(self.local_review_state, LocalReviewState::Running(_))
+            || matches!(
+                self.suggested_change_state,
+                SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+            );
+        let prepare_button = Button::new("prepare-local-command")
+            .label(
+                if matches!(self.local_command_state, LocalCommandState::Preparing(_)) {
+                    "Checking command and sandbox…"
+                } else {
+                    "Review command"
+                },
+            )
+            .disabled(is_busy || is_other_work_running)
+            .on_click(move |_event, _window, cx| {
+                let command_line = input_entity.read(cx).value().to_string();
+                begin_local_command_preflight(&prepare_entity, context.clone(), command_line, cx);
+            });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_2()
+            .p_2()
+            .border_t_1()
+            .border_color(rgb(0x003b_4c5c))
+            .child("Run a local test or analyzer")
+            .child("Enter one command. It is parsed into an executable and literal arguments; no shell expansion is performed.")
+            .children(Some(TextInput::new(input)))
+            .child(prepare_button)
+            .child(render_local_command_state(
+                &self.local_command_state,
+                snapshot,
+                &entity,
+            ))
     }
 
     fn render_local_review_action(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1834,10 +1963,15 @@ impl ReviewWorkspace {
                 | LocalReviewState::Revoking { .. }
         );
         let is_review_running = matches!(self.local_review_state, LocalReviewState::Running(_));
-        let is_suggestion_busy = matches!(
-            &self.suggested_change_state,
-            SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+        let is_local_command_running = matches!(
+            self.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
         );
+        let is_suggestion_busy = is_local_command_running
+            || matches!(
+                &self.suggested_change_state,
+                SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+            );
         let store = self.session_store.clone();
         let authorization_button = render_local_review_authorization_button(
             &cx.entity(),
@@ -1864,6 +1998,7 @@ impl ReviewWorkspace {
             store.is_some()
                 && is_authorized
                 && !is_review_running
+                && !is_local_command_running
                 && !is_authorization_busy
                 && !is_suggestion_busy,
         );
@@ -2612,6 +2747,375 @@ const fn local_review_state_color(state: &LocalReviewState) -> u32 {
     }
 }
 
+fn render_local_command_state(
+    state: &LocalCommandState,
+    snapshot: &repository::RepositorySnapshot,
+    entity: &Entity<ReviewWorkspace>,
+) -> gpui::Div {
+    match state {
+        LocalCommandState::Idle => div(),
+        LocalCommandState::Preparing(_) => div().text_color(rgb(0x009b_aaba)).child(
+            "Rechecking the reviewed diff and checking sandbox support. No command is running.",
+        ),
+        LocalCommandState::Confirming(pending) => {
+            if !local_command_plan_matches_snapshot(&pending.plan, snapshot) {
+                return div()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child("This command preview is stale. Prepare it again against the current HEAD and diff.");
+            }
+            render_local_command_confirmation(pending, entity, false)
+        }
+        LocalCommandState::ConfirmingUnsandboxed(pending) => {
+            if !local_command_plan_matches_snapshot(&pending.plan, snapshot) {
+                return div()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child("This command preview is stale. Prepare it again against the current HEAD and diff.");
+            }
+            render_local_command_confirmation(pending, entity, true)
+        }
+        LocalCommandState::Running { pending, cancelled } => {
+            if !local_command_plan_matches_snapshot(&pending.plan, snapshot) {
+                return div()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child("The reviewed checkout changed while the command was running; its output will be discarded.");
+            }
+            let entity = entity.clone();
+            let cancel = cancelled.clone();
+            let is_stopping = cancelled.load(Ordering::Acquire);
+            let cancel_button = Button::new("cancel-local-command")
+                .label(if is_stopping {
+                    "Stopping process group…"
+                } else {
+                    "Cancel command"
+                })
+                .disabled(is_stopping)
+                .on_click(move |_event, _window, cx| {
+                    cancel.store(true, Ordering::Release);
+                    entity.update(cx, |this, cx| {
+                        this.notice = Some(
+                            "Stopping the command and its process group; waiting for it to exit…"
+                                .into(),
+                        );
+                        cx.notify();
+                    });
+                });
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .mt_2()
+                .p_2()
+                .bg(rgb(0x0020_2b36))
+                .child(format!("Running · {}", pending.plan.command.display()))
+                .child(format!("Isolation: {}", pending.plan.sandbox.description()))
+                .child("Command output is captured in memory only and is not written to the session database.")
+                .child(cancel_button)
+        }
+        LocalCommandState::Complete { pending, output } => {
+            if !local_command_plan_matches_snapshot(&pending.plan, snapshot) {
+                return div()
+                    .text_color(rgb(0x00e5_b6ba))
+                    .child("This result is stale because the checkout changed. Clear it before preparing another command.");
+            }
+            render_local_command_output(pending, output, entity)
+        }
+        LocalCommandState::Failed(message) => {
+            let entity = entity.clone();
+            let clear_button = Button::new("clear-local-command-state")
+                .label("Clear")
+                .ghost()
+                .on_click(move |_event, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.local_command_state = LocalCommandState::Idle;
+                        cx.notify();
+                    });
+                });
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .mt_2()
+                .text_color(rgb(0x00e5_b6ba))
+                .child(message.clone())
+                .child(clear_button)
+        }
+    }
+}
+
+fn local_command_plan_matches_snapshot(
+    plan: &local_command::CommandPlan,
+    snapshot: &repository::RepositorySnapshot,
+) -> bool {
+    local_command::CommandContext::from_snapshot(snapshot)
+        .is_ok_and(|context| context == plan.context)
+}
+
+fn render_local_command_confirmation(
+    pending: &PendingLocalCommand,
+    entity: &Entity<ReviewWorkspace>,
+    unsandboxed: bool,
+) -> gpui::Div {
+    let pending_for_cancel = pending.clone();
+    let cancel_entity = entity.clone();
+    let cancel_button = Button::new("cancel-local-command-preview")
+        .label("Cancel")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            close_local_command_confirmation(&cancel_entity, &pending_for_cancel, cx);
+        });
+
+    let panel = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .mt_2()
+        .p_2()
+        .bg(rgb(0x0020_2b36))
+        .border_1()
+        .border_color(rgb(if unsandboxed {
+            0x00e5_a84b
+        } else {
+            0x003b_4c5c
+        }))
+        .child(if unsandboxed {
+            "UNSANDBOXED RUN · a separate confirmation is required"
+        } else {
+            "COMMAND PREVIEW · one run only"
+        })
+        .child(pending.plan.command.display())
+        .child(format!(
+            "Repository: {} · working directory: repository root",
+            pending.plan.context.repository_root.display()
+        ))
+        .child(format!(
+            "HEAD: {} · diff: {}",
+            pending
+                .plan
+                .context
+                .head_oid
+                .as_deref()
+                .map_or("unborn", short_sha),
+            &pending.plan.context.diff_fingerprint[..12]
+        ))
+        .child(format!("Sandbox: {}", pending.plan.sandbox.description()))
+        .child("Limits: 10 minutes · 32 KiB captured per stream · no retries · output is memory-only")
+        .child("The executable and arguments are passed directly; shell expansion is not performed. Approval is never reused for another run.");
+
+    let controls = if unsandboxed {
+        render_unsandboxed_confirmation_controls(pending, entity, cancel_button)
+    } else {
+        render_sandboxed_confirmation_controls(pending, entity, cancel_button)
+    };
+    panel.child(controls)
+}
+
+fn render_unsandboxed_confirmation_controls(
+    pending: &PendingLocalCommand,
+    entity: &Entity<ReviewWorkspace>,
+    cancel_button: Button,
+) -> gpui::Div {
+    let entity_for_run = entity.clone();
+    let pending_for_run = pending.clone();
+    let run_button = Button::new("confirm-unsandboxed-local-command")
+        .label("I understand — run without sandbox")
+        .on_click(move |_event, _window, cx| {
+            start_local_command_run(
+                &entity_for_run,
+                pending_for_run.clone(),
+                local_command::ExecutionMode::Unsandboxed,
+                cx,
+            );
+        });
+    let entity_for_back = entity.clone();
+    let pending_for_back = pending.clone();
+    let back_button = Button::new("back-to-local-command-preview")
+        .label("Back")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            entity_for_back.update(cx, |this, cx| {
+                if matches!(
+                    &this.local_command_state,
+                    LocalCommandState::ConfirmingUnsandboxed(active)
+                        if active.request_id == pending_for_back.request_id
+                ) {
+                    this.local_command_state =
+                        LocalCommandState::Confirming(pending_for_back.clone());
+                    cx.notify();
+                }
+            });
+        });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child("Without isolation, this command runs with your OS account permissions. It may read user files or credential stores, access the network, and modify the checkout. Cururu does not pass its provider keys or load repository environment files.")
+        .child(div().flex().gap_2().child(run_button).child(back_button))
+        .child(cancel_button)
+}
+
+fn render_sandboxed_confirmation_controls(
+    pending: &PendingLocalCommand,
+    entity: &Entity<ReviewWorkspace>,
+    cancel_button: Button,
+) -> gpui::Div {
+    let sandbox_button = if pending.plan.sandbox.is_available() {
+        let entity = entity.clone();
+        let pending = pending.clone();
+        Some(
+            Button::new("confirm-sandboxed-local-command")
+                .label("Confirm and run sandboxed")
+                .on_click(move |_event, _window, cx| {
+                    start_local_command_run(
+                        &entity,
+                        pending.clone(),
+                        local_command::ExecutionMode::Sandboxed,
+                        cx,
+                    );
+                }),
+        )
+    } else {
+        None
+    };
+    let entity = entity.clone();
+    let pending = pending.clone();
+    let unsandboxed_button = Button::new("review-unsandboxed-local-command")
+        .label("Review unsandboxed run…")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            enter_unsandboxed_local_command_confirmation(&entity, &pending, cx);
+        });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .children(sandbox_button)
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(unsandboxed_button)
+                .child(cancel_button),
+        )
+}
+
+fn render_local_command_output(
+    pending: &PendingLocalCommand,
+    output: &local_command::CommandOutput,
+    entity: &Entity<ReviewWorkspace>,
+) -> gpui::Div {
+    let status = if output.was_cancelled() {
+        "Cancelled · process group stopped".to_string()
+    } else if output.timed_out() {
+        "Timed out after 10 minutes · process group stopped".to_string()
+    } else if output.succeeded() {
+        "Completed · exit code 0".to_string()
+    } else {
+        format!(
+            "Finished · exit code {}",
+            output
+                .exit_code
+                .map_or_else(|| "unavailable".to_string(), |code| code.to_string())
+        )
+    };
+    let entity = entity.clone();
+    let clear_button = Button::new("clear-local-command-output")
+        .label("Clear output")
+        .ghost()
+        .on_click(move |_event, _window, cx| {
+            entity.update(cx, |this, cx| {
+                this.local_command_state = LocalCommandState::Idle;
+                cx.notify();
+            });
+        });
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .mt_2()
+        .p_2()
+        .bg(rgb(0x0020_2b36))
+        .child(format!("{} · {}", status, pending.plan.command.display()))
+        .children(output.output_pipe_held_open().then(|| {
+            div()
+                .text_color(rgb(0x00e5_a84b))
+                .child("A background process kept an output pipe open; the process group was stopped.")
+        }))
+        .child("Output remains in memory only; it is cleared on request, repository change, or app exit.");
+    if !output.stdout.is_empty() {
+        panel = panel
+            .child(format!(
+                "stdout{}",
+                if output.stdout_truncated {
+                    " · truncated at 32 KiB"
+                } else {
+                    ""
+                }
+            ))
+            .child(
+                div()
+                    .p_2()
+                    .bg(rgb(0x0011_1820))
+                    .child(output.stdout.clone()),
+            );
+    }
+    if !output.stderr.is_empty() {
+        panel = panel
+            .child(format!(
+                "stderr{}",
+                if output.stderr_truncated {
+                    " · truncated at 32 KiB"
+                } else {
+                    ""
+                }
+            ))
+            .child(
+                div()
+                    .p_2()
+                    .bg(rgb(0x0011_1820))
+                    .child(output.stderr.clone()),
+            );
+    }
+    panel.child(clear_button)
+}
+
+fn close_local_command_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    pending: &PendingLocalCommand,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        let is_current = matches!(
+            &this.local_command_state,
+            LocalCommandState::Confirming(active)
+                | LocalCommandState::ConfirmingUnsandboxed(active)
+                if active.request_id == pending.request_id
+        );
+        if is_current {
+            this.local_command_state = LocalCommandState::Idle;
+            this.notice = Some("Command preview cancelled; nothing was run.".into());
+            cx.notify();
+        }
+    });
+}
+
+fn enter_unsandboxed_local_command_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    pending: &PendingLocalCommand,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        if matches!(
+            &this.local_command_state,
+            LocalCommandState::Confirming(active) if active.request_id == pending.request_id
+        ) {
+            this.local_command_state = LocalCommandState::ConfirmingUnsandboxed(pending.clone());
+            cx.notify();
+        }
+    });
+}
+
 fn render_local_review_limits() -> gpui::Div {
     div()
         .text_color(rgb(0x009b_aaba))
@@ -2915,6 +3419,240 @@ fn render_local_review_send_button(
             };
             start_local_review(&entity, request, cx);
         })
+}
+
+fn begin_local_command_preflight(
+    entity: &Entity<ReviewWorkspace>,
+    context: local_command::CommandContext,
+    command_line: String,
+    cx: &mut App,
+) {
+    let request_id = entity.update(cx, |this, cx| {
+        if this.review_mode != ReviewMode::ReviewChanges
+            || !matches!(this.remote_review_state, RemoteReviewState::Idle)
+        {
+            this.notice = Some("Local commands are available only in the local review workspace.".into());
+            cx.notify();
+            return None;
+        }
+        if this.is_opening_repository {
+            this.notice = Some("Wait for the repository to finish opening before preparing a command.".into());
+            cx.notify();
+            return None;
+        }
+        if matches!(
+            this.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+        ) || matches!(this.local_review_state, LocalReviewState::Running(_))
+            || matches!(
+                this.suggested_change_state,
+                SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+            )
+        {
+            this.notice = Some("Wait for the current local operation to finish before preparing another command.".into());
+            cx.notify();
+            return None;
+        }
+
+        this.next_local_command_request_id =
+            this.next_local_command_request_id.saturating_add(1);
+        let request_id = this.next_local_command_request_id;
+        this.local_command_state = LocalCommandState::Preparing(request_id);
+        this.notice = Some(
+            "Checking the exact command and revalidating the reviewed HEAD/diff. No repository command will run yet."
+                .into(),
+        );
+        cx.notify();
+        Some(request_id)
+    });
+    let Some(request_id) = request_id else {
+        return;
+    };
+
+    let task_entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { local_command::prepare(context, &command_line) })
+            .await;
+        let _ = task_entity.update(cx, |this, cx| {
+            if !matches!(
+                this.local_command_state,
+                LocalCommandState::Preparing(active) if active == request_id
+            ) {
+                return;
+            }
+            match result {
+                Ok(plan) => {
+                    this.local_command_state = LocalCommandState::Confirming(
+                        PendingLocalCommand { request_id, plan },
+                    );
+                    this.notice = Some(
+                        "Command preview ready. Review the executable, arguments, isolation, and checkout before confirming."
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    this.local_command_state =
+                        LocalCommandState::Failed(error.to_string().into());
+                    this.notice = Some("Command preview failed; nothing was run.".into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn start_local_command_run(
+    entity: &Entity<ReviewWorkspace>,
+    pending: PendingLocalCommand,
+    mode: local_command::ExecutionMode,
+    cx: &mut App,
+) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    if !accept_local_command_confirmation(entity, &pending, mode, &cancelled, cx) {
+        return;
+    }
+
+    let receiver = match spawn_local_command_worker(pending.plan.clone(), mode, cancelled) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            entity.update(cx, |this, cx| {
+                if matches!(
+                    &this.local_command_state,
+                    LocalCommandState::Running { pending: active, .. }
+                        if active.request_id == pending.request_id
+                ) {
+                    this.local_command_state = LocalCommandState::Failed(
+                        format!("Could not start the command supervisor: {error}").into(),
+                    );
+                    cx.notify();
+                }
+            });
+            return;
+        }
+    };
+
+    let task_entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("command supervisor stopped before returning a result"))
+            .and_then(|result| result);
+        let _ = task_entity.update(cx, |this, cx| {
+            complete_local_command_run(this, &pending, result, cx);
+        });
+    })
+    .detach();
+}
+
+fn accept_local_command_confirmation(
+    entity: &Entity<ReviewWorkspace>,
+    pending: &PendingLocalCommand,
+    mode: local_command::ExecutionMode,
+    cancelled: &Arc<AtomicBool>,
+    cx: &mut App,
+) -> bool {
+    entity.update(cx, |this, cx| {
+        let was_confirmed = match (&this.local_command_state, mode) {
+            (LocalCommandState::Confirming(active), local_command::ExecutionMode::Sandboxed) => {
+                active.request_id == pending.request_id && active.plan.sandbox.is_available()
+            }
+            (
+                LocalCommandState::ConfirmingUnsandboxed(active),
+                local_command::ExecutionMode::Unsandboxed,
+            ) => active.request_id == pending.request_id,
+            _ => false,
+        };
+        if !was_confirmed {
+            return false;
+        }
+        let snapshot_matches = this
+            .local_repository_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| local_command_plan_matches_snapshot(&pending.plan, snapshot));
+        if !snapshot_matches {
+            this.local_command_state = LocalCommandState::Failed(
+                "The reviewed HEAD or diff changed after preview; no command was run.".into(),
+            );
+            this.notice =
+                Some("Command confirmation rejected because the checkout changed.".into());
+            cx.notify();
+            return false;
+        }
+        this.local_command_state = LocalCommandState::Running {
+            pending: pending.clone(),
+            cancelled: cancelled.clone(),
+        };
+        this.notice = Some(match mode {
+            local_command::ExecutionMode::Sandboxed => {
+                "Running the confirmed command in the isolated sandbox…".into()
+            }
+            local_command::ExecutionMode::Unsandboxed => {
+                "Running the separately confirmed command without sandbox isolation…".into()
+            }
+        });
+        cx.notify();
+        true
+    })
+}
+
+fn spawn_local_command_worker(
+    plan: local_command::CommandPlan,
+    mode: local_command::ExecutionMode,
+    cancelled: Arc<AtomicBool>,
+) -> anyhow::Result<
+    futures::channel::oneshot::Receiver<anyhow::Result<local_command::ExecutionResult>>,
+> {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("cururu-local-command-supervisor".to_string())
+        .spawn(move || {
+            let result = local_command::run(&plan, mode, cancelled.as_ref());
+            let _ = sender.send(result);
+        })
+        .context("could not start the command supervisor")?;
+    Ok(receiver)
+}
+
+fn complete_local_command_run(
+    this: &mut ReviewWorkspace,
+    pending: &PendingLocalCommand,
+    result: anyhow::Result<local_command::ExecutionResult>,
+    cx: &mut Context<ReviewWorkspace>,
+) {
+    if !matches!(
+        &this.local_command_state,
+        LocalCommandState::Running { pending: active, .. }
+            if active.request_id == pending.request_id
+    ) {
+        return;
+    }
+    match result {
+        Ok(local_command::ExecutionResult::Completed(output)) => {
+            this.notice = Some(match (output.was_cancelled(), output.timed_out()) {
+                (true, _) => "Command cancelled; its output is available in memory only.".into(),
+                (_, true) => "Command reached the 10-minute limit and was stopped.".into(),
+                _ => "Command finished; output is available in memory only.".into(),
+            });
+            this.local_command_state = LocalCommandState::Complete {
+                pending: pending.clone(),
+                output,
+            };
+        }
+        Ok(local_command::ExecutionResult::Stale) => {
+            this.local_command_state = LocalCommandState::Failed(
+                "The command finished after the reviewed HEAD or diff changed. Its output was discarded; reopen the repository before another run.".into(),
+            );
+            this.notice = Some("Stale command output discarded.".into());
+        }
+        Err(error) => {
+            this.local_command_state = LocalCommandState::Failed(error.to_string().into());
+            this.notice = Some("Command could not complete safely; no retry was attempted.".into());
+        }
+    }
+    cx.notify();
 }
 
 fn start_local_review(
@@ -3292,6 +4030,9 @@ fn begin_suggested_change_preview(
         let already_busy = matches!(
             &this.suggested_change_state,
             SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
+        ) || matches!(
+            this.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
         );
         let review_matches = matches!(
             &this.local_review_state,
@@ -3397,6 +4138,15 @@ fn start_suggested_change_application(
 ) {
     let store = entity.read(cx).session_store.clone();
     let can_apply = entity.update(cx, |this, cx| {
+        if matches!(
+            this.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+        ) {
+            this.notice =
+                Some("Finish or cancel the local command before applying a suggestion.".into());
+            cx.notify();
+            return false;
+        }
         let is_current_preview = matches!(
             &this.suggested_change_state,
             SuggestedChangeState::Preview(active)
@@ -4147,6 +4897,15 @@ fn handle_open_pull_request(
     }
     let token = credentials.access_token;
     let can_load = entity.update(cx, |this, cx| {
+        if matches!(
+            this.local_command_state,
+            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+        ) {
+            this.notice =
+                Some("Finish or cancel the local command before opening a GitHub PR.".into());
+            cx.notify();
+            return false;
+        }
         if matches!(this.remote_review_state, RemoteReviewState::Loading(_))
             || matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
             || matches!(
@@ -4170,6 +4929,7 @@ fn handle_open_pull_request(
         this.evaluator_result_comment_id = None;
         this.active_evaluator_context = None;
         this.is_evaluator_running = false;
+        this.local_command_state = LocalCommandState::Idle;
         this.remote_review_state = RemoteReviewState::Loading(reference.clone());
         cx.notify();
         true

@@ -13,7 +13,8 @@ dual-provider second-opinion workflow. The review workspace includes:
 
 - a repository file rail;
 - a virtualized diff with 10,000 rows;
-- selectable source lines and a finding detail pane.
+- selectable source lines and a finding detail pane;
+- separately approved local test/analyzer commands for an opened checkout.
 
 Without an argument, the app renders a 10,000-row synthetic unified diff parsed
 through the pinned `cururu-core` parser. The sample does not access a
@@ -54,8 +55,22 @@ bounded unified diffs are sent (up to 100 files, 45,000 bytes per file, and
 and discards the result if the checkout changes during review. Findings are
 informational and are never applied automatically. A structured single-line
 suggestion can be previewed as a local diff; only a separate confirmation applies
-it after rechecking the reviewed diff and exact file contents. This action does
-not run commands, stage, commit, or push.
+it after rechecking the reviewed diff and exact file contents. Applying a
+suggestion does not run commands, stage, commit, or push.
+
+Local tests and analyzers are a separate, manually entered workflow. Cururu
+shows the resolved executable, literal arguments, checkout, working directory,
+HEAD/diff identity, and isolation status, then requires a fresh confirmation for
+each run. It launches directly without shell expansion, does not load repository
+environment files or pass Cururu provider credentials, captures at most 32 KiB
+per output stream, stops a run after 10 minutes, and never persists command
+output. On Linux, a verified Bubblewrap sandbox makes the checkout read-only,
+disables networking, and hides the user's home and credential stores. If that
+sandbox is unavailable for the command, running without isolation requires a
+separate confirmation and may access or modify anything permitted to the OS
+user. The macOS sandbox backend is not implemented yet, so macOS commands use
+that explicit unsandboxed-confirmation path. Remote PR text never supplies or
+authorizes a command.
 
 GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
 `CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.

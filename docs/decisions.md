@@ -207,6 +207,12 @@ months. Before the flow can run against GitHub, register/configure the app with
 Device Flow enabled and supply its public client ID. App registration itself
 is not part of this repository change.
 
+The MVP also supports an explicitly selected `gh` CLI fallback. The app may
+read the token into memory for the current app session only; it must not persist
+or log the token, and disconnecting this app must not sign the user out of `gh`.
+Device Flow remains the primary path. Validate the requested GitHub App scopes
+and revocation behavior before live use.
+
 ### Read-only pull-request inspection
 
 The initial remote review journey identifies a PR with an explicit
@@ -272,3 +278,54 @@ require the repository authorization. Each analysis has one 2-minute deadline,
 no internal retries, and fail-closed behavior. Evidence sent per selected
 thread is capped at 8,000 characters; remote content remains untrusted data and
 cannot trigger tools or actions.
+
+Evaluator rollout starts in observe-only mode. It must not filter or suppress
+findings until a labeled evaluation set has been measured and thresholds and
+rollout criteria have been separately calibrated.
+
+## Local test and analyzer execution
+
+- **Status:** Implemented on Linux; macOS remains unsandboxed behind separate confirmation
+- **Date:** 2026-10-13
+
+Running a test or analyzer is a separate, explicit action from reviewing code.
+For each run, show the exact executable and arguments, repository and working
+directory, reviewed HEAD/diff identity, and whether isolation is active. Require
+fresh confirmation for every command; do not infer approval from a previous
+run. Launch the executable directly without implicit shell parsing or
+interpolation. Do not inject application/provider credentials or automatically
+load repository environment files. Do not persist command output.
+
+Use an available OS sandbox when it can be established for that run. If no
+sandbox is available, clearly warn that the command will run with the user's OS
+permissions and require a separate confirmation for that unsandboxed run. Bound
+runtime and captured output, show exit status and bounded output, and offer
+cancellation. Cancellation must terminate the child process and reap it; do not
+retry commands. Remote PR content remains untrusted and never authorizes a run.
+
+The first implementation uses Bubblewrap on Linux when a namespace and the
+required checkout/home mounts pass preflight. The checkout is read-only, the
+network namespace is unshared, temporary directories are isolated, and the
+user's home/credential stores are hidden; only Rust toolchain and Cargo cache
+paths needed by supported commands are mounted read-only. macOS does not yet
+have a sandbox backend, so it follows the separately confirmed unsandboxed path
+until a platform sandbox is implemented and validated. Each run is capped at
+10 minutes and captures at most 32 KiB per output stream in memory; cancellation
+sends SIGTERM to the process group and escalates to SIGKILL after two seconds.
+The app revalidates repository identity, HEAD, and diff before and after the run,
+discarding output if the reviewed checkout becomes stale. These limits do not
+authorize running repository-provided code during development or review of this
+repository.
+
+## Initial desktop distribution targets
+
+- **Status:** Accepted for packaging preparation, not release
+- **Date:** 2026-10-13
+
+The initial architecture matrix is Linux x86_64, Linux ARM64, and macOS Apple
+Silicon (ARM64). Prepare Linux AppImage and macOS `.app`/`.dmg` artifacts, but
+verify the packager/runtime supports the Linux ARM64 target before treating that
+artifact as available. Windows, macOS Intel, and Linux packages beyond AppImage
+remain out of this initial matrix. This decision authorizes local/CI packaging
+preparation only; it does not authorize signing with user credentials, creating
+a release, deploying, or publishing artifacts.
