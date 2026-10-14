@@ -285,8 +285,8 @@ rollout criteria have been separately calibrated.
 
 ## Local test and analyzer execution
 
-- **Status:** Implemented on Linux; macOS remains unsandboxed behind separate confirmation
-- **Date:** 2026-10-13
+- **Status:** Linux Bubblewrap implemented; macOS Seatbelt implemented, native validation pending
+- **Date:** 2026-10-14
 
 Running a test or analyzer is a separate, explicit action from reviewing code.
 For each run, show the exact executable and arguments, repository and working
@@ -307,9 +307,14 @@ The first implementation uses Bubblewrap on Linux when a namespace and the
 required checkout/home mounts pass preflight. The checkout is read-only, the
 network namespace is unshared, temporary directories are isolated, and the
 user's home/credential stores are hidden; only Rust toolchain and Cargo cache
-paths needed by supported commands are mounted read-only. macOS does not yet
-have a sandbox backend, so it follows the separately confirmed unsandboxed path
-until a platform sandbox is implemented and validated. Each run is capped at
+paths needed by supported commands are mounted read-only. macOS uses the system
+Seatbelt `sandbox-exec` CLI with a deny-by-default profile: the checkout and
+allowlisted Rust toolchain/cache paths are read-only, networking is denied, and
+writes are limited to the private per-run temporary directory plus required
+system device nodes. The CLI is deprecated
+by Apple; the app fails closed to the separately confirmed unsandboxed path if
+the binary or sandbox profile preflight is unavailable. Native macOS CI must
+validate the backend before it is treated as complete. Each run is capped at
 10 minutes and captures at most 32 KiB per output stream in memory; cancellation
 sends SIGTERM to the process group and escalates to SIGKILL after two seconds.
 The app revalidates repository identity, HEAD, and diff before and after the run,
@@ -334,3 +339,11 @@ linuxdeploy's bundled strip cannot read Ubuntu 24.04 `.relr.dyn` sections.
 Windows, macOS Intel, and Linux packages beyond AppImage remain out of this
 initial matrix. CI packaging is validation-only: no signing, artifact upload,
 release, deployment, or publication is configured or authorized.
+
+## Rust toolchain
+
+- **Status:** Accepted
+- **Date:** 2026-10-14
+
+Set the desktop's minimum supported Rust version to 1.99 and pin CI to Rust
+1.99.0, matching the toolchain used for ongoing Cururu desktop development.

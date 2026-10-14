@@ -32,6 +32,45 @@ const SANDBOX_RUSTUP_HOME: &str = "/tmp/cururu-rustup";
 const SANDBOX_CARGO_BIN: &str = "/tmp/cururu-cargo-bin";
 const SANDBOX_TMP: &str = "/tmp/cururu-tmp";
 const SANDBOX_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+#[cfg(any(target_os = "macos", test))]
+const SEATBELT_READ_PATHS: &[&str] = &[
+    "/Applications",
+    "/Library/Developer",
+    "/Library/Frameworks",
+    "/System/Applications",
+    "/System/Library",
+    "/bin",
+    "/opt/homebrew",
+    "/private/etc",
+    "/sbin",
+    "/usr",
+    "/usr/local",
+    "/usr/sbin",
+];
+#[cfg(any(target_os = "macos", test))]
+const SEATBELT_READ_DEVICES: &[&str] = &[
+    "/dev/dtracehelper",
+    "/dev/fd",
+    "/dev/null",
+    "/dev/random",
+    "/dev/stderr",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/tty",
+    "/dev/urandom",
+    "/dev/zero",
+];
+#[cfg(any(target_os = "macos", test))]
+const SEATBELT_WRITE_DEVICES: &[&str] = &["/dev/dtracehelper", "/dev/null", "/dev/zero"];
+#[cfg(target_os = "macos")]
+const SEATBELT_PATH: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandContext {
@@ -82,15 +121,26 @@ pub struct BubblewrapSandbox {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatbeltSandbox {
+    pub executable: PathBuf,
+    pub hidden_home: PathBuf,
+    pub cargo_bin: Option<PathBuf>,
+    pub cargo_registry: Option<PathBuf>,
+    pub cargo_git: Option<PathBuf>,
+    pub rustup_home: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxAvailability {
     Bubblewrap(BubblewrapSandbox),
+    Seatbelt(SeatbeltSandbox),
     Unavailable(String),
 }
 
 impl SandboxAvailability {
     #[must_use]
     pub const fn is_available(&self) -> bool {
-        matches!(self, Self::Bubblewrap(_))
+        matches!(self, Self::Bubblewrap(_) | Self::Seatbelt(_))
     }
 
     #[must_use]
@@ -98,6 +148,10 @@ impl SandboxAvailability {
         match self {
             Self::Bubblewrap(_) => {
                 "Bubblewrap · checkout read-only · network disabled · user home/credentials hidden"
+                    .to_string()
+            }
+            Self::Seatbelt(_) => {
+                "macOS Seatbelt · checkout read-only · network disabled · user home/credentials hidden"
                     .to_string()
             }
             Self::Unavailable(reason) => format!("Unavailable for this command: {reason}"),
@@ -246,7 +300,9 @@ pub fn run(
 
     let sandbox = match mode {
         ExecutionMode::Sandboxed => match &plan.sandbox {
-            SandboxAvailability::Bubblewrap(sandbox) => Some(sandbox),
+            SandboxAvailability::Bubblewrap(_) | SandboxAvailability::Seatbelt(_) => {
+                Some(&plan.sandbox)
+            }
             SandboxAvailability::Unavailable(reason) => {
                 anyhow::bail!("sandbox is unavailable: {reason}");
             }
@@ -339,10 +395,7 @@ fn detect_sandbox(repository_root: &Path, command: &ParsedCommand) -> SandboxAva
 
     #[cfg(target_os = "macos")]
     {
-        let _ = (repository_root, command);
-        SandboxAvailability::Unavailable(
-            "the macOS sandbox profile is not yet supported; review the unsandboxed warning before running".to_string(),
-        )
+        detect_seatbelt(repository_root, command)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -352,6 +405,251 @@ fn detect_sandbox(repository_root: &Path, command: &ParsedCommand) -> SandboxAva
             "this platform does not have a supported sandbox backend".to_string(),
         )
     }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_seatbelt(repository_root: &Path, command: &ParsedCommand) -> SandboxAvailability {
+    let executable = PathBuf::from("/usr/bin/sandbox-exec");
+    if !executable.is_file() {
+        return SandboxAvailability::Unavailable(
+            "the macOS Seatbelt sandbox command is not installed".to_string(),
+        );
+    }
+    let Ok(executable) = executable.canonicalize() else {
+        return SandboxAvailability::Unavailable(
+            "the macOS Seatbelt sandbox command could not be resolved".to_string(),
+        );
+    };
+    let Ok(repository_root) = repository_root.canonicalize() else {
+        return SandboxAvailability::Unavailable(
+            "the repository path could not be canonicalized".to_string(),
+        );
+    };
+    let Ok(canonical_executable) = command.canonical_executable.canonicalize() else {
+        return SandboxAvailability::Unavailable(
+            "the executable path could not be canonicalized".to_string(),
+        );
+    };
+    let Some(home) =
+        directories::BaseDirs::new().map(|directories| directories.home_dir().to_path_buf())
+    else {
+        return SandboxAvailability::Unavailable(
+            "could not determine the current user's home directory for credential isolation"
+                .to_string(),
+        );
+    };
+    let Ok(home) = home.canonicalize() else {
+        return SandboxAvailability::Unavailable(
+            "the current user's home directory could not be canonicalized".to_string(),
+        );
+    };
+    if home == Path::new("/") {
+        return SandboxAvailability::Unavailable(
+            "the current user's home directory resolves to the filesystem root".to_string(),
+        );
+    }
+
+    let cargo_home = home.join(".cargo");
+    let sandbox = SeatbeltSandbox {
+        executable,
+        hidden_home: home.clone(),
+        cargo_bin: existing_home_directory(&cargo_home.join("bin"), &home),
+        cargo_registry: existing_home_directory(&cargo_home.join("registry"), &home),
+        cargo_git: existing_home_directory(&cargo_home.join("git"), &home),
+        rustup_home: existing_home_directory(&home.join(".rustup"), &home),
+    };
+    if !seatbelt_can_read_path(&canonical_executable, &repository_root, &sandbox) {
+        return SandboxAvailability::Unavailable(
+            "the executable is outside the system, checkout, and allowlisted Rust toolchain paths"
+                .to_string(),
+        );
+    }
+
+    let scratch = match tempfile::Builder::new()
+        .prefix("cururu-seatbelt-probe-")
+        .tempdir()
+    {
+        Ok(scratch) => scratch,
+        Err(_) => {
+            return SandboxAvailability::Unavailable(
+                "could not create a temporary directory for the Seatbelt preflight".to_string(),
+            );
+        }
+    };
+    let profile = match build_seatbelt_profile(&repository_root, &sandbox, scratch.path()) {
+        Ok(profile) => profile,
+        Err(_) => {
+            return SandboxAvailability::Unavailable(
+                "the Seatbelt profile could not be prepared for this checkout".to_string(),
+            );
+        }
+    };
+    if !seatbelt_probe_succeeds(&sandbox.executable, &profile, &repository_root) {
+        return SandboxAvailability::Unavailable(
+            "macOS Seatbelt could not establish the required isolated profile".to_string(),
+        );
+    }
+
+    SandboxAvailability::Seatbelt(sandbox)
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_can_read_path(path: &Path, repository_root: &Path, sandbox: &SeatbeltSandbox) -> bool {
+    path.starts_with(repository_root)
+        || SEATBELT_READ_PATHS
+            .iter()
+            .any(|root| path.starts_with(root))
+        || [
+            sandbox.cargo_bin.as_deref(),
+            sandbox.cargo_registry.as_deref(),
+            sandbox.cargo_git.as_deref(),
+            sandbox.rustup_home.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| path.starts_with(root))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_seatbelt_profile(
+    repository_root: &Path,
+    sandbox: &SeatbeltSandbox,
+    scratch_home: &Path,
+) -> anyhow::Result<String> {
+    let repository_root = repository_root
+        .canonicalize()
+        .context("could not canonicalize the checkout for the Seatbelt profile")?;
+    let scratch_home = scratch_home
+        .canonicalize()
+        .context("could not canonicalize the temporary command directory")?;
+    ensure!(
+        !scratch_home.starts_with(&repository_root),
+        "the temporary command directory must not be inside the checkout"
+    );
+
+    let mut profile = String::from(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process-exec*)\n\
+         (allow process-fork)\n\
+         (allow process-info* (target same-sandbox))\n\
+         (allow signal (target same-sandbox))\n\
+         (allow sysctl-read)\n",
+    );
+    profile.push_str("(allow file-read* (literal \"/\"))\n");
+    for path in SEATBELT_READ_PATHS {
+        append_seatbelt_read_path(&mut profile, Path::new(path))?;
+    }
+    for path in SEATBELT_READ_DEVICES {
+        append_seatbelt_read_literal(&mut profile, Path::new(path))?;
+    }
+    append_seatbelt_deny_read_path(&mut profile, &sandbox.hidden_home)?;
+    append_seatbelt_read_path(&mut profile, &repository_root)?;
+    for path in [
+        sandbox.cargo_bin.as_deref(),
+        sandbox.cargo_registry.as_deref(),
+        sandbox.cargo_git.as_deref(),
+        sandbox.rustup_home.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let canonical = path
+            .canonicalize()
+            .context("an allowlisted Rust toolchain path is no longer available")?;
+        ensure!(
+            canonical.starts_with(&sandbox.hidden_home),
+            "an allowlisted Rust toolchain path escaped the user's home directory"
+        );
+        append_seatbelt_read_path(&mut profile, &canonical)?;
+    }
+    append_seatbelt_read_path(&mut profile, &scratch_home)?;
+    append_seatbelt_write_path(&mut profile, &scratch_home)?;
+    for path in SEATBELT_WRITE_DEVICES {
+        append_seatbelt_write_literal(&mut profile, Path::new(path))?;
+    }
+    Ok(profile)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_read_path(profile: &mut String, path: &Path) -> anyhow::Result<()> {
+    let escaped = seatbelt_path_literal(path)?;
+    profile.push_str("(allow file-read* (subpath \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    profile.push_str("(allow file-map-executable (subpath \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    append_seatbelt_read_metadata_ancestors(profile, path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_read_metadata_ancestors(
+    profile: &mut String,
+    path: &Path,
+) -> anyhow::Result<()> {
+    for ancestor in path.ancestors() {
+        let escaped = seatbelt_path_literal(ancestor)?;
+        profile.push_str("(allow file-read-metadata (literal \"");
+        profile.push_str(&escaped);
+        profile.push_str("\"))\n");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_read_literal(profile: &mut String, path: &Path) -> anyhow::Result<()> {
+    let escaped = seatbelt_path_literal(path)?;
+    profile.push_str("(allow file-read* (literal \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    append_seatbelt_read_metadata_ancestors(profile, path)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_deny_read_path(profile: &mut String, path: &Path) -> anyhow::Result<()> {
+    let escaped = seatbelt_path_literal(path)?;
+    profile.push_str("(deny file-read* (subpath \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_write_path(profile: &mut String, path: &Path) -> anyhow::Result<()> {
+    let escaped = seatbelt_path_literal(path)?;
+    profile.push_str("(allow file-write* (subpath \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn append_seatbelt_write_literal(profile: &mut String, path: &Path) -> anyhow::Result<()> {
+    let escaped = seatbelt_path_literal(path)?;
+    profile.push_str("(allow file-write* (literal \"");
+    profile.push_str(&escaped);
+    profile.push_str("\"))\n");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_path_literal(path: &Path) -> anyhow::Result<String> {
+    let value = path.to_str().context("sandbox paths must be valid UTF-8")?;
+    ensure!(
+        !value.chars().any(char::is_control),
+        "sandbox paths must not contain control characters"
+    );
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            _ => escaped.push(character),
+        }
+    }
+    Ok(escaped)
 }
 
 #[cfg(target_os = "linux")]
@@ -446,7 +744,6 @@ fn is_hidden_system_path(path: &Path) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-#[cfg(target_os = "linux")]
 fn is_masked_by_sandbox(path: &Path) -> bool {
     ["/home", "/root", "/tmp", "/var/tmp", "/run"]
         .iter()
@@ -464,6 +761,15 @@ fn is_temporary_sandbox_path(path: &Path) -> bool {
 fn existing_directory(path: &Path) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
     if is_temporary_sandbox_path(&canonical) {
+        return None;
+    }
+    canonical.is_dir().then_some(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn existing_home_directory(path: &Path, home: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(home) {
         return None;
     }
     canonical.is_dir().then_some(canonical)
@@ -541,21 +847,56 @@ fn bubblewrap_probe_succeeds(executable: &Path, hidden_home: &Path) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn seatbelt_probe_succeeds(executable: &Path, profile: &str, repository_root: &Path) -> bool {
+    let mut command = Command::new(executable);
+    command
+        .arg("-p")
+        .arg(profile)
+        .arg("/usr/bin/true")
+        .current_dir(repository_root)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    set_process_group(&mut command);
+
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started_at.elapsed() < SANDBOX_PROBE_TIMEOUT => {
+                thread::sleep(SUPERVISOR_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                terminate_child_group(&mut child);
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 fn supervise(
     repository_root: &Path,
     parsed: &ParsedCommand,
-    sandbox: Option<&BubblewrapSandbox>,
+    sandbox: Option<&SandboxAvailability>,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<CommandOutput> {
-    let scratch = if sandbox.is_none() {
-        Some(
+    let scratch = match sandbox {
+        Some(SandboxAvailability::Bubblewrap(_)) => None,
+        Some(SandboxAvailability::Seatbelt(_)) | None => Some(
             tempfile::Builder::new()
                 .prefix("cururu-local-command-")
                 .tempdir()
                 .context("could not create an isolated temporary home for the command")?,
-        )
-    } else {
-        None
+        ),
+        Some(SandboxAvailability::Unavailable(reason)) => {
+            anyhow::bail!("sandbox is unavailable: {reason}");
+        }
     };
     let scratch_home = scratch.as_ref().map_or_else(
         || Path::new("/tmp"),
@@ -721,16 +1062,43 @@ fn monitor_process(
 fn build_process_command(
     repository_root: &Path,
     parsed: &ParsedCommand,
-    sandbox: Option<&BubblewrapSandbox>,
+    sandbox: Option<&SandboxAvailability>,
     scratch_home: &Path,
 ) -> anyhow::Result<Command> {
     if let Some(sandbox) = sandbox {
-        return Ok(build_sandboxed_command(repository_root, parsed, sandbox));
+        return build_sandboxed_command(repository_root, parsed, sandbox, scratch_home);
     }
     build_unsandboxed_command(repository_root, parsed, scratch_home)
 }
 
 fn build_sandboxed_command(
+    repository_root: &Path,
+    parsed: &ParsedCommand,
+    sandbox: &SandboxAvailability,
+    scratch_home: &Path,
+) -> anyhow::Result<Command> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = scratch_home;
+
+    match sandbox {
+        SandboxAvailability::Bubblewrap(sandbox) => {
+            Ok(build_bubblewrap_command(repository_root, parsed, sandbox))
+        }
+        #[cfg(target_os = "macos")]
+        SandboxAvailability::Seatbelt(sandbox) => {
+            build_seatbelt_command(repository_root, parsed, sandbox, scratch_home)
+        }
+        #[cfg(not(target_os = "macos"))]
+        SandboxAvailability::Seatbelt(_) => {
+            anyhow::bail!("the Seatbelt sandbox is only supported on macOS");
+        }
+        SandboxAvailability::Unavailable(reason) => {
+            anyhow::bail!("sandbox is unavailable: {reason}");
+        }
+    }
+}
+
+fn build_bubblewrap_command(
     repository_root: &Path,
     parsed: &ParsedCommand,
     sandbox: &BubblewrapSandbox,
@@ -744,6 +1112,61 @@ fn build_sandboxed_command(
     command.env_clear().stdin(Stdio::null());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_command(
+    repository_root: &Path,
+    parsed: &ParsedCommand,
+    sandbox: &SeatbeltSandbox,
+    scratch_home: &Path,
+) -> anyhow::Result<Command> {
+    use std::os::unix::fs::symlink;
+
+    let scratch_home = scratch_home
+        .canonicalize()
+        .context("could not canonicalize the temporary command directory")?;
+    let cargo_home = scratch_home.join(".cargo");
+    fs::create_dir_all(&cargo_home).context("could not create an isolated Cargo home")?;
+    for (name, source) in [
+        ("registry", sandbox.cargo_registry.as_deref()),
+        ("git", sandbox.cargo_git.as_deref()),
+    ] {
+        if let Some(source) = source {
+            symlink(source, cargo_home.join(name))
+                .context("could not expose a read-only Cargo cache to the sandbox")?;
+        }
+    }
+
+    let profile = build_seatbelt_profile(repository_root, sandbox, &scratch_home)?;
+    let mut path_entries: Vec<PathBuf> = SEATBELT_PATH.iter().map(PathBuf::from).collect();
+    if let Some(cargo_bin) = &sandbox.cargo_bin {
+        path_entries.insert(0, cargo_bin.clone());
+    }
+    let path = std::env::join_paths(path_entries).context("could not build sandboxed PATH")?;
+    let target_dir = scratch_home.join("target");
+    let mut command = Command::new(&sandbox.executable);
+    command
+        .arg("-p")
+        .arg(profile)
+        .arg(&parsed.executable)
+        .args(&parsed.arguments)
+        .current_dir(repository_root)
+        .env_clear()
+        .env("HOME", &scratch_home)
+        .env("TMPDIR", &scratch_home)
+        .env("TMP", &scratch_home)
+        .env("TEMP", &scratch_home)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(rustup_home) = &sandbox.rustup_home {
+        command.env("RUSTUP_HOME", rustup_home);
+    }
+    Ok(command)
 }
 
 fn append_sandbox_workspace_mounts(
@@ -1038,7 +1461,8 @@ mod tests {
 
     use super::{
         CommandContext, CommandPlan, ExecutionMode, ParsedCommand, SandboxAvailability,
-        capture_stream, detect_sandbox, parse_command, run, supervise,
+        SeatbeltSandbox, build_seatbelt_profile, capture_stream, detect_sandbox, parse_command,
+        run, seatbelt_path_literal, supervise,
     };
     use crate::repository::RepositorySnapshot;
 
@@ -1078,6 +1502,63 @@ mod tests {
 
         assert_eq!(captured.bytes.len(), 32 * 1_024);
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn seatbelt_paths_are_escaped_and_the_profile_scopes_filesystem_access() {
+        let path = PathBuf::from("/tmp/quoted\" (allow default) \\");
+        assert_eq!(
+            seatbelt_path_literal(&path).unwrap(),
+            "/tmp/quoted\\\" (allow default) \\\\"
+        );
+        assert!(seatbelt_path_literal(PathBuf::from("/tmp/line\nbreak").as_path()).is_err());
+
+        let repository = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let hidden_home = home.path().canonicalize().unwrap();
+        let sandbox = SeatbeltSandbox {
+            executable: PathBuf::from("/usr/bin/sandbox-exec"),
+            hidden_home: hidden_home.clone(),
+            cargo_bin: None,
+            cargo_registry: None,
+            cargo_git: None,
+            rustup_home: None,
+        };
+
+        let profile = build_seatbelt_profile(repository.path(), &sandbox, scratch.path()).unwrap();
+        let repository_path = repository.path().canonicalize().unwrap();
+        let scratch_path = scratch.path().canonicalize().unwrap();
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            repository_path.display()
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            scratch_path.display()
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            repository_path.display()
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            hidden_home.display()
+        )));
+        let home_deny = format!("(deny file-read* (subpath \"{}\"))", hidden_home.display());
+        let checkout_allow = format!(
+            "(allow file-read* (subpath \"{}\"))",
+            repository_path.display()
+        );
+        assert!(profile.find(&home_deny).unwrap() < profile.find(&checkout_allow).unwrap());
+        assert!(!profile.contains(&format!(
+            "(allow file-read-metadata (subpath \"{}\"))",
+            hidden_home.display()
+        )));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
+        assert!(profile.contains("(allow file-read* (subpath \"/System/Library\"))"));
+        assert!(!profile.contains("(allow file-read* (subpath \"/System\"))"));
+        assert!(!profile.contains("(allow network"));
     }
 
     #[test]
@@ -1168,9 +1649,8 @@ mod tests {
             canonical_executable: PathBuf::from("/usr/bin/true"),
             arguments: Vec::new(),
         };
-        let SandboxAvailability::Bubblewrap(sandbox) =
-            detect_sandbox(repository.path(), &true_command)
-        else {
+        let sandbox = detect_sandbox(repository.path(), &true_command);
+        let SandboxAvailability::Bubblewrap(_) = &sandbox else {
             return;
         };
         let output = supervise(
@@ -1188,9 +1668,8 @@ mod tests {
             canonical_executable: PathBuf::from("/usr/bin/touch"),
             arguments: vec![write_marker.to_string()],
         };
-        let SandboxAvailability::Bubblewrap(touch_sandbox) =
-            detect_sandbox(repository.path(), &touch_command)
-        else {
+        let touch_sandbox = detect_sandbox(repository.path(), &touch_command);
+        let SandboxAvailability::Bubblewrap(_) = &touch_sandbox else {
             return;
         };
         let output = supervise(
@@ -1209,9 +1688,8 @@ mod tests {
             canonical_executable: PathBuf::from("/usr/bin/sleep"),
             arguments: vec!["5".to_string()],
         };
-        let SandboxAvailability::Bubblewrap(sleep_sandbox) =
-            detect_sandbox(repository.path(), &sleep_command)
-        else {
+        let sleep_sandbox = detect_sandbox(repository.path(), &sleep_command);
+        let SandboxAvailability::Bubblewrap(_) = &sleep_sandbox else {
             return;
         };
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
@@ -1232,5 +1710,143 @@ mod tests {
 
         assert!(output.was_cancelled());
         assert!(started_at.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_hides_home_disables_network_and_keeps_checkout_read_only() {
+        let fixture = tempfile::tempdir().unwrap();
+        let fake_home = fixture.path().join("home");
+        std::fs::create_dir(&fake_home).unwrap();
+        let repository = fake_home.join("checkout");
+        std::fs::create_dir(&repository).unwrap();
+        let secret_path = fake_home.join("synthetic-credential.txt");
+        std::fs::write(&secret_path, "test-only marker").unwrap();
+        let checkout_file = repository.join("source.txt");
+        std::fs::write(&checkout_file, "checkout is readable").unwrap();
+        let shell_command = ParsedCommand {
+            executable: PathBuf::from("/bin/sh"),
+            canonical_executable: PathBuf::from("/bin/sh").canonicalize().unwrap(),
+            arguments: Vec::new(),
+        };
+        let detected_sandbox = match detect_sandbox(&repository, &shell_command) {
+            SandboxAvailability::Seatbelt(sandbox) => sandbox,
+            unavailable => {
+                panic!(
+                    "macOS Seatbelt preflight did not pass: {}",
+                    unavailable.description()
+                );
+            }
+        };
+        let sandbox = SandboxAvailability::Seatbelt(SeatbeltSandbox {
+            hidden_home: fake_home.canonicalize().unwrap(),
+            cargo_bin: None,
+            cargo_registry: None,
+            cargo_git: None,
+            rustup_home: None,
+            ..detected_sandbox
+        });
+
+        let read_checkout = ParsedCommand {
+            executable: PathBuf::from("/bin/cat"),
+            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
+            arguments: vec![checkout_file.display().to_string()],
+        };
+        let output = supervise(
+            &repository,
+            &read_checkout,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(output.succeeded(), "{}", output.stderr);
+        assert_eq!(output.stdout, "checkout is readable");
+
+        let scratch_write = ParsedCommand {
+            executable: PathBuf::from("/bin/sh"),
+            canonical_executable: PathBuf::from("/bin/sh").canonicalize().unwrap(),
+            arguments: vec![
+                "-c".to_string(),
+                "printf marker > \"$TMPDIR/scratch-write\" && test -f \"$TMPDIR/scratch-write\""
+                    .to_string(),
+            ],
+        };
+        let output = supervise(
+            &repository,
+            &scratch_write,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(output.succeeded(), "{}", output.stderr);
+
+        let read_home = ParsedCommand {
+            executable: PathBuf::from("/bin/cat"),
+            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
+            arguments: vec![secret_path.display().to_string()],
+        };
+        let output = supervise(
+            &repository,
+            &read_home,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!output.succeeded());
+
+        let secret_symlink = repository.join("synthetic-credential-link");
+        std::os::unix::fs::symlink(&secret_path, &secret_symlink).unwrap();
+        let read_home_symlink = ParsedCommand {
+            executable: PathBuf::from("/bin/cat"),
+            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
+            arguments: vec![secret_symlink.display().to_string()],
+        };
+        let output = supervise(
+            &repository,
+            &read_home_symlink,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!output.succeeded());
+
+        let write_marker = repository.join("seatbelt-write-marker");
+        let write_checkout = ParsedCommand {
+            executable: PathBuf::from("/usr/bin/touch"),
+            canonical_executable: PathBuf::from("/usr/bin/touch").canonicalize().unwrap(),
+            arguments: vec![write_marker.display().to_string()],
+        };
+        let output = supervise(
+            &repository,
+            &write_checkout,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!output.succeeded());
+        assert!(!write_marker.exists());
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let network_probe = ParsedCommand {
+            executable: PathBuf::from("/usr/bin/nc"),
+            canonical_executable: PathBuf::from("/usr/bin/nc").canonicalize().unwrap(),
+            arguments: vec![
+                "-z".to_string(),
+                "-w".to_string(),
+                "1".to_string(),
+                "127.0.0.1".to_string(),
+                port,
+            ],
+        };
+        let output = supervise(
+            &repository,
+            &network_probe,
+            Some(&sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!output.succeeded());
+        drop(listener);
     }
 }
