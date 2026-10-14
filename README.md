@@ -116,5 +116,8 @@ loading or comment selection.
 cargo run
 ```
 
-On Linux, GPUI's X11/Wayland system dependencies must be installed. macOS
-packaging and hardware validation remain a separate proof item.
+On Linux, GPUI's X11/Wayland system dependencies must be installed. CI builds
+Linux x86_64 and ARM64 AppImages, plus macOS Apple Silicon `.app`/`.dmg`
+packages. Packaging is validation-only: CI does not sign, upload, or publish
+these files. AppImage ARM64 remains provisional until its native CI build passes;
+runtime and visual validation remain separate proof items.

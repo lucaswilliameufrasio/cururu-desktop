@@ -325,7 +325,12 @@ repository.
 The initial architecture matrix is Linux x86_64, Linux ARM64, and macOS Apple
 Silicon (ARM64). Prepare Linux AppImage and macOS `.app`/`.dmg` artifacts, but
 verify the packager/runtime supports the Linux ARM64 target before treating that
-artifact as available. Windows, macOS Intel, and Linux packages beyond AppImage
-remain out of this initial matrix. This decision authorizes local/CI packaging
-preparation only; it does not authorize signing with user credentials, creating
-a release, deploying, or publishing artifacts.
+artifact as available. The CI matrix now uses native x86_64, ARM64, and Apple
+Silicon runners, with `cargo-packager` 0.11.8 building the selected packages.
+The packager's AppImage implementation has ARM64-specific AppRun, linuxdeploy,
+and plugin assets; the native CI build still needs to pass before claiming the
+ARM64 artifact is validated. Linux packaging sets `NO_STRIP=1` because
+linuxdeploy's bundled strip cannot read Ubuntu 24.04 `.relr.dyn` sections.
+Windows, macOS Intel, and Linux packages beyond AppImage remain out of this
+initial matrix. CI packaging is validation-only: no signing, artifact upload,
+release, deployment, or publication is configured or authorized.

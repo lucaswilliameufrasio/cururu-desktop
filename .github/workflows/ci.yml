@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -11,12 +10,21 @@ permissions:
 
 jobs:
   check:
-    name: Check (${{ matrix.os }})
+    name: Check and package (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        include:
+          - os: ubuntu-24.04
+            label: Linux x86_64
+            package_formats: appimage
+          - os: ubuntu-24.04-arm
+            label: Linux ARM64
+            package_formats: appimage
+          - os: macos-15
+            label: macOS Apple Silicon
+            package_formats: app,dmg
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,3 +68,13 @@ jobs:
 
       - name: Build release
         run: cargo build --locked --workspace --release
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Package without signing or publishing
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          # linuxdeploy's bundled strip cannot read RELR sections on Ubuntu 24.04.
+          NO_STRIP: "1"
+        run: cargo packager --release --formats "${{ matrix.package_formats }}"

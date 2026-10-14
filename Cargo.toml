@@ -6,6 +6,12 @@ rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 description = "Desktop code review client for Cururu"
 
+[package.metadata.packager]
+product-name = "Cururu Desktop"
+identifier = "dev.cururu.desktop"
+description = "A native desktop client for code review."
+icons = ["assets/cururu-icon.png"]
+
 [dependencies]
 anyhow = "1"
 base64 = "=0.22.1"
