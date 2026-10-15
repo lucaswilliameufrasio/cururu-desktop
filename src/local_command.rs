@@ -538,7 +538,8 @@ fn build_seatbelt_profile(
     for path in SEATBELT_READ_DEVICES {
         append_seatbelt_read_literal(&mut profile, Path::new(path))?;
     }
-    append_seatbelt_deny_read_path(&mut profile, &sandbox.hidden_home)?;
+    // The default-deny policy blocks unlisted home paths. An explicit home
+    // deny would also block a checkout nested below the home directory.
     append_seatbelt_read_path(&mut profile, &repository_root)?;
     for path in [
         sandbox.cargo_bin.as_deref(),
@@ -599,15 +600,6 @@ fn append_seatbelt_read_literal(profile: &mut String, path: &Path) -> anyhow::Re
     profile.push_str(&escaped);
     profile.push_str("\"))\n");
     append_seatbelt_read_metadata_ancestors(profile, path)?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn append_seatbelt_deny_read_path(profile: &mut String, path: &Path) -> anyhow::Result<()> {
-    let escaped = seatbelt_path_literal(path)?;
-    profile.push_str("(deny file-read* (subpath \"");
-    profile.push_str(&escaped);
-    profile.push_str("\"))\n");
     Ok(())
 }
 
@@ -1584,8 +1576,9 @@ mod tests {
         );
         assert!(seatbelt_path_literal(PathBuf::from("/tmp/line\nbreak").as_path()).is_err());
 
-        let repository = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("checkout");
+        std::fs::create_dir(&repository).unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let hidden_home = home.path().canonicalize().unwrap();
         let sandbox = SeatbeltSandbox {
@@ -1597,8 +1590,8 @@ mod tests {
             rustup_home: None,
         };
 
-        let profile = build_seatbelt_profile(repository.path(), &sandbox, scratch.path()).unwrap();
-        let repository_path = repository.path().canonicalize().unwrap();
+        let profile = build_seatbelt_profile(&repository, &sandbox, scratch.path()).unwrap();
+        let repository_path = repository.canonicalize().unwrap();
         let scratch_path = scratch.path().canonicalize().unwrap();
         assert!(profile.contains(&format!(
             "(allow file-read* (subpath \"{}\"))",
@@ -1621,7 +1614,9 @@ mod tests {
             "(allow file-read* (subpath \"{}\"))",
             repository_path.display()
         );
-        assert!(profile.find(&home_deny).unwrap() < profile.find(&checkout_allow).unwrap());
+        assert!(profile.contains("(deny default)"));
+        assert!(!profile.contains(&home_deny));
+        assert!(profile.contains(&checkout_allow));
         assert!(!profile.contains(&format!(
             "(allow file-read-metadata (subpath \"{}\"))",
             hidden_home.display()
@@ -1651,8 +1646,8 @@ mod tests {
     fn cancellation_terminates_and_reaps_the_command_process_group() {
         let repository = tempfile::tempdir().unwrap();
         let command = ParsedCommand {
-            executable: PathBuf::from("/usr/bin/sleep"),
-            canonical_executable: PathBuf::from("/usr/bin/sleep"),
+            executable: PathBuf::from("/bin/sleep"),
+            canonical_executable: PathBuf::from("/bin/sleep"),
             arguments: vec!["30".to_string()],
         };
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
