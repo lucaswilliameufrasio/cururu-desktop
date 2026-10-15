@@ -20,7 +20,7 @@ const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024;
 const MAX_THREAD_REPLY_BYTES: usize = 10_000;
 const MAX_MUTATION_RESPONSE_BYTES: usize = 64_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PullRequestRef {
     pub owner: String,
     pub repository: String,
@@ -104,11 +104,48 @@ struct CreateThreadReplyRequest<'a> {
     in_reply_to: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewReviewComment {
     pub path: String,
     pub line: u32,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReview {
+    pub reference: PullRequestRef,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub body: String,
+    pub comments: Vec<NewReviewComment>,
+}
+
+pub fn validate_saved_review(review: &PendingReview) -> anyhow::Result<()> {
+    validate_pull_request_reference(&review.reference)?;
+    ensure!(
+        review.reference.owner.len() <= 256 && review.reference.repository.len() <= 256,
+        "saved review repository name exceeds the limit"
+    );
+    ensure!(
+        valid_commit_sha(&review.base_sha) && valid_commit_sha(&review.head_sha),
+        "saved review has invalid commit identifiers"
+    );
+    if !review.body.is_empty() {
+        validate_thread_reply_body(&review.body)?;
+    }
+    ensure!(
+        review.comments.len() == 1,
+        "saved draft must contain exactly one inline comment"
+    );
+    for comment in &review.comments {
+        validate_relative_path(&comment.path)?;
+        ensure!(
+            comment.path.len() <= 4_096 && comment.line > 0,
+            "saved comment has an invalid anchor"
+        );
+        validate_thread_reply_body(&comment.body)?;
+    }
+    Ok(())
 }
 
 pub fn validate_review_comments(

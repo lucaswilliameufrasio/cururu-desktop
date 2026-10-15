@@ -445,6 +445,10 @@ impl ReviewWorkspace {
         let mut workspace = Self::sample();
         match session_store::SessionStore::open_default() {
             Ok(store) => {
+                if let Err(error) = workspace.review_publication.restore(store.github_drafts()) {
+                    workspace.session_store_error =
+                        Some(format!("Could not restore GitHub drafts: {error}").into());
+                }
                 match store.evaluator_settings() {
                     Ok(settings) => workspace.evaluator_settings = settings,
                     Err(error) => {

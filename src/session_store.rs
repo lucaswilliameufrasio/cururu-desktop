@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
@@ -31,6 +31,28 @@ pub struct StoredCommentDraft {
     pub updated_at: i64,
     pub revision: i64,
     pub is_stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct GitHubDraftQueue {
+    pub drafts: Vec<crate::github_pr::PendingReview>,
+    pub summary: String,
+}
+
+impl GitHubDraftQueue {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.drafts.len() <= 50,
+            "saved GitHub queue exceeds 50 comments"
+        );
+        if !self.summary.is_empty() {
+            crate::github_pr::validate_thread_reply_body(&self.summary)?;
+        }
+        for draft in &self.drafts {
+            crate::github_pr::validate_saved_review(draft)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +123,65 @@ impl SessionStore {
             )
             .optional()
             .context("failed to read the most recent local session")
+    }
+
+    pub fn github_drafts(&self) -> anyhow::Result<(i64, GitHubDraftQueue)> {
+        let connection = self.connect()?;
+        let record: Option<(i64, String)> = connection.query_row(
+            "SELECT revision, payload FROM github_draft_queue WHERE id = 1 AND length(CAST(payload AS BLOB)) <= 1048576",
+            [], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let Some((revision, payload)) = record else {
+            let count: i64 =
+                connection.query_row("SELECT count(*) FROM github_draft_queue", [], |row| {
+                    row.get(0)
+                })?;
+            anyhow::ensure!(
+                count == 0,
+                "saved GitHub drafts exceed the storage size limit"
+            );
+            return Ok((0, GitHubDraftQueue::default()));
+        };
+        let queue: GitHubDraftQueue = serde_json::from_str(&payload)?;
+        queue.validate()?;
+        Ok((revision, queue))
+    }
+
+    pub fn save_github_drafts(
+        &self,
+        expected_revision: i64,
+        queue: &GitHubDraftQueue,
+    ) -> anyhow::Result<i64> {
+        queue.validate()?;
+        let payload = serde_json::to_string(queue)?;
+        anyhow::ensure!(
+            payload.len() <= 1_048_576,
+            "GitHub draft queue exceeds the storage size limit"
+        );
+        let mut connection = self.connect()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: i64 = transaction
+            .query_row(
+                "SELECT revision FROM github_draft_queue WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        anyhow::ensure!(
+            current == expected_revision,
+            "GitHub drafts changed in another app instance; restart to restore them before saving"
+        );
+        let revision = current
+            .checked_add(1)
+            .context("GitHub draft revision overflow")?;
+        transaction.execute(
+            "INSERT INTO github_draft_queue(id, revision, payload) VALUES (1, ?1, ?2) \
+            ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload",
+            params![revision, payload],
+        )?;
+        transaction.commit()?;
+        Ok(revision)
     }
 
     pub fn record_opened(
@@ -543,6 +624,9 @@ impl SessionStore {
                 )
                 .context("failed to apply local session database migration 5")?;
         }
+        if version < 6 {
+            transaction.execute_batch("CREATE TABLE github_draft_queue (id INTEGER PRIMARY KEY CHECK(id = 1), revision INTEGER NOT NULL CHECK(revision > 0), payload TEXT NOT NULL); PRAGMA user_version = 6;")?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -890,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_version_four_database_adds_only_local_review_tables() {
+    fn opening_a_version_four_database_adds_local_review_and_github_draft_tables() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("version-four.sqlite3");
         let connection = rusqlite::Connection::open(&database_path).unwrap();
@@ -905,7 +989,109 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            super::SCHEMA_VERSION
+        );
+    }
+
+    fn github_queue() -> super::GitHubDraftQueue {
+        super::GitHubDraftQueue {
+            summary: "My review summary".to_string(),
+            drafts: vec![crate::github_pr::PendingReview {
+                reference: crate::github_pr::PullRequestRef::parse("octo/repo#42").unwrap(),
+                base_sha: "b".repeat(40),
+                head_sha: "a".repeat(40),
+                body: String::new(),
+                comments: vec![crate::github_pr::NewReviewComment {
+                    path: "src/lib.rs".to_string(),
+                    line: 17,
+                    body: "Please check this anchor".to_string(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn github_drafts_round_trip_across_restarts_and_reject_stale_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("github-drafts.sqlite3");
+        let first = SessionStore::open(&path).unwrap();
+        let second = SessionStore::open(&path).unwrap();
+        assert_eq!(
+            first.github_drafts().unwrap(),
+            (0, super::GitHubDraftQueue::default())
+        );
+        let queue = github_queue();
+        assert_eq!(first.save_github_drafts(0, &queue).unwrap(), 1);
+        assert!(
+            second
+                .save_github_drafts(0, &super::GitHubDraftQueue::default())
+                .is_err()
+        );
+        drop(first);
+        let reopened = SessionStore::open(&path).unwrap();
+        assert_eq!(reopened.github_drafts().unwrap(), (1, queue));
+        assert_eq!(
+            reopened
+                .save_github_drafts(1, &super::GitHubDraftQueue::default())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            second.github_drafts().unwrap(),
+            (2, super::GitHubDraftQueue::default())
+        );
+    }
+
+    #[test]
+    fn github_draft_migration_preserves_local_drafts_and_rejects_invalid_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite3");
+        let store = SessionStore::open(&path).unwrap();
+        let repo = directory.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        store
+            .record_opened(&repo, Some("feature/test"), Some("head"))
+            .unwrap();
+        let draft = cururu_core::ReviewCommentDraft {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            body: "Existing local draft".to_string(),
+        };
+        store
+            .save_comment_draft(&repo, Some("head"), Some("head"), &draft, None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
+            .unwrap();
+        let migrated = SessionStore::open(&path).unwrap();
+        assert_eq!(
+            migrated.most_recent().unwrap().unwrap().head_oid.as_deref(),
+            Some("head")
+        );
+        assert_eq!(
+            migrated.comment_drafts(&repo, Some("head")).unwrap()[0].draft,
+            draft
+        );
+        let mut invalid = github_queue();
+        invalid.drafts[0].comments[0].path = "../credential".to_string();
+        assert!(migrated.save_github_drafts(0, &invalid).is_err());
+        let payload = serde_json::to_string(&invalid).unwrap();
+        connection
+            .execute(
+                "INSERT INTO github_draft_queue(id,revision,payload) VALUES(1,1,?1)",
+                [payload],
+            )
+            .unwrap();
+        assert!(migrated.github_drafts().is_err());
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM github_draft_queue", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "invalid persisted data must not be silently deleted"
         );
     }
 

@@ -10,14 +10,7 @@ use gpui_component::{
 
 use crate::{GitHubAuthState, RemoteReviewState, ReviewWorkspace, github_pr};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingReview {
-    pub reference: github_pr::PullRequestRef,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub body: String,
-    pub comments: Vec<github_pr::NewReviewComment>,
-}
+use crate::github_pr::PendingReview;
 
 impl PendingReview {
     fn matches(&self, snapshot: &github_pr::PullRequestSnapshot) -> bool {
@@ -41,9 +34,38 @@ pub enum PublicationState {
 pub struct ReviewPublication {
     pub drafts: Vec<PendingReview>,
     pub state: PublicationState,
+    storage: DraftStorage,
+    storage_revision: i64,
+    restored_summary: String,
+}
+
+#[derive(Default)]
+enum DraftStorage {
+    #[default]
+    Ready,
+    Saving,
+    Unavailable,
 }
 
 impl ReviewPublication {
+    pub fn restore(
+        &mut self,
+        result: anyhow::Result<(i64, crate::session_store::GitHubDraftQueue)>,
+    ) -> anyhow::Result<()> {
+        match result {
+            Ok((revision, queue)) => {
+                self.drafts = queue.drafts;
+                self.storage_revision = revision;
+                self.restored_summary = queue.summary;
+                Ok(())
+            }
+            Err(error) => {
+                self.storage = DraftStorage::Unavailable;
+                Err(error)
+            }
+        }
+    }
+
     pub const fn is_publishing(&self) -> bool {
         matches!(self.state, PublicationState::Publishing(_))
     }
@@ -160,6 +182,7 @@ impl ReviewWorkspace {
                     .multi_line()
                     .rows(3)
                     .placeholder("Write the summary sent with your COMMENT review…")
+                    .default_value(self.review_publication.restored_summary.clone())
             }));
         }
         if self.remote_comment_input.is_none() {
@@ -184,9 +207,7 @@ impl ReviewWorkspace {
             .flex_col()
             .gap_2()
             .child("New inline comments · local queue, not yet published")
-            .child(
-                "Drafts stay in memory across mode/layout switches, but do not survive app exit.",
-            );
+            .child("Drafts stay in memory until explicitly saved locally. Saving never publishes.");
         let Some(input) = &self.remote_comment_input else {
             return content;
         };
@@ -244,7 +265,28 @@ impl ReviewWorkspace {
                     .as_ref()
                     .map(TextInput::new),
             )
+            .child(self.render_save_github_drafts(cx))
             .child(self.render_review_confirmation(cx))
+    }
+
+    fn render_save_github_drafts(&self, cx: &Context<Self>) -> gpui::Div {
+        let entity = cx.entity();
+        let saving = matches!(self.review_publication.storage, DraftStorage::Saving);
+        gpui::div().child(
+            Button::new("save-github-drafts")
+                .label(if saving {
+                    "Saving GitHub drafts…"
+                } else {
+                    "Save queued comments and summary locally"
+                })
+                .disabled(
+                    self.session_store.is_none()
+                        || saving
+                        || self.review_publication.is_publishing()
+                        || matches!(self.review_publication.storage, DraftStorage::Unavailable),
+                )
+                .on_click(move |_event, _window, cx| save_drafts(&entity, cx)),
+        )
     }
 
     fn render_queued_comment(
@@ -369,6 +411,47 @@ fn preview(entity: &Entity<ReviewWorkspace>, only: Option<usize>, cx: &mut App) 
     });
 }
 
+fn save_drafts(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
+    let request = entity.update(cx, |this, cx| {
+        let store = this.session_store.clone()?;
+        if !matches!(this.review_publication.storage, DraftStorage::Ready)
+            || this.review_publication.is_publishing()
+        {
+            return None;
+        }
+        let queue = crate::session_store::GitHubDraftQueue {
+            drafts: this.review_publication.drafts.clone(),
+            summary: this
+                .remote_review_summary_input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default(),
+        };
+        let revision = this.review_publication.storage_revision;
+        this.review_publication.storage = DraftStorage::Saving;
+        cx.notify();
+        Some((store, revision, queue))
+    });
+    let Some((store, revision, queue)) = request else {
+        return;
+    };
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx.background_executor().spawn(async move { store.save_github_drafts(revision, &queue) }).await;
+        let _ = entity.update(cx, |this, cx| {
+            this.review_publication.storage = DraftStorage::Ready;
+            match result {
+                Ok(revision) => {
+                    this.review_publication.storage_revision = revision;
+                    this.notice = Some("GitHub drafts and summary saved locally. Later edits/removals require another save. No comment was published.".into());
+                }
+                Err(error) => this.notice = Some(format!("Drafts were NOT saved; in-memory edits kept: {error}").into()),
+            }
+            cx.notify();
+        });
+    }).detach();
+}
+
 fn publish(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
     let Some((pending, token)) = entity.update(cx, |this, cx| {
         let PublicationState::Confirming(pending) = &this.review_publication.state else {
@@ -458,6 +541,31 @@ mod tests {
             line,
             body: format!("Check line {line}"),
         }
+    }
+
+    #[test]
+    fn restoring_saved_drafts_does_not_create_a_publication_confirmation() {
+        let snapshot = snapshot();
+        let mut publication = ReviewPublication::default();
+        publication.queue(&snapshot, comment(1)).unwrap();
+        let queue = crate::session_store::GitHubDraftQueue {
+            drafts: publication.drafts.clone(),
+            summary: "Saved summary".to_string(),
+        };
+        let mut restored = ReviewPublication::default();
+        restored.restore(Ok((7, queue))).unwrap();
+        assert_eq!(restored.drafts, publication.drafts);
+        assert_eq!(restored.restored_summary, "Saved summary");
+        assert_eq!(restored.storage_revision, 7);
+        assert!(matches!(restored.state, PublicationState::Drafting));
+        assert!(!restored.is_publishing());
+        assert!(
+            restored
+                .restore(Err(anyhow::anyhow!("invalid saved data")))
+                .is_err()
+        );
+        assert!(matches!(restored.storage, DraftStorage::Unavailable));
+        assert_eq!(restored.drafts.len(), 1);
     }
 
     #[test]
