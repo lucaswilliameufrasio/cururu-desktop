@@ -83,9 +83,13 @@ pub struct CommandContext {
 
 impl CommandContext {
     pub fn from_snapshot(snapshot: &RepositorySnapshot) -> anyhow::Result<Self> {
+        let repository_root = snapshot
+            .root
+            .canonicalize()
+            .context("could not resolve the local repository path")?;
         Ok(Self {
-            repository_root: snapshot.root.clone(),
-            repository_identity: local_review::repository_identity(&snapshot.root)?,
+            repository_identity: local_review::repository_identity(&repository_root)?,
+            repository_root,
             head_oid: snapshot.head_oid.clone(),
             diff_fingerprint: local_review::snapshot_fingerprint(snapshot),
         })
@@ -1475,6 +1479,10 @@ mod tests {
         std::fs::write(&secret_path, "test-only marker").unwrap();
         let checkout_file = repository.join("source.txt");
         std::fs::write(&checkout_file, "checkout is readable").unwrap();
+        let fake_home = fake_home.canonicalize().unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let secret_path = secret_path.canonicalize().unwrap();
+        let checkout_file = checkout_file.canonicalize().unwrap();
         let shell_path = PathBuf::from("/bin/sh");
         let shell_command = ParsedCommand {
             canonical_executable: shell_path.canonicalize().unwrap(),
@@ -1542,6 +1550,23 @@ mod tests {
             command.arguments,
             ["%s", "$(touch /tmp/should-not-exist); *"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_context_canonicalizes_the_repository_root() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        gix::init(&repository).unwrap();
+        let repository_alias = root.path().join("repo-alias");
+        std::os::unix::fs::symlink(&repository, &repository_alias).unwrap();
+        let mut snapshot = RepositorySnapshot::open(&repository).unwrap();
+        snapshot.root = repository_alias;
+
+        let context = CommandContext::from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(context.repository_root, repository.canonicalize().unwrap());
     }
 
     #[test]
