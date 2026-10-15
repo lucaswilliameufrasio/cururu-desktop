@@ -24,6 +24,7 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const SANDBOX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
 const SANDBOX_WORKSPACE: &str = "/tmp/cururu-workspace";
 const SANDBOX_ALTERNATE_WORKSPACE: &str = "/var/tmp/cururu-workspace";
 const SANDBOX_HOME: &str = "/tmp/cururu-home";
@@ -465,24 +466,18 @@ fn detect_seatbelt(repository_root: &Path, command: &ParsedCommand) -> SandboxAv
         );
     }
 
-    let scratch = match tempfile::Builder::new()
+    let Ok(scratch) = tempfile::Builder::new()
         .prefix("cururu-seatbelt-probe-")
         .tempdir()
-    {
-        Ok(scratch) => scratch,
-        Err(_) => {
-            return SandboxAvailability::Unavailable(
-                "could not create a temporary directory for the Seatbelt preflight".to_string(),
-            );
-        }
+    else {
+        return SandboxAvailability::Unavailable(
+            "could not create a temporary directory for the Seatbelt preflight".to_string(),
+        );
     };
-    let profile = match build_seatbelt_profile(&repository_root, &sandbox, scratch.path()) {
-        Ok(profile) => profile,
-        Err(_) => {
-            return SandboxAvailability::Unavailable(
-                "the Seatbelt profile could not be prepared for this checkout".to_string(),
-            );
-        }
+    let Ok(profile) = build_seatbelt_profile(&repository_root, &sandbox, scratch.path()) else {
+        return SandboxAvailability::Unavailable(
+            "the Seatbelt profile could not be prepared for this checkout".to_string(),
+        );
     };
     if !seatbelt_probe_succeeds(&sandbox.executable, &profile, &repository_root) {
         return SandboxAvailability::Unavailable(
@@ -1459,12 +1454,88 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "macos")]
+    use super::CommandOutput;
     use super::{
         CommandContext, CommandPlan, ExecutionMode, ParsedCommand, SandboxAvailability,
         SeatbeltSandbox, build_seatbelt_profile, capture_stream, detect_sandbox, parse_command,
         run, seatbelt_path_literal, supervise,
     };
     use crate::repository::RepositorySnapshot;
+
+    #[cfg(target_os = "macos")]
+    struct SeatbeltTestFixture {
+        _root: tempfile::TempDir,
+        repository: PathBuf,
+        secret_path: PathBuf,
+        checkout_file: PathBuf,
+        sandbox: SandboxAvailability,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seatbelt_test_fixture() -> SeatbeltTestFixture {
+        let root = tempfile::tempdir().unwrap();
+        let fake_home = root.path().join("home");
+        std::fs::create_dir(&fake_home).unwrap();
+        let repository = fake_home.join("checkout");
+        std::fs::create_dir(&repository).unwrap();
+        let secret_path = fake_home.join("synthetic-credential.txt");
+        std::fs::write(&secret_path, "test-only marker").unwrap();
+        let checkout_file = repository.join("source.txt");
+        std::fs::write(&checkout_file, "checkout is readable").unwrap();
+        let shell_path = PathBuf::from("/bin/sh");
+        let shell_command = ParsedCommand {
+            canonical_executable: shell_path.canonicalize().unwrap(),
+            executable: shell_path,
+            arguments: Vec::new(),
+        };
+        let detected_sandbox = match detect_sandbox(&repository, &shell_command) {
+            SandboxAvailability::Seatbelt(sandbox) => sandbox,
+            unavailable => {
+                panic!(
+                    "macOS Seatbelt preflight did not pass: {}",
+                    unavailable.description()
+                );
+            }
+        };
+        let sandbox = SandboxAvailability::Seatbelt(SeatbeltSandbox {
+            hidden_home: fake_home.canonicalize().unwrap(),
+            cargo_bin: None,
+            cargo_registry: None,
+            cargo_git: None,
+            rustup_home: None,
+            ..detected_sandbox
+        });
+
+        SeatbeltTestFixture {
+            _root: root,
+            repository,
+            secret_path,
+            checkout_file,
+            sandbox,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_seatbelt_command(
+        fixture: &SeatbeltTestFixture,
+        executable: &str,
+        arguments: Vec<String>,
+    ) -> CommandOutput {
+        let executable = PathBuf::from(executable);
+        let command = ParsedCommand {
+            canonical_executable: executable.canonicalize().unwrap(),
+            executable,
+            arguments,
+        };
+        supervise(
+            &fixture.repository,
+            &command,
+            Some(&fixture.sandbox),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn command_parser_treats_shell_metacharacters_as_literal_arguments() {
@@ -1714,138 +1785,80 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_hides_home_disables_network_and_keeps_checkout_read_only() {
-        let fixture = tempfile::tempdir().unwrap();
-        let fake_home = fixture.path().join("home");
-        std::fs::create_dir(&fake_home).unwrap();
-        let repository = fake_home.join("checkout");
-        std::fs::create_dir(&repository).unwrap();
-        let secret_path = fake_home.join("synthetic-credential.txt");
-        std::fs::write(&secret_path, "test-only marker").unwrap();
-        let checkout_file = repository.join("source.txt");
-        std::fs::write(&checkout_file, "checkout is readable").unwrap();
-        let shell_command = ParsedCommand {
-            executable: PathBuf::from("/bin/sh"),
-            canonical_executable: PathBuf::from("/bin/sh").canonicalize().unwrap(),
-            arguments: Vec::new(),
-        };
-        let detected_sandbox = match detect_sandbox(&repository, &shell_command) {
-            SandboxAvailability::Seatbelt(sandbox) => sandbox,
-            unavailable => {
-                panic!(
-                    "macOS Seatbelt preflight did not pass: {}",
-                    unavailable.description()
-                );
-            }
-        };
-        let sandbox = SandboxAvailability::Seatbelt(SeatbeltSandbox {
-            hidden_home: fake_home.canonicalize().unwrap(),
-            cargo_bin: None,
-            cargo_registry: None,
-            cargo_git: None,
-            rustup_home: None,
-            ..detected_sandbox
-        });
-
-        let read_checkout = ParsedCommand {
-            executable: PathBuf::from("/bin/cat"),
-            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
-            arguments: vec![checkout_file.display().to_string()],
-        };
-        let output = supervise(
-            &repository,
-            &read_checkout,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+    fn seatbelt_allows_checkout_reads_and_scratch_writes() {
+        let fixture = seatbelt_test_fixture();
+        let output = run_seatbelt_command(
+            &fixture,
+            "/bin/cat",
+            vec![fixture.checkout_file.display().to_string()],
+        );
         assert!(output.succeeded(), "{}", output.stderr);
         assert_eq!(output.stdout, "checkout is readable");
 
-        let scratch_write = ParsedCommand {
-            executable: PathBuf::from("/bin/sh"),
-            canonical_executable: PathBuf::from("/bin/sh").canonicalize().unwrap(),
-            arguments: vec![
+        let output = run_seatbelt_command(
+            &fixture,
+            "/bin/sh",
+            vec![
                 "-c".to_string(),
                 "printf marker > \"$TMPDIR/scratch-write\" && test -f \"$TMPDIR/scratch-write\""
                     .to_string(),
             ],
-        };
-        let output = supervise(
-            &repository,
-            &scratch_write,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        );
         assert!(output.succeeded(), "{}", output.stderr);
+    }
 
-        let read_home = ParsedCommand {
-            executable: PathBuf::from("/bin/cat"),
-            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
-            arguments: vec![secret_path.display().to_string()],
-        };
-        let output = supervise(
-            &repository,
-            &read_home,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_denies_home_credentials_directly_and_through_symlinks() {
+        let fixture = seatbelt_test_fixture();
+        let output = run_seatbelt_command(
+            &fixture,
+            "/bin/cat",
+            vec![fixture.secret_path.display().to_string()],
+        );
         assert!(!output.succeeded());
 
-        let secret_symlink = repository.join("synthetic-credential-link");
-        std::os::unix::fs::symlink(&secret_path, &secret_symlink).unwrap();
-        let read_home_symlink = ParsedCommand {
-            executable: PathBuf::from("/bin/cat"),
-            canonical_executable: PathBuf::from("/bin/cat").canonicalize().unwrap(),
-            arguments: vec![secret_symlink.display().to_string()],
-        };
-        let output = supervise(
-            &repository,
-            &read_home_symlink,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let secret_symlink = fixture.repository.join("synthetic-credential-link");
+        std::os::unix::fs::symlink(&fixture.secret_path, &secret_symlink).unwrap();
+        let output = run_seatbelt_command(
+            &fixture,
+            "/bin/cat",
+            vec![secret_symlink.display().to_string()],
+        );
         assert!(!output.succeeded());
+    }
 
-        let write_marker = repository.join("seatbelt-write-marker");
-        let write_checkout = ParsedCommand {
-            executable: PathBuf::from("/usr/bin/touch"),
-            canonical_executable: PathBuf::from("/usr/bin/touch").canonicalize().unwrap(),
-            arguments: vec![write_marker.display().to_string()],
-        };
-        let output = supervise(
-            &repository,
-            &write_checkout,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_keeps_the_checkout_read_only() {
+        let fixture = seatbelt_test_fixture();
+        let write_marker = fixture.repository.join("seatbelt-write-marker");
+        let output = run_seatbelt_command(
+            &fixture,
+            "/usr/bin/touch",
+            vec![write_marker.display().to_string()],
+        );
         assert!(!output.succeeded());
         assert!(!write_marker.exists());
+    }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_disables_loopback_network_access() {
+        let fixture = seatbelt_test_fixture();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
-        let network_probe = ParsedCommand {
-            executable: PathBuf::from("/usr/bin/nc"),
-            canonical_executable: PathBuf::from("/usr/bin/nc").canonicalize().unwrap(),
-            arguments: vec![
+        let output = run_seatbelt_command(
+            &fixture,
+            "/usr/bin/nc",
+            vec![
                 "-z".to_string(),
                 "-w".to_string(),
                 "1".to_string(),
                 "127.0.0.1".to_string(),
                 port,
             ],
-        };
-        let output = supervise(
-            &repository,
-            &network_probe,
-            Some(&sandbox),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        );
         assert!(!output.succeeded());
         drop(listener);
     }
