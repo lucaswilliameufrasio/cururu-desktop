@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::input::{InputState, TextInput};
 use gpui_component::{
-    Disableable as _,
+    Disableable as _, Selectable as _,
     button::{Button, ButtonVariants as _},
 };
 use std::{
@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod diff_view;
 pub mod evaluator;
 pub mod github_auth;
 pub mod github_pr;
@@ -50,12 +51,15 @@ struct DiffLine {
     old_number: Option<usize>,
     new_number: Option<usize>,
     kind: DiffKind,
+    hunk: usize,
     text: SharedString,
 }
 
 struct DiffFile {
     path: SharedString,
     lines: Vec<DiffLine>,
+    split_rows: Vec<diff_view::SplitRow>,
+    split_indices: Vec<usize>,
     added: usize,
     removed: usize,
 }
@@ -116,6 +120,7 @@ struct ReviewWorkspace {
     next_evaluator_request_id: u64,
     selected_file: Option<usize>,
     selected_line: usize,
+    diff_layout: diff_view::DiffLayout,
     diff_scroll_handle: UniformListScrollHandle,
 }
 
@@ -425,6 +430,7 @@ impl ReviewWorkspace {
             selected_file: Some(0),
             selected_line: 42,
             diff_scroll_handle: UniformListScrollHandle::new(),
+            diff_layout: diff_view::DiffLayout::default(),
         }
     }
 
@@ -555,7 +561,7 @@ impl ReviewWorkspace {
         self.selected_line = line_index;
         self.editing_draft = None;
         self.diff_scroll_handle
-            .scroll_to_item(line_index, ScrollStrategy::Center);
+            .scroll_to_item(self.diff_display_index(line_index), ScrollStrategy::Center);
         self.notice = Some(
             format!(
                 "Focused {}:{} from the selected review thread.",
@@ -789,6 +795,7 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
     let mut right_lines = file.right_lines.into_iter();
     let mut added = 0;
     let mut removed = 0;
+    let mut hunk = 0;
 
     for raw_line in file.patch.lines() {
         if raw_line.starts_with("diff --git ")
@@ -798,6 +805,7 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
             continue;
         }
         if let Some(start) = hunk_old_start(raw_line) {
+            hunk += 1;
             old_number = start;
             continue;
         }
@@ -831,13 +839,17 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
             old_number: old,
             new_number: new,
             kind,
+            hunk,
             text: raw_line.to_string().into(),
         });
     }
 
+    let (split_rows, split_indices) = diff_view::split_rows(&lines);
     DiffFile {
         path: file.path.into(),
         lines,
+        split_rows,
+        split_indices,
         added,
         removed,
     }
@@ -1629,6 +1641,170 @@ impl ReviewWorkspace {
             .children(file_rows)
     }
 
+    fn diff_display_index(&self, line_index: usize) -> usize {
+        match self.diff_layout {
+            diff_view::DiffLayout::Unified => line_index,
+            diff_view::DiffLayout::SideBySide => self
+                .selected_file
+                .and_then(|index| self.files[index].split_indices.get(line_index))
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    fn set_diff_layout(&mut self, layout: diff_view::DiffLayout) {
+        self.diff_layout = layout;
+        self.diff_scroll_handle.scroll_to_item(
+            self.diff_display_index(self.selected_line),
+            ScrollStrategy::Center,
+        );
+    }
+
+    fn render_diff_layout_switch(&self, cx: &Context<Self>) -> gpui::Div {
+        let mut buttons = Vec::new();
+        for (layout, id, label) in [
+            (diff_view::DiffLayout::Unified, "diff-unified", "Unified"),
+            (
+                diff_view::DiffLayout::SideBySide,
+                "diff-split",
+                "Side by side",
+            ),
+        ] {
+            let entity = cx.entity();
+            buttons.push(
+                Button::new(id)
+                    .label(label)
+                    .selected(self.diff_layout == layout)
+                    .on_click(move |_event, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.set_diff_layout(layout);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+        div().flex().gap_2().children(buttons)
+    }
+
+    fn render_split_cell(
+        &self,
+        file_index: usize,
+        line_index: Option<usize>,
+        is_left: bool,
+        entity: &Entity<Self>,
+    ) -> gpui::Div {
+        let cell = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h(px(LINE_HEIGHT))
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(rgb(0x002b_3946));
+        let Some(line_index) = line_index else {
+            return cell.bg(rgb(0x0015_1e27));
+        };
+        let line = &self.files[file_index].lines[line_index];
+        let (background, foreground) = match line.kind {
+            DiffKind::Context => (0x0011_1820, 0x00c5_ced8),
+            DiffKind::Added => (0x0018_3126, 0x00b8_dfc4),
+            DiffKind::Removed => (0x003a_2227, 0x00e5_b6ba),
+        };
+        let background = if line_index == self.selected_line {
+            0x0034_4558
+        } else {
+            background
+        };
+        let number = if is_left {
+            line.old_number
+        } else {
+            line.new_number
+        };
+        let entity = entity.clone();
+        div().flex().flex_1().min_w_0().child(
+            cell.id((
+                if is_left { "split-left" } else { "split-right" },
+                line_index,
+            ))
+            .bg(rgb(background))
+            .cursor_pointer()
+            .on_click(move |_event, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.selected_line = line_index;
+                    this.editing_draft = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .w(px(52.0))
+                    .flex_shrink_0()
+                    .text_color(rgb(0x009b_aaba))
+                    .child(number.map_or_else(String::new, |value| value.to_string())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_color(rgb(foreground))
+                    .child(line.text.clone()),
+            ),
+        )
+    }
+
+    fn render_unified_row(
+        &self,
+        line: &DiffLine,
+        index: usize,
+        entity: &Entity<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (background, foreground) = match line.kind {
+            DiffKind::Context => (0x0011_1820, 0x00c5_ced8),
+            DiffKind::Added => (0x0018_3126, 0x00b8_dfc4),
+            DiffKind::Removed => (0x003a_2227, 0x00e5_b6ba),
+        };
+        let background = if index == self.selected_line {
+            0x0034_4558
+        } else {
+            background
+        };
+        let entity = entity.clone();
+        div()
+            .id(index)
+            .flex()
+            .items_center()
+            .h(px(LINE_HEIGHT))
+            .bg(rgb(background))
+            .cursor_pointer()
+            .on_click(move |_event, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.selected_line = index;
+                    this.editing_draft = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .w(px(52.0))
+                    .text_color(rgb(0x009b_aaba))
+                    .child(line.old_number.map_or_else(String::new, |n| n.to_string())),
+            )
+            .child(
+                div()
+                    .w(px(52.0))
+                    .text_color(rgb(0x009b_aaba))
+                    .child(line.new_number.map_or_else(String::new, |n| n.to_string())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .whitespace_nowrap()
+                    .text_color(rgb(foreground))
+                    .child(line.text.clone()),
+            )
+    }
+
     fn render_diff(&self, cx: &Context<Self>) -> impl IntoElement {
         let Some(selected_file) = self.selected_file else {
             let message = self
@@ -1647,6 +1823,10 @@ impl ReviewWorkspace {
         };
         let entity = cx.entity();
         let file = &self.files[selected_file];
+        let row_count = match self.diff_layout {
+            diff_view::DiffLayout::Unified => file.lines.len(),
+            diff_view::DiffLayout::SideBySide => file.split_rows.len(),
+        };
         div()
             .flex()
             .flex_col()
@@ -1658,56 +1838,43 @@ impl ReviewWorkspace {
                     .px_3()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .border_b_1()
                     .border_color(rgb(0x002b_3946))
-                    .child(file.path.clone()),
+                    .child(file.path.clone())
+                    .child(self.render_diff_layout_switch(cx)),
             )
             .child(
                 uniform_list(
                     "review-diff-lines",
-                    file.lines.len(),
+                    row_count,
                     cx.processor(move |this, range: Range<usize>, _window, _cx| {
                         let mut elements = Vec::with_capacity(range.len());
                         let lines = &this.files[selected_file].lines;
                         for index in range {
-                            let line = &lines[index];
-                            let is_selected = index == this.selected_line;
-                            let (background, foreground) = match line.kind {
-                                DiffKind::Context => (0x0011_1820, 0x00c5_ced8),
-                                DiffKind::Added => (0x0018_3126, 0x00b8_dfc4),
-                                DiffKind::Removed => (0x003a_2227, 0x00e5_b6ba),
-                            };
-                            let background = if is_selected { 0x0034_4558 } else { background };
-                            let entity = entity.clone();
-                            elements.push(
-                                div()
-                                    .id(index)
-                                    .flex()
-                                    .items_center()
-                                    .h(px(LINE_HEIGHT))
-                                    .bg(rgb(background))
-                                    .cursor_pointer()
-                                    .on_click(move |_event, _window, cx| {
-                                        entity.update(cx, |this, cx| {
-                                            this.selected_line = index;
-                                            this.editing_draft = None;
-                                            cx.notify();
-                                        });
-                                    })
-                                    .child(div().w(px(52.0)).text_color(rgb(0x0071_8191)).child(
-                                        line.old_number.map_or_else(String::new, |n| n.to_string()),
-                                    ))
-                                    .child(div().w(px(52.0)).text_color(rgb(0x0071_8191)).child(
-                                        line.new_number.map_or_else(String::new, |n| n.to_string()),
-                                    ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .whitespace_nowrap()
-                                            .text_color(rgb(foreground))
-                                            .child(line.text.clone()),
-                                    ),
-                            );
+                            if this.diff_layout == diff_view::DiffLayout::SideBySide {
+                                let row = this.files[selected_file].split_rows[index];
+                                elements.push(
+                                    div()
+                                        .id(index)
+                                        .flex()
+                                        .h(px(LINE_HEIGHT))
+                                        .child(this.render_split_cell(
+                                            selected_file,
+                                            row.left,
+                                            true,
+                                            &entity,
+                                        ))
+                                        .child(this.render_split_cell(
+                                            selected_file,
+                                            row.right,
+                                            false,
+                                            &entity,
+                                        )),
+                                );
+                                continue;
+                            }
+                            elements.push(this.render_unified_row(&lines[index], index, &entity));
                         }
                         elements
                     }),
@@ -3903,8 +4070,10 @@ fn render_local_review_result(
                         {
                             this.selected_file = Some(file_index);
                             this.selected_line = line_index;
-                            this.diff_scroll_handle
-                                .scroll_to_item(line_index, ScrollStrategy::Center);
+                            this.diff_scroll_handle.scroll_to_item(
+                                this.diff_display_index(line_index),
+                                ScrollStrategy::Center,
+                            );
                         }
                         cx.notify();
                     });
@@ -5794,6 +5963,61 @@ mod tests {
         assert_eq!(workspace.files.len(), original_file_count);
         assert_eq!(workspace.selected_file, original_selection);
         assert_eq!(workspace.comment_drafts.len(), original_draft_count);
+    }
+
+    #[test]
+    fn switching_diff_layout_preserves_selection_and_nonempty_drafts() {
+        let mut workspace = ReviewWorkspace::sample();
+        let draft = crate::session_store::StoredCommentDraft {
+            id: 1,
+            draft: cururu_core::ReviewCommentDraft {
+                path: SAMPLE_FILE_PATHS[0].to_string(),
+                line: Some(4),
+                body: "Keep this draft across layouts".to_string(),
+            },
+            base_head_oid: None,
+            created_at: 0,
+            updated_at: 0,
+            revision: 1,
+            is_stale: false,
+        };
+        workspace.comment_drafts.push(draft.clone());
+        workspace.editing_draft = Some(draft.clone());
+        workspace.selected_line = 5;
+        let selected_file = workspace.selected_file;
+        let split_index = workspace.files[0].split_indices[5];
+
+        workspace.set_diff_layout(crate::diff_view::DiffLayout::SideBySide);
+
+        assert_eq!(workspace.diff_display_index(5), split_index);
+        assert_eq!(workspace.files[0].split_rows[split_index].right, Some(5));
+        assert_eq!(workspace.selected_file, selected_file);
+        assert_eq!(workspace.selected_line, 5);
+        assert_eq!(workspace.comment_drafts, vec![draft.clone()]);
+        assert_eq!(workspace.editing_draft, Some(draft.clone()));
+
+        workspace.set_diff_layout(crate::diff_view::DiffLayout::Unified);
+
+        assert_eq!(workspace.diff_display_index(5), 5);
+        assert_eq!(workspace.selected_line, 5);
+        assert_eq!(workspace.comment_drafts, vec![draft.clone()]);
+        assert_eq!(workspace.editing_draft, Some(draft));
+    }
+
+    #[test]
+    fn split_rows_round_trip_every_large_diff_anchor() {
+        let workspace = ReviewWorkspace::sample();
+        for file in &workspace.files {
+            for (index, line) in file.lines.iter().enumerate() {
+                let row = file.split_rows[file.split_indices[index]];
+                if line.old_number.is_some() {
+                    assert_eq!(row.left, Some(index));
+                }
+                if line.new_number.is_some() {
+                    assert_eq!(row.right, Some(index));
+                }
+            }
+        }
     }
 
     #[test]

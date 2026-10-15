@@ -14,6 +14,7 @@ dual-provider second-opinion workflow. The review workspace includes:
 - a repository file rail;
 - a virtualized diff with 10,000 rows;
 - selectable source lines and a finding detail pane;
+- unified and side-by-side layouts with synchronized virtualized scrolling;
 - separately approved local test/analyzer commands for an opened checkout.
 
 Without an argument, the app renders a 10,000-row synthetic unified diff parsed
@@ -125,5 +126,6 @@ cargo run
 On Linux, GPUI's X11/Wayland system dependencies must be installed. CI builds
 Linux x86_64 and ARM64 AppImages, plus macOS Apple Silicon `.app`/`.dmg`
 packages. Packaging is validation-only: CI does not sign, upload, or publish
-these files. AppImage ARM64 remains provisional until its native CI build passes;
-runtime and visual validation remain separate proof items.
+these files. Native CI validated all three packaging targets in run
+`38737417983`, including the macOS Seatbelt tests; runtime and visual validation
+remain separate proof items.

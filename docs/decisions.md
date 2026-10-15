@@ -95,6 +95,22 @@ Keep reviewer policy and prompt behavior in Cururu rather than copying review
 heuristics into the desktop. Revisit consent fingerprint versioning if the
 outbound evidence boundary or destination semantics change.
 
+## Unified and side-by-side diff presentation
+
+- **Status:** Accepted for implementation from the approved desktop plan
+- **Date:** 2026-10-15
+
+Both layouts use the same parsed diff lines and canonical line selection. The
+side-by-side view pairs removals/additions within a contiguous change block in
+one hunk, not by text similarity. Unpaired lines have an empty opposite cell;
+context lines appear on both sides. A click on either populated cell selects
+the original unified line, preserving old/new anchors for threads and drafts.
+Layout switching only changes presentation and scroll position; it never clears
+drafts, publishes, runs analysis, or changes files. Cache row/index mappings per
+file, and keep one virtualized list for synchronized vertical scrolling rather
+than maintaining two independently scrolling panes. Revisit alignment heuristics
+only with real review examples; do not imply semantic equivalence of paired lines.
+
 ## Local review-session persistence
 
 - **Status:** Accepted
