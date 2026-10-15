@@ -99,8 +99,19 @@ individual reply. The app previews the exact PR, head, target comment, and body;
 only **Confirm and publish this reply** sends it. Before sending, the app
 rechecks that the PR is open, its head is unchanged, and the target comment
 still exists. It does not automatically retry an ambiguous request; refresh the
-PR before deciding whether to retry. Batch review submission and general
-conversation comments are not implemented yet.
+PR before deciding whether to retry.
+
+In **Review changes**, select a new-side line to queue a new inline comment.
+Provide a review summary, then preview one comment or all queued comments for
+the exact PR/base/head. Only **Confirm and publish this review** sends a single
+GitHub `COMMENT` review with those comments and summary. The app rechecks that
+the PR is open, base/head are unchanged, anchors remain in the diff, and identical
+comments do not already exist. Requests are never retried automatically. Failed
+or ambiguous writes keep drafts and require a PR refresh before another attempt.
+Queued comments survive mode/layout changes, but are currently in-memory only:
+they do not survive app exit. Stale/other-PR drafts remain visible and cannot be
+sent against a different PR/head. General conversation comments and approval or
+request-changes votes are not implemented yet.
 
 “Understand a review” can optionally run a second opinion through both a
 user-configured OpenAI-compatible chat-completions endpoint and Jev. Configure

@@ -104,6 +104,61 @@ struct CreateThreadReplyRequest<'a> {
     in_reply_to: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NewReviewComment {
+    pub path: String,
+    pub line: u32,
+    pub body: String,
+}
+
+pub fn validate_review_comments(
+    files: &[cururu_core::ChangedFile],
+    comments: &[NewReviewComment],
+) -> anyhow::Result<()> {
+    ensure!(
+        !comments.is_empty() && comments.len() <= 50,
+        "a review requires 1 to 50 inline comments"
+    );
+    let mut total_bytes = 0_usize;
+    for (index, comment) in comments.iter().enumerate() {
+        validate_relative_path(&comment.path)?;
+        validate_thread_reply_body(&comment.body)?;
+        total_bytes = total_bytes.saturating_add(comment.body.len());
+        ensure!(
+            total_bytes <= 64_000,
+            "review comments exceed the 64,000-byte aggregate limit"
+        );
+        ensure!(
+            comment.line > 0
+                && files.iter().any(|file| {
+                    file.path == comment.path && file.right_lines.contains(&comment.line)
+                }),
+            "a review comment is not anchored to the loaded new-side diff"
+        );
+        ensure!(
+            !comments[..index].contains(comment),
+            "the review contains a duplicate comment"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CreateReviewRequest<'a> {
+    commit_id: &'a str,
+    body: &'a str,
+    event: &'static str,
+    comments: Vec<CreateReviewComment<'a>>,
+}
+
+#[derive(Serialize)]
+struct CreateReviewComment<'a> {
+    path: &'a str,
+    line: u32,
+    side: &'static str,
+    body: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestSnapshot {
     pub reference: PullRequestRef,
@@ -341,6 +396,131 @@ impl GitHubPullRequestClient {
             .revalidate_thread_reply_target(reference, expected_head_sha, expected_target, body)
             .await?;
         self.send_thread_reply(reference, &target, body).await
+    }
+
+    pub async fn publish_comment_review(
+        &self,
+        reference: &PullRequestRef,
+        expected_base_sha: &str,
+        expected_head_sha: &str,
+        body: &str,
+        comments: &[NewReviewComment],
+    ) -> anyhow::Result<PullRequestReview> {
+        validate_pull_request_reference(reference)?;
+        validate_thread_reply_body(body)?;
+        ensure!(
+            valid_commit_sha(expected_base_sha) && valid_commit_sha(expected_head_sha),
+            "the confirmed review has invalid commit identifiers"
+        );
+        // Validate sizes and paths before making any remote request. Anchors are
+        // checked against freshly loaded files, never against user input alone.
+        ensure!(
+            !comments.is_empty() && comments.len() <= 50,
+            "a review requires 1 to 50 inline comments"
+        );
+        let mut total_bytes = 0_usize;
+        for comment in comments {
+            validate_relative_path(&comment.path)?;
+            validate_thread_reply_body(&comment.body)?;
+            total_bytes = total_bytes.saturating_add(comment.body.len());
+        }
+        ensure!(
+            total_bytes <= 64_000,
+            "review comments exceed the aggregate limit"
+        );
+        let current = self.load_pull_request(reference.clone()).await?;
+        ensure!(
+            current.state == "open",
+            "the pull request is no longer open; refresh before publishing"
+        );
+        ensure!(
+            current.head_sha == expected_head_sha && current.base_sha == expected_base_sha,
+            "the pull request base or head changed; refresh and preview again"
+        );
+        validate_review_comments(&current.files, comments)?;
+        for comment in comments {
+            ensure!(
+                !current.review_threads.iter().any(|thread| {
+                    let existing = &thread.root;
+                    existing.path == comment.path
+                        && existing.line == Some(comment.line)
+                        && existing.side.as_deref() == Some("RIGHT")
+                        && existing.commit_id == expected_head_sha
+                        && existing.body == comment.body
+                }),
+                "an identical comment already exists at this anchor; refresh before publishing"
+            );
+        }
+        self.send_comment_review(reference, expected_head_sha, body, comments)
+            .await
+    }
+
+    async fn send_comment_review(
+        &self,
+        reference: &PullRequestRef,
+        head_sha: &str,
+        summary: &str,
+        comments: &[NewReviewComment],
+    ) -> anyhow::Result<PullRequestReview> {
+        let body = serde_json::to_string(&CreateReviewRequest {
+            commit_id: head_sha,
+            body: summary,
+            event: "COMMENT",
+            comments: comments
+                .iter()
+                .map(|comment| CreateReviewComment {
+                    path: &comment.path,
+                    line: comment.line,
+                    side: "RIGHT",
+                    body: &comment.body,
+                })
+                .collect(),
+        })?;
+        let url = format!(
+            "{API_ROOT}/repos/{}/{}/pulls/{}/reviews",
+            reference.owner, reference.repository, reference.number
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header("User-Agent", "Cururu-Desktop")
+            .body(AsyncBody::from(body))?;
+        let response = self.http.send(request).await.context(
+            "GitHub did not confirm publication; refresh before deciding whether to retry",
+        )?;
+        let (parts, mut body) = response.into_parts();
+        ensure!(
+            parts.status == StatusCode::OK,
+            "GitHub returned HTTP {} for review publication; refresh before retrying",
+            parts.status
+        );
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame?.into_data() {
+                ensure!(
+                    bytes.len().saturating_add(data.len()) <= MAX_MUTATION_RESPONSE_BYTES,
+                    "GitHub review response exceeded the size limit; refresh before retrying"
+                );
+                bytes.extend_from_slice(&data);
+            }
+        }
+        let response: PullRequestReviewResponse = serde_json::from_slice(&bytes)?;
+        let review = parse_pull_request_reviews(vec![response])?
+            .pop()
+            .context("GitHub did not return the created review")?;
+        ensure!(
+            review.id > 0
+                && review.body == summary
+                && review.state == "COMMENTED"
+                && review.commit_id.as_deref() == Some(head_sha),
+            "GitHub returned a different review; refresh before retrying"
+        );
+        Ok(review)
     }
 
     async fn revalidate_thread_reply_target(
@@ -1000,6 +1180,237 @@ mod tests {
             subject_type: None,
             side: None,
         }
+    }
+
+    const REVIEW_PR: &str = r#"{"number":42,"title":"Parser review","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"author"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+    const REVIEW_FILES: &str = r#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-before\n+after"}]"#;
+    const CREATED_REVIEW: &str = r#"{"id":91,"state":"COMMENTED","body":"Review notes","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/octo-org/review_repo/pull/42#pullrequestreview-91","user":{"login":"reviewer"}}"#;
+
+    fn review_comment() -> super::NewReviewComment {
+        super::NewReviewComment {
+            path: "src/lib.rs".to_string(),
+            line: 1,
+            body: "Please preserve this check.".to_string(),
+        }
+    }
+
+    fn review_client(
+        comments: &'static str,
+        post_status: StatusCode,
+    ) -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
+        let http = Arc::new(FakeHttpClient {
+            responses: Mutex::new(VecDeque::from([
+                response(REVIEW_PR),
+                response(REVIEW_FILES),
+                response(comments),
+                response("[]"),
+                response("[]"),
+                response_with_status(post_status, CREATED_REVIEW),
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        (
+            GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string()).unwrap(),
+            http,
+        )
+    }
+
+    #[test]
+    fn comment_review_sends_one_head_bound_request_after_full_revalidation() {
+        futures::executor::block_on(async {
+            let (client, http) = review_client("[]", StatusCode::OK);
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let review = client
+                .publish_comment_review(
+                    &reference,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "Review notes",
+                    &[review_comment()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(review.id, 91);
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            let post = &requests[5];
+            assert_eq!(post.method, "POST");
+            assert!(post.uri.ends_with("/pulls/42/reviews"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&post.body).unwrap(),
+                serde_json::json!({
+                    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "event": "COMMENT", "body": "Review notes",
+                    "comments": [{"path": "src/lib.rs", "line": 1, "side": "RIGHT", "body": "Please preserve this check."}]
+                })
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn comment_review_rejects_changed_base_head_and_missing_anchors_without_a_post() {
+        futures::executor::block_on(async {
+            for (base, head, line) in [
+                (
+                    "cccccccccccccccccccccccccccccccccccccccc",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    1,
+                ),
+                (
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "cccccccccccccccccccccccccccccccccccccccc",
+                    1,
+                ),
+                (
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    999,
+                ),
+            ] {
+                let (client, http) = review_client("[]", StatusCode::OK);
+                let mut comment = review_comment();
+                comment.line = line;
+                assert!(
+                    client
+                        .publish_comment_review(
+                            &PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                            base,
+                            head,
+                            "Review notes",
+                            &[comment]
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    http.requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|request| request.method == "GET")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn comment_review_blocks_duplicates_and_never_retries_a_rejected_write() {
+        futures::executor::block_on(async {
+            let existing = r#"[{"id":7,"path":"src/lib.rs","line":1,"body":"Please preserve this check.","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","side":"RIGHT","user":{"login":"reviewer"}}]"#;
+            for (comments, status, expected_posts) in [
+                (existing, StatusCode::OK, 0),
+                ("[]", StatusCode::UNPROCESSABLE_ENTITY, 1),
+                ("[]", StatusCode::TEMPORARY_REDIRECT, 1),
+            ] {
+                let (client, http) = review_client(comments, status);
+                assert!(
+                    client
+                        .publish_comment_review(
+                            &PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "Review notes",
+                            &[review_comment()]
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    http.requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request.method == "POST")
+                        .count(),
+                    expected_posts
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn comment_review_rejects_closed_pr_and_unconfirmed_success_records() {
+        futures::executor::block_on(async {
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            let (client, http) = review_client("[]", StatusCode::OK);
+            http.responses.lock().unwrap()[0] = response(
+                r#"{"number":42,"title":"Parser review","state":"closed","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"author"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            );
+            assert!(
+                client
+                    .publish_comment_review(
+                        &reference,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Review notes",
+                        &[review_comment()]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                http.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+            let (client, http) = review_client("[]", StatusCode::OK);
+            // A 200 alone is not proof the confirmed review was created.
+            http.responses.lock().unwrap()[5] = response("{}");
+            assert!(
+                client
+                    .publish_comment_review(
+                        &reference,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Review notes",
+                        &[review_comment()]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                http.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.method == "POST")
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn comment_review_validation_is_bounded_and_rejects_invalid_input_before_network() {
+        let files =
+            super::parse_pull_request_files(serde_json::from_str(REVIEW_FILES).unwrap()).unwrap();
+        assert!(super::validate_review_comments(&files, &[]).is_err());
+        assert!(
+            super::validate_review_comments(&files, &[review_comment(), review_comment()]).is_err()
+        );
+        let mut oversized = review_comment();
+        oversized.body = "x".repeat(10_001);
+        assert!(super::validate_review_comments(&files, &[oversized]).is_err());
+        futures::executor::block_on(async {
+            let (client, http) = api_client(&[]);
+            let mut invalid = review_comment();
+            invalid.path = "../secret".to_string();
+            assert!(
+                client
+                    .publish_comment_review(
+                        &PullRequestRef::parse("octo/repo#1").unwrap(),
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Review notes",
+                        &[invalid]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(http.requests.lock().unwrap().is_empty());
+        });
     }
 
     #[test]

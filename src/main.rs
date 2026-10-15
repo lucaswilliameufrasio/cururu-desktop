@@ -28,6 +28,7 @@ pub mod github_pr;
 pub mod local_command;
 pub mod local_review;
 pub mod repository;
+mod review_publication;
 pub mod session_store;
 pub mod suggested_change;
 
@@ -102,6 +103,9 @@ struct ReviewWorkspace {
     remote_review_state: RemoteReviewState,
     remote_source_context: RemoteSourceContextState,
     remote_reply_input: Option<Entity<InputState>>,
+    remote_comment_input: Option<Entity<InputState>>,
+    remote_review_summary_input: Option<Entity<InputState>>,
+    review_publication: review_publication::ReviewPublication,
     thread_reply_state: ThreadReplyState,
     review_mode: ReviewMode,
     selected_remote_comment: Option<github_pr::PullRequestComment>,
@@ -411,6 +415,9 @@ impl ReviewWorkspace {
             remote_review_state: RemoteReviewState::Idle,
             remote_source_context: RemoteSourceContextState::Idle,
             remote_reply_input: None,
+            remote_comment_input: None,
+            remote_review_summary_input: None,
+            review_publication: review_publication::ReviewPublication::default(),
             thread_reply_state: ThreadReplyState::Idle,
             review_mode: ReviewMode::ReviewChanges,
             selected_remote_comment: None,
@@ -917,6 +924,7 @@ impl ReviewWorkspace {
             }));
         }
         self.ensure_local_command_input(window, cx);
+        self.ensure_review_comment_input(window, cx);
         if self.pull_request_input.is_none() {
             self.pull_request_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
@@ -1237,7 +1245,8 @@ impl ReviewWorkspace {
         let input = self.pull_request_input.as_ref().map(TextInput::new);
         let input_entity = self.pull_request_input.clone();
         let is_publishing_reply =
-            matches!(&self.thread_reply_state, ThreadReplyState::Publishing(_));
+            matches!(&self.thread_reply_state, ThreadReplyState::Publishing(_))
+                || self.review_publication.is_publishing();
         let is_applying_suggestion = matches!(
             &self.suggested_change_state,
             SuggestedChangeState::Applying(_)
@@ -2001,7 +2010,8 @@ impl ReviewWorkspace {
                     "{} changed files at head {}",
                     snapshot.files.len(),
                     short_sha(&snapshot.head_sha)
-                )),
+                ))
+                .child(self.render_comment_review(cx, snapshot, path, selected_line)),
             (ReviewMode::UnderstandReview, _) => div()
                 .flex()
                 .flex_col()
@@ -2843,7 +2853,8 @@ fn begin_thread_reply_confirmation(
         });
         let body_is_valid = github_pr::validate_thread_reply_body(&pending.body).is_ok();
         let no_publication_is_running =
-            !matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_));
+            !matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
+                && !this.review_publication.is_publishing();
         if !pull_request_matches
             || !selected_comment_matches
             || !body_is_valid
@@ -4783,6 +4794,7 @@ fn start_thread_reply_publication(
                 && credentials.access_token.eq(&access_token)
         });
         if !confirmation_is_current
+            || this.review_publication.is_publishing()
             || !pull_request_is_current
             || !selected_comment_is_current
             || !credentials_are_current
@@ -5076,6 +5088,7 @@ fn handle_open_pull_request(
             return false;
         }
         if matches!(this.remote_review_state, RemoteReviewState::Loading(_))
+            || this.review_publication.is_publishing()
             || matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
             || matches!(
                 &this.suggested_change_state,
@@ -5128,6 +5141,7 @@ fn start_pull_request_load(
         let _ = entity.update(cx, |this, cx| {
             match result {
                 Ok(snapshot) => {
+                    this.review_publication.refreshed();
                     this.files = snapshot
                         .files
                         .iter()
