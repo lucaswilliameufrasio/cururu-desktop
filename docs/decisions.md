@@ -273,6 +273,26 @@ UI also keeps the exact successful reply visible and blocks an accidental
 identical repeat in that thread. This workflow does not modify local files,
 stage, commit, or push.
 
+### New inline comments and batch comment reviews
+
+- **Status:** Accepted for implementation from the approved publication journey
+- **Date:** 2026-10-15
+
+User-authored comments on new-side diff lines can be queued in memory and sent
+individually or together as one GitHub `COMMENT` review. Before any write, preview
+the PR, base/head identities, exact anchors, and full bodies; require a separate
+confirmation. Require a user-authored summary (GitHub requires a body for the
+`COMMENT` event); include it unchanged in the preview and request. Revalidate
+that the PR is open, both SHAs are unchanged, every
+anchor still exists, and no identical comment already exists at the same anchor.
+Send one create-review request bound to the confirmed head, without redirects
+or automatic retries. Preserve drafts after errors and require refresh after an
+ambiguous outcome; never automatically resend. Mode/layout changes do not discard
+drafts. A draft remains scoped to its exact PR/head. Approve/request-changes votes,
+general conversation comments, persistence of remote drafts, and applying remote
+suggestions remain distinct slices; this feature neither runs code nor edits a
+checkout. No live GitHub publication is authorized by implementation approval.
+
 ### Review understanding evaluators
 
 Both a user-configured OpenAI-compatible chat-completions provider and Jev are
