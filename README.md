@@ -108,9 +108,13 @@ GitHub `COMMENT` review with those comments and summary. The app rechecks that
 the PR is open, base/head are unchanged, anchors remain in the diff, and identical
 comments do not already exist. Requests are never retried automatically. Failed
 or ambiguous writes keep drafts and require a PR refresh before another attempt.
-Queued comments survive mode/layout changes, but are currently in-memory only:
-they do not survive app exit. Stale/other-PR drafts remain visible and cannot be
-sent against a different PR/head. General conversation comments and approval or
+Queued comments survive mode/layout changes. **Save queued comments and summary
+locally** explicitly persists them in SQLite; saved drafts are restored on app
+startup without sending anything. Later edits, removals, or publication require
+another save to update that local snapshot. Concurrent saves from another app
+instance are rejected instead of overwriting its drafts. Tokens and source
+snapshots are never part of this record. Stale/other-PR drafts remain visible and
+cannot be sent against a different PR/head. General conversation comments and approval or
 request-changes votes are not implemented yet.
 
 “Understand a review” can optionally run a second opinion through both a

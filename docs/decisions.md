@@ -289,9 +289,22 @@ Send one create-review request bound to the confirmed head, without redirects
 or automatic retries. Preserve drafts after errors and require refresh after an
 ambiguous outcome; never automatically resend. Mode/layout changes do not discard
 drafts. A draft remains scoped to its exact PR/head. Approve/request-changes votes,
-general conversation comments, persistence of remote drafts, and applying remote
+general conversation comments and applying remote
 suggestions remain distinct slices; this feature neither runs code nor edits a
 checkout. No live GitHub publication is authorized by implementation approval.
+
+An explicit local save persists the bounded draft queue and summary in schema 6
+of the existing SQLite database; startup restores it without sending any content.
+Only PR/base/head identities, paths/lines and user-authored bodies are stored, not
+credentials or source snapshots. Saves use an immediate transaction and an
+optimistic revision over the queue to reject stale multi-instance writers.
+Database work for the save runs on the background executor. Edits/removals and
+successful publication change the in-memory queue; saving again updates the
+durable snapshot. If the stored snapshot includes a previously published draft,
+publication revalidation must still reject a duplicate rather than resending it.
+Invalid stored data fails closed, is not silently deleted, and disables writes
+from that app instance. Revisit whole-queue revisions if independent multi-instance
+editing of separate PRs becomes necessary.
 
 ### Review understanding evaluators
 
@@ -321,7 +334,7 @@ rollout criteria have been separately calibrated.
 
 ## Local test and analyzer execution
 
-- **Status:** Linux Bubblewrap implemented; macOS Seatbelt implemented, native validation pending
+- **Status:** Linux Bubblewrap and macOS Seatbelt validated in native CI; interactive validation pending
 - **Date:** 2026-10-14
 
 Running a test or analyzer is a separate, explicit action from reviewing code.
