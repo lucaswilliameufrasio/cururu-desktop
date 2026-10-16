@@ -12,7 +12,6 @@ pub const MAX_LOCAL_FILE_DIFF_BYTES: usize = 45_000;
 pub const MAX_LOCAL_DIFF_BYTES: usize = 180_000;
 pub const MAX_LOCAL_REVIEW_FILES: usize = 100;
 pub const MAX_LOCAL_REVIEW_CHUNKS: usize = 4;
-const REVIEW_CHUNK_BYTES: usize = MAX_LOCAL_FILE_DIFF_BYTES;
 const MAX_REVIEW_FINDINGS: usize = 100;
 const REVIEW_MAX_OUTPUT_TOKENS: u32 = 4_000;
 const REVIEW_TEMPERATURE: f32 = 0.1;
@@ -61,6 +60,12 @@ impl LocalReviewSecrets {
 }
 
 #[derive(Debug, Clone)]
+pub struct PolicySuppressedFinding {
+    pub finding: cururu_core::ReviewFinding,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalReviewResult {
     pub review: cururu_core::ReviewResult,
     pub usage: Option<cururu_engine::ReviewUsage>,
@@ -69,6 +74,7 @@ pub struct LocalReviewResult {
     pub diff_bytes: usize,
     pub chunk_count: usize,
     pub discarded_findings: usize,
+    pub policy_suppressed: Vec<PolicySuppressedFinding>,
 }
 
 pub fn repository_identity(root: &Path) -> anyhow::Result<String> {
@@ -116,6 +122,11 @@ fn system_prompt() -> String {
 pub fn snapshot_fingerprint(snapshot: &RepositorySnapshot) -> String {
     let mut digest = Sha256::new();
     digest.update(b"cururu-desktop-local-review-diff-v1\0");
+    match &snapshot.review_policy {
+        Ok(policy) => digest.update(policy.fingerprint.as_bytes()),
+        Err(error) => digest.update(error.as_bytes()),
+    }
+    digest.update([0]);
     digest.update(
         snapshot
             .head_oid
@@ -146,6 +157,15 @@ pub fn validate_snapshot(snapshot: &RepositorySnapshot) -> anyhow::Result<usize>
     bounded_chunks(snapshot).map(|chunks| chunks.len())
 }
 
+pub fn outbound_stats(snapshot: &RepositorySnapshot) -> anyhow::Result<(usize, usize)> {
+    let policy = snapshot
+        .review_policy
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let files = policy.review_files(&snapshot.changed_files)?;
+    Ok((files.len(), files.iter().map(|file| file.patch.len()).sum()))
+}
+
 pub async fn review_snapshot(
     settings: &LocalReviewSettings,
     secrets: &LocalReviewSecrets,
@@ -168,25 +188,25 @@ pub async fn review_snapshot(
 }
 
 fn bounded_chunks(snapshot: &RepositorySnapshot) -> anyhow::Result<Vec<cururu_core::DiffChunk>> {
+    let policy = snapshot.review_policy.as_ref().map_err(|error| {
+        anyhow::anyhow!("Repository review configuration blocks sending: {error}")
+    })?;
+    let files = policy.review_files(&snapshot.changed_files)?;
     anyhow::ensure!(
-        !snapshot.changed_files.is_empty(),
+        !files.is_empty(),
         "there are no changed-file diffs to review"
     );
     anyhow::ensure!(
-        snapshot.changed_files.len() <= MAX_LOCAL_REVIEW_FILES,
+        files.len() <= MAX_LOCAL_REVIEW_FILES,
         "local review is limited to 100 changed files per request"
     );
     cururu_core::ensure_review_diff_limits(
-        &snapshot.changed_files,
+        &files,
         MAX_LOCAL_FILE_DIFF_BYTES,
-        MAX_LOCAL_DIFF_BYTES,
+        policy.max_diff_bytes,
     )
     .map_err(|error| anyhow::anyhow!(error).context("local review diff exceeds its size limit"))?;
-    let chunks = cururu_core::chunk_files(
-        &snapshot.changed_files,
-        REVIEW_CHUNK_BYTES,
-        MAX_LOCAL_DIFF_BYTES,
-    );
+    let chunks = cururu_core::chunk_files(&files, policy.chunk_bytes, policy.max_diff_bytes);
     anyhow::ensure!(
         !chunks.is_empty() && chunks.len() <= MAX_LOCAL_REVIEW_CHUNKS,
         "local review exceeds the bounded chunk limit"
@@ -205,13 +225,18 @@ fn assemble_review_result(
         "local review did not return a complete bounded chunk set"
     );
     let usage = cururu_engine::merge_usage(&chunk_results);
+    let policy = snapshot
+        .review_policy
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("Repository review configuration is invalid: {error}"))?;
+    let reviewed_files = policy.review_files(&snapshot.changed_files)?;
     let reviews = chunk_results
         .into_iter()
         .map(|chunk_result| chunk_result.review)
         .collect();
     let mut review = cururu_core::collect_review_candidates(
         settings.openai_model.clone(),
-        snapshot.changed_files.len(),
+        reviewed_files.len(),
         reviews,
         Vec::new(),
         cururu_core::CandidateOptions {
@@ -225,15 +250,39 @@ fn assemble_review_result(
         let has_valid_severity = cururu_core::Severity::from_name(&finding.severity).is_some();
         let has_valid_confidence =
             finding.confidence.is_finite() && (0.0..=1.0).contains(&finding.confidence);
-        let has_valid_anchor = finding.line.is_some_and(|line| {
-            cururu_core::is_valid_anchor(&snapshot.changed_files, &finding.path, line)
-        });
+        let has_valid_anchor = finding
+            .line
+            .is_some_and(|line| cururu_core::is_valid_anchor(&reviewed_files, &finding.path, line));
         has_valid_severity && has_valid_confidence && has_valid_anchor
     });
-    review.findings.truncate(MAX_REVIEW_FINDINGS);
-    let discarded_findings = candidate_count.saturating_sub(review.findings.len());
+    let mut policy_suppressed = Vec::new();
+    for mut finding in std::mem::take(&mut review.findings) {
+        if !policy.suggested_changes {
+            finding.suggested_change = None;
+        }
+        if finding.confidence >= policy.minimum_confidence
+            && cururu_core::Severity::from_name(&finding.severity)
+                .is_some_and(|severity| policy.allowed_severities.contains(&severity))
+            && review.findings.len() < policy.max_findings.min(MAX_REVIEW_FINDINGS)
+        {
+            review.findings.push(finding);
+        } else {
+            let reason = if finding.confidence < policy.minimum_confidence {
+                "below repository minimum confidence"
+            } else if !cururu_core::Severity::from_name(&finding.severity)
+                .is_some_and(|severity| policy.allowed_severities.contains(&severity))
+            {
+                "severity excluded by repository policy"
+            } else {
+                "local/repository finding-count limit"
+            };
+            policy_suppressed.push(PolicySuppressedFinding { finding, reason });
+        }
+    }
+    let discarded_findings =
+        candidate_count.saturating_sub(review.findings.len() + policy_suppressed.len());
     review.summary = format!(
-        "Found {} anchored review finding(s); discarded {} invalid or excess candidate(s).",
+        "Found {} anchored review finding(s); discarded {} invalid candidate(s).",
         review.findings.len(),
         discarded_findings
     );
@@ -243,9 +292,10 @@ fn assemble_review_result(
         usage,
         diff_fingerprint: snapshot_fingerprint(snapshot),
         head_oid: snapshot.head_oid.clone(),
-        diff_bytes: diff_byte_count(snapshot),
+        diff_bytes: reviewed_files.iter().map(|file| file.patch.len()).sum(),
         chunk_count,
         discarded_findings,
+        policy_suppressed,
     })
 }
 
@@ -311,6 +361,7 @@ mod tests {
             head_oid: Some("abc123".to_string()),
             changed_paths: files.iter().map(|file| file.path.clone()).collect(),
             changed_files: files,
+            review_policy: Ok(crate::repository_policy::RepositoryPolicy::default()),
         }
     }
 
@@ -412,6 +463,62 @@ mod tests {
         assert_eq!(result.review.findings.len(), 1);
         assert_eq!(result.discarded_findings, 5);
         assert!(result.review.findings[0].suggested_change.is_some());
+    }
+
+    #[test]
+    fn repository_restrictions_limit_outbound_evidence_and_keep_policy_audit() {
+        let mut snapshot = snapshot(vec![
+            changed_file("src/lib.rs", "+allowed", &[1, 2]),
+            changed_file("ignored.rs", "+hidden", &[1]),
+            changed_file(".cururu.toml", "+private configuration", &[1]),
+        ]);
+        snapshot.review_policy = Ok(crate::repository_policy::RepositoryPolicy::parse(
+            "version = 1\n[review]\nignore = ['ignored.rs']\n[policy]\nminimum_confidence = 0.95\nsuggested_changes = false").unwrap());
+        let chunks = bounded_chunks(&snapshot).unwrap();
+        let outbound = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert!(outbound.contains("+allowed"));
+        assert!(!outbound.contains("+hidden"));
+        assert!(!outbound.contains("private configuration"));
+        let mut low_confidence = finding("src/lib.rs", Some(1));
+        low_confidence.confidence = 0.9;
+        let mut retained = finding("src/lib.rs", Some(2));
+        retained.confidence = 0.99;
+        retained.suggested_change = Some(cururu_core::SuggestedChange {
+            replacement: "safe()".to_string(),
+        });
+        let chunk = cururu_engine::ChunkResult {
+            review: ReviewResult {
+                model: "ignored".to_string(),
+                files_reviewed: 9,
+                summary: String::new(),
+                findings: vec![low_confidence, retained, finding("ignored.rs", Some(1))],
+            },
+            usage: None,
+        };
+        let result = assemble_review_result(
+            &settings("https://api.example.test/v1", "model"),
+            &snapshot,
+            vec![chunk],
+        )
+        .unwrap();
+        assert_eq!(result.review.files_reviewed, 1);
+        assert_eq!(result.review.findings.len(), 1);
+        assert!(result.review.findings[0].suggested_change.is_none());
+        assert_eq!(result.policy_suppressed.len(), 1);
+        assert_eq!(
+            result.policy_suppressed[0].reason,
+            "below repository minimum confidence"
+        );
+        assert_eq!(result.discarded_findings, 1);
+        let mut changed = snapshot.clone();
+        changed.review_policy = Ok(crate::repository_policy::RepositoryPolicy::default());
+        assert_ne!(
+            snapshot_fingerprint(&snapshot),
+            snapshot_fingerprint(&changed)
+        );
     }
 
     #[test]

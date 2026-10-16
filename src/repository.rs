@@ -9,13 +9,14 @@ const MAX_LOCAL_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LOCAL_FILE_DIFF_BYTES: usize = 45_000;
 const MAX_LOCAL_DIFF_BYTES: usize = 180_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: Option<String>,
     pub head_oid: Option<String>,
     pub changed_paths: Vec<String>,
     pub changed_files: Vec<cururu_core::ChangedFile>,
+    pub review_policy: Result<crate::repository_policy::RepositoryPolicy, String>,
 }
 
 impl RepositorySnapshot {
@@ -62,6 +63,8 @@ impl RepositorySnapshot {
         changed_paths.sort();
         changed_paths.dedup();
         let changed_files = changed_files(&repository, &root, &changed_paths)?;
+        let review_policy = crate::repository_policy::RepositoryPolicy::load(&root)
+            .map_err(|error| error.to_string());
 
         Ok(Self {
             root,
@@ -69,7 +72,43 @@ impl RepositorySnapshot {
             head_oid,
             changed_paths,
             changed_files,
+            review_policy,
         })
+    }
+}
+
+#[cfg(test)]
+mod policy_integration_tests {
+    use super::RepositorySnapshot;
+
+    #[test]
+    fn ignored_configuration_changes_invalidate_review_without_breaking_manual_review() {
+        let root = tempfile::tempdir().unwrap();
+        gix::init(root.path()).unwrap();
+        std::fs::write(root.path().join(".gitignore"), ".cururu.toml\n").unwrap();
+        std::fs::write(root.path().join("source.rs"), "changed\n").unwrap();
+        std::fs::write(
+            root.path().join(".cururu.toml"),
+            "version = 1\n[policy]\nmax_findings = 1\n",
+        )
+        .unwrap();
+        let before = RepositorySnapshot::open(root.path()).unwrap();
+        std::fs::write(
+            root.path().join(".cururu.toml"),
+            "version = 1\n[policy]\nmax_findings = 2\n",
+        )
+        .unwrap();
+        let after = RepositorySnapshot::open(root.path()).unwrap();
+        assert_eq!(before.changed_files, after.changed_files);
+        assert_ne!(
+            crate::local_review::snapshot_fingerprint(&before),
+            crate::local_review::snapshot_fingerprint(&after)
+        );
+        std::fs::write(root.path().join(".cururu.toml"), "version = 'invalid'").unwrap();
+        let manual = RepositorySnapshot::open(root.path()).unwrap();
+        assert_eq!(manual.changed_files, before.changed_files);
+        assert!(manual.review_policy.is_err());
+        assert!(crate::local_review::validate_snapshot(&manual).is_err());
     }
 }
 

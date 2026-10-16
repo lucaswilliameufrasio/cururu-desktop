@@ -15,10 +15,11 @@ icons = ["assets/cururu-icon.png"]
 [dependencies]
 anyhow = "1"
 base64 = "=0.22.1"
-cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "90b8869" }
-cururu-engine = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "90b8869" }
+cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "c4428b1" }
+cururu-engine = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "c4428b1" }
 directories = "6"
 futures = "0.3"
+globset = "0.4"
 gpui = "0.2.2"
 gpui-component = { version = "=0.3.0", default-features = false }
 gix = { version = "=0.85.0", default-features = false, features = ["basic", "parallel", "sha1", "status"] }

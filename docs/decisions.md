@@ -68,7 +68,35 @@ The initial extraction exposes the existing `ReviewAgent` contract, usage and
 chunk result types, sequential fail-closed chunk orchestration, and the
 canonical Cururu review prompt. The desktop consumes these contracts for its
 local OpenAI-compatible reviewer; both crates are pinned to engine commit
-`90b8869`.
+`c4428b1` (including the shared configuration schema).
+
+### Shared repository configuration boundary
+
+- **Status:** Accepted by the user
+- **Date:** 2026-10-16
+
+Use `cururu-engine::config` for the versioned `.cururu.toml` shape/parser and
+portable validation. Environment, credentials, runtime merging, SCM, filesystem
+access and permissions stay in hosts (Cururu ADR 006). Do not copy the CLI schema
+or import all `AppConfig`. The initial desktop interpretation is restriction-only:
+`review.max_diff_bytes`, `chunk_bytes`, `ignore`, and `policy.minimum_confidence`,
+`max_findings`, `allowed_severities`, `suggested_changes`. Repository limits are
+intersected with desktop ceilings; provider fields never change the locally
+configured destination/model/key. `[evaluator]` is rejected, not activated.
+
+Read only the regular, non-symlink `.cururu.toml` at the selected root, bounded to
+64 KiB, on the background repository-snapshot path. Do not load shared bases,
+context files, analyzers, prompts, or environment files implicitly. Unsupported
+review/policy settings and `[config]`, `[context]`, `[analysis]` fail closed for AI
+review while manual diff/drafts remain available. `[summary]` is not applied.
+Surface this partial support rather than pretending full CLI configuration is
+implemented. The config file's own patch is excluded from outbound evidence.
+
+Hash the raw config into the snapshot identity, including when Git ignores it,
+and revalidate before/after review. Repository restrictions cannot replace local
+consent. Keep valid policy-suppressed findings and their reasons visible for
+audit; this is not evaluator filtering, which remains observe-only. Extending
+outbound context/focus later requires an explicit bounded evidence/consent design.
 
 ### Local code review and provider consent
 
