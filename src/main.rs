@@ -28,6 +28,7 @@ pub mod github_pr;
 pub mod local_command;
 pub mod local_review;
 pub mod repository;
+mod repository_policy;
 mod review_publication;
 pub mod session_store;
 pub mod suggested_change;
@@ -2201,6 +2202,7 @@ impl ReviewWorkspace {
             ))
             .child(validation_message)
             .child(render_local_review_limits())
+            .child("Repository .cururu.toml may only restrict review limits/files/findings; provider destinations and consent remain local.")
             .child(authorization_message)
             .child(authorization_button)
             .child(send_button)
@@ -3314,11 +3316,12 @@ fn local_review_validation_message(
     validation: anyhow::Result<usize>,
 ) -> String {
     match validation {
-        Ok(chunks) => format!(
-            "{} changed files · {} bytes · {chunks} bounded chunk(s)",
-            snapshot.changed_files.len(),
-            local_review::diff_byte_count(snapshot)
-        ),
+        Ok(chunks) => match local_review::outbound_stats(snapshot) {
+            Ok((files, bytes)) => format!(
+                "{files} eligible changed files · {bytes} bytes · {chunks} bounded chunk(s) · repository policy applied; provider section ignored"
+            ),
+            Err(error) => format!("Local review unavailable: {error}"),
+        },
         Err(error) => format!("Local review unavailable: {error}"),
     }
 }
@@ -4107,7 +4110,30 @@ fn render_local_review_result(
             result.diff_bytes
         ))
         .child(result.review.summary.clone())
+        .child(render_policy_suppressions(result))
         .children(rows)
+}
+
+fn render_policy_suppressions(result: &local_review::LocalReviewResult) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(format!(
+            "{} valid finding(s) retained for repository-policy audit (not evaluator filtering)",
+            result.policy_suppressed.len()
+        ))
+        .children(result.policy_suppressed.iter().map(|suppressed| {
+            div().p_2().child(format!(
+                "{} · {}:{} · {}\n{}\n{}",
+                suppressed.reason,
+                suppressed.finding.path,
+                suppressed.finding.line.unwrap_or_default(),
+                suppressed.finding.severity,
+                suppressed.finding.title,
+                suppressed.finding.message
+            ))
+        }))
 }
 
 fn render_suggested_change_state(

@@ -1388,7 +1388,7 @@ dependencies = [
 [[package]]
 name = "cururu-core"
 version = "0.1.0"
-source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=90b8869#90b8869d7863889f2de4e188f72757e879ae3f77"
+source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=c4428b1#c4428b155bbf69f9dce88b6aac9700e988b05055"
 dependencies = [
  "globset",
  "schemars",
@@ -1406,6 +1406,7 @@ dependencies = [
  "directories",
  "futures",
  "gix",
+ "globset",
  "gpui",
  "gpui-component",
  "http-body-util",
@@ -1424,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "cururu-engine"
 version = "0.1.0"
-source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=90b8869#90b8869d7863889f2de4e188f72757e879ae3f77"
+source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=c4428b1#c4428b155bbf69f9dce88b6aac9700e988b05055"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1432,8 +1433,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "thiserror 2.0.21",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
@@ -6180,9 +6183,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
@@ -6495,6 +6498,17 @@ dependencies = [
  "memchr",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

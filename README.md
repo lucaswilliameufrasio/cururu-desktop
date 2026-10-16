@@ -59,6 +59,20 @@ suggestion can be previewed as a local diff; only a separate confirmation applie
 it after rechecking the reviewed diff and exact file contents. Applying a
 suggestion does not run commands, stage, commit, or push.
 
+Local review reads a regular `.cururu.toml` at the checkout root (up to 64 KiB)
+using the shared engine schema. The initial desktop support is restriction-only:
+`review.max_diff_bytes`, `chunk_bytes`, `ignore`, and `policy.minimum_confidence`,
+`max_findings`, `allowed_severities`, `suggested_changes`. Limits cannot exceed
+the desktop ceilings. Valid policy-suppressed findings remain visible with a
+reason. Provider settings in the repository are ignored: destination/model/key
+and consent remain local. The config file's patch is not sent for review.
+Configuration changes invalidate an in-flight review even when Git ignores the
+file. Unsupported or invalid configuration blocks AI review; manual diff/drafts
+remain available subject to the worktree reader's existing file limits and
+non-symlink-file support. Context/shared-base/analyzer sections and unsupported review/policy
+fields are not implemented in the desktop yet and block AI sends rather than
+being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
+
 Local tests and analyzers are a separate, manually entered workflow. Cururu
 shows the resolved executable, literal arguments, checkout, working directory,
 HEAD/diff identity, and isolation status, then requires a fresh confirmation for
