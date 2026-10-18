@@ -22,6 +22,8 @@ use std::{
 };
 
 mod diff_view;
+mod evaluation_history;
+mod evaluation_history_ui;
 pub mod evaluator;
 mod gh_cli;
 pub mod github_auth;
@@ -120,6 +122,8 @@ struct ReviewWorkspace {
     evaluator_openai_key_input: Option<Entity<InputState>>,
     evaluator_jev_key_input: Option<Entity<InputState>>,
     evaluator_result: Option<evaluator::CombinedReviewAnalysis>,
+    evaluation_history: evaluation_history_ui::HistoryState,
+    evaluator_result_anchor: Option<evaluation_history::EvaluationAnchor>,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -149,6 +153,7 @@ struct LocalReviewSettingsInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EvaluatorRequestContext {
+    anchor: evaluation_history::EvaluationAnchor,
     request_id: u64,
     repository_identity: String,
     comment_id: u64,
@@ -157,6 +162,7 @@ struct EvaluatorRequestContext {
 
 #[derive(Clone)]
 struct EvaluatorAnalysisRequest {
+    anchor: evaluation_history::EvaluationAnchor,
     settings: session_store::EvaluatorSettings,
     repository_identity: String,
     config_fingerprint: String,
@@ -433,6 +439,8 @@ impl ReviewWorkspace {
             evaluator_openai_key_input: None,
             evaluator_jev_key_input: None,
             evaluator_result: None,
+            evaluation_history: evaluation_history_ui::HistoryState::default(),
+            evaluator_result_anchor: None,
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -2022,6 +2030,7 @@ impl ReviewWorkspace {
                             .map(render_remote_conversation_comment),
                     )
                     .child(self.render_evaluator_action(cx, snapshot))
+                    .child(self.render_evaluation_history(cx, snapshot))
                     .child(self.render_thread_reply_composer(cx))
             }
             (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
@@ -2323,12 +2332,18 @@ impl ReviewWorkspace {
         };
         let analysis_input =
             build_review_analysis_input(snapshot, &comment, &source, anchor_line).ok();
-        let analysis_request = analysis_input.map(|input| EvaluatorAnalysisRequest {
-            settings: settings.clone(),
-            repository_identity: identity.clone(),
-            config_fingerprint: fingerprint.clone(),
-            input,
-            comment_id: comment.id,
+        let analysis_request = analysis_input.and_then(|input| {
+            let anchor =
+                evaluation_history::EvaluationAnchor::new(snapshot, &comment, &input, &settings)
+                    .ok()?;
+            Some(EvaluatorAnalysisRequest {
+                anchor,
+                settings: settings.clone(),
+                repository_identity: identity.clone(),
+                config_fingerprint: fingerprint.clone(),
+                input,
+                comment_id: comment.id,
+            })
         });
         let analysis_button = render_evaluator_send_button(
             entity,
@@ -2357,7 +2372,8 @@ impl ReviewWorkspace {
             .children(
                 self.evaluator_result
                     .as_ref()
-                    .filter(|_| self.evaluator_result_comment_id == Some(comment.id))
+                    .filter(|_| self.current_evaluation_anchor().as_ref() == self.evaluator_result_anchor.as_ref()
+                        && self.evaluator_result_anchor.is_some())
                     .map(render_evaluator_result),
             )
     }
@@ -4975,6 +4991,15 @@ fn start_review_analysis(
     request: EvaluatorAnalysisRequest,
     cx: &mut App,
 ) {
+    if entity.read(cx).is_evaluator_running
+        || entity.read(cx).current_evaluation_anchor().as_ref() != Some(&request.anchor)
+    {
+        entity.update(cx, |this, cx| {
+            this.evaluator_notice = Some("Evidence changed or analysis is already running; prepare the current thread again.".into());
+            cx.notify();
+        });
+        return;
+    }
     let store = entity.read(cx).session_store.clone();
     let Some(store) = store else {
         entity.update(cx, |this, cx| {
@@ -5020,6 +5045,7 @@ fn start_review_analysis(
                 evaluator::DualReviewEvaluator::config_fingerprint(current).ok()
             });
             let still_matches = current_repository == request_context.repository_identity
+                && this.current_evaluation_anchor().as_ref() == Some(&request_context.anchor)
                 && this
                     .selected_remote_comment
                     .as_ref()
@@ -5033,6 +5059,7 @@ fn start_review_analysis(
             }
             match result {
                 Ok(analysis) => {
+                    this.evaluator_result_anchor = Some(request.anchor.clone());
                     this.evaluator_result = Some(analysis);
                     this.evaluator_result_comment_id = Some(request.comment_id);
                     this.evaluator_notice = Some(
@@ -5057,6 +5084,7 @@ fn start_review_analysis(
 
 fn evaluator_request_context(request: &EvaluatorAnalysisRequest) -> EvaluatorRequestContext {
     EvaluatorRequestContext {
+        anchor: request.anchor.clone(),
         request_id: 0,
         repository_identity: request.repository_identity.to_ascii_lowercase(),
         comment_id: request.comment_id,

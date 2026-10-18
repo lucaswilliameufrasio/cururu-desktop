@@ -8,7 +8,10 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 6;
+#[path = "evaluation_history_store.rs"]
+mod evaluation_history_store;
+
+const SCHEMA_VERSION: i64 = 7;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
@@ -627,6 +630,9 @@ impl SessionStore {
         if version < 6 {
             transaction.execute_batch("CREATE TABLE github_draft_queue (id INTEGER PRIMARY KEY CHECK(id = 1), revision INTEGER NOT NULL CHECK(revision > 0), payload TEXT NOT NULL); PRAGMA user_version = 6;")?;
         }
+        if version < 7 {
+            evaluation_history_store::migrate(&transaction)?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -1062,7 +1068,7 @@ mod tests {
             .unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
+            .execute_batch("DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(

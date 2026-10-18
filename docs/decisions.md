@@ -1,5 +1,29 @@
 # Desktop architecture decisions
 
+## Explicit local evaluation archive
+
+SQLite schema 7 adds an immutable, explicitly saved second-opinion archive,
+scoped to GitHub repository/PR. Identity includes base/head/source SHAs, comment
+ID, a hash of the bounded evidence, provider configuration and rubric version.
+Freshness checks also compare the selected comment with the canonical loaded
+thread, preventing edited comments or changed revisions from accepting an old
+in-flight result. Provider/rubric changes invalidate existing local consent.
+
+Saving is opt-in and local only, with an optional human assessment (unreviewed,
+agree, disagree, needs more evidence). A different assessment creates another
+immutable record, not an overwrite. These are subjective annotations, not a
+calibrated dataset and never enable filtering. Reading the archive does not
+restore live analysis, permissions, reply drafts or publication confirmations.
+Records not matching current evidence are labeled stale/unverified.
+
+Store provider explanations, model IDs and reported usage, but not provider keys,
+full inputs or source snapshots. Explanations may quote code/comments; disclose
+that before saving. Cap records at 64,000 bytes, 200 records globally and 20 per
+page. Reject excess rather than truncate, silently evict, or overwrite. Deletion
+is an explicit local action; it is not a secure-erasure guarantee for SQLite,
+backups or filesystem snapshots. Real temporary SQLite tests cover migration,
+reopening, isolation, idempotency, corruption, limits and explicit deletion.
+
 ## Local Git access
 
 - **Status:** Accepted
