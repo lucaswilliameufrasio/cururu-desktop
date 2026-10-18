@@ -54,6 +54,44 @@ pub struct StoredCredentials {
     pub issued_at_unix_seconds: u64,
 }
 
+/// Session-only union: only the Device Flow payload can reach `CredentialStore`.
+#[derive(Debug, Clone)]
+pub enum SessionCredentials {
+    DeviceFlow(StoredCredentials),
+    GhCli(crate::gh_cli::GhToken),
+}
+
+impl SessionCredentials {
+    #[must_use]
+    pub fn access_token(&self) -> &str {
+        match self {
+            Self::DeviceFlow(credentials) => &credentials.access_token,
+            Self::GhCli(token) => token.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn access_token_is_expired(&self) -> bool {
+        match self {
+            Self::DeviceFlow(credentials) => credentials.access_token_is_expired(),
+            Self::GhCli(_) => false,
+        }
+    }
+
+    #[must_use]
+    pub fn device_flow_credentials(&self) -> Option<StoredCredentials> {
+        match self {
+            Self::DeviceFlow(credentials) => Some(credentials.clone()),
+            Self::GhCli(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_gh_cli(&self) -> bool {
+        matches!(self, Self::GhCli(_))
+    }
+}
+
 impl StoredCredentials {
     #[must_use]
     pub fn access_token_is_expired(&self) -> bool {
