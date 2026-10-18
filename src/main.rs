@@ -23,8 +23,10 @@ use std::{
 
 mod diff_view;
 pub mod evaluator;
+mod gh_cli;
 pub mod github_auth;
 pub mod github_pr;
+mod github_session;
 pub mod local_command;
 pub mod local_review;
 pub mod repository;
@@ -99,7 +101,7 @@ struct ReviewWorkspace {
     draft_input: Option<Entity<InputState>>,
     github_app_client_id: Option<String>,
     github_auth_state: GitHubAuthState,
-    github_credentials: Option<github_auth::StoredCredentials>,
+    github_credentials: Option<github_auth::SessionCredentials>,
     pull_request_input: Option<Entity<InputState>>,
     remote_review_state: RemoteReviewState,
     remote_source_context: RemoteSourceContextState,
@@ -290,6 +292,7 @@ enum GitHubAuthState {
     CheckingCredentials,
     SignedOut,
     StartingDeviceFlow,
+    ReadingGhSession,
     AwaitingDeviceAuthorization {
         user_code: String,
         verification_url: String,
@@ -1306,7 +1309,7 @@ impl ReviewWorkspace {
         let access_token_expired = self
             .github_credentials
             .as_ref()
-            .is_some_and(github_auth::StoredCredentials::access_token_is_expired);
+            .is_some_and(github_auth::SessionCredentials::access_token_is_expired);
         match &self.github_auth_state {
             GitHubAuthState::AwaitingDeviceAuthorization { cancel, .. } => {
                 cancel.store(true, Ordering::Release);
@@ -1317,7 +1320,9 @@ impl ReviewWorkspace {
             GitHubAuthState::SignedIn if access_token_expired => {
                 let (Some(client_id), Some(credentials)) = (
                     self.github_app_client_id.clone(),
-                    self.github_credentials.clone(),
+                    self.github_credentials
+                        .as_ref()
+                        .and_then(github_auth::SessionCredentials::device_flow_credentials),
                 ) else {
                     self.github_auth_state = GitHubAuthState::Failed(
                         "Configure CURURU_GITHUB_APP_CLIENT_ID before refreshing GitHub.".into(),
@@ -1329,6 +1334,10 @@ impl ReviewWorkspace {
                 start_github_refresh(cx.entity(), client_id, http, credentials, cx);
             }
             GitHubAuthState::SignedIn => {
+                if self.clear_gh_session() {
+                    cx.notify();
+                    return;
+                }
                 self.github_auth_state = GitHubAuthState::Disconnecting;
                 let entity = cx.entity();
                 start_github_disconnect(entity, cx);
@@ -1336,7 +1345,9 @@ impl ReviewWorkspace {
             GitHubAuthState::ReauthorizationRequired => {
                 let (Some(client_id), Some(credentials)) = (
                     self.github_app_client_id.clone(),
-                    self.github_credentials.clone(),
+                    self.github_credentials
+                        .as_ref()
+                        .and_then(github_auth::SessionCredentials::device_flow_credentials),
                 ) else {
                     self.github_auth_state = GitHubAuthState::Failed(
                         "Configure CURURU_GITHUB_APP_CLIENT_ID before connecting GitHub.".into(),
@@ -1361,6 +1372,7 @@ impl ReviewWorkspace {
             GitHubAuthState::Uninitialized
             | GitHubAuthState::CheckingCredentials
             | GitHubAuthState::StartingDeviceFlow
+            | GitHubAuthState::ReadingGhSession
             | GitHubAuthState::RefreshingToken
             | GitHubAuthState::SavingCredentials
             | GitHubAuthState::Disconnecting => {}
@@ -1386,7 +1398,8 @@ impl ReviewWorkspace {
                         } else {
                             GitHubAuthState::SignedIn
                         };
-                        this.github_credentials = Some(credentials);
+                        this.github_credentials =
+                            Some(github_auth::SessionCredentials::DeviceFlow(credentials));
                     }
                     Ok(None) => {
                         this.github_auth_state = GitHubAuthState::SignedOut;
@@ -1411,6 +1424,7 @@ impl ReviewWorkspace {
             GitHubAuthState::StartingDeviceFlow => {
                 Some("Requesting a GitHub device code…".to_string())
             }
+            GitHubAuthState::ReadingGhSession => Some("Reading the existing github.com gh session (memory only)…".to_string()),
             GitHubAuthState::AwaitingDeviceAuthorization {
                 user_code,
                 verification_url,
@@ -1427,7 +1441,9 @@ impl ReviewWorkspace {
                 Some("Saving credentials to the OS keyring…".to_string())
             }
             GitHubAuthState::SignedIn => {
-                Some("GitHub connected · publication still requires confirmation.".to_string())
+                Some(if self.github_credentials.as_ref().is_some_and(github_auth::SessionCredentials::is_gh_cli) {
+                    "GitHub connected via gh · memory only; expiry/permissions managed by gh. Disconnect does not sign gh out.".to_string()
+                } else { "GitHub connected · publication still requires confirmation.".to_string() })
             }
             GitHubAuthState::ReauthorizationRequired => {
                 Some("GitHub session expired. Try refreshing or reconnecting.".to_string())
@@ -1568,6 +1584,7 @@ impl ReviewWorkspace {
             .gap_2()
             .children(reopen_button)
             .child(auth_button)
+            .child(self.render_gh_fallback_button(cx))
             .child(open_button)
     }
 
@@ -1577,13 +1594,14 @@ impl ReviewWorkspace {
                 if self
                     .github_credentials
                     .as_ref()
-                    .is_some_and(github_auth::StoredCredentials::access_token_is_expired) =>
+                    .is_some_and(github_auth::SessionCredentials::access_token_is_expired) =>
             {
                 "Refresh GitHub session"
             }
             GitHubAuthState::SignedIn => "Disconnect GitHub",
             GitHubAuthState::AwaitingDeviceAuthorization { .. } => "Cancel sign-in",
             GitHubAuthState::StartingDeviceFlow => "Connecting…",
+            GitHubAuthState::ReadingGhSession => "Reading gh session…",
             GitHubAuthState::RefreshingToken => "Refreshing…",
             GitHubAuthState::SavingCredentials => "Saving credentials…",
             GitHubAuthState::Disconnecting => "Disconnecting…",
@@ -1983,7 +2001,7 @@ impl ReviewWorkspace {
                 let http = cx.http_client();
                 let access_token = self.github_credentials.as_ref().and_then(|credentials| {
                     (!credentials.access_token_is_expired())
-                        .then(|| credentials.access_token.clone())
+                        .then(|| credentials.access_token().to_string())
                 });
                 div()
                     .flex()
@@ -2377,7 +2395,7 @@ impl ReviewWorkspace {
         let access_token = self.github_credentials.as_ref().and_then(|credentials| {
             (!credentials.access_token_is_expired()
                 && matches!(&self.github_auth_state, GitHubAuthState::SignedIn))
-            .then(|| credentials.access_token.clone())
+            .then(|| credentials.access_token().to_string())
         });
         render_thread_reply_editor(
             ThreadReplyComposer {
@@ -4821,7 +4839,7 @@ fn start_thread_reply_publication(
             GitHubAuthState::SignedIn
         ) && this.github_credentials.as_ref().is_some_and(|credentials| {
             !credentials.access_token_is_expired()
-                && credentials.access_token.eq(&access_token)
+                && credentials.access_token() == access_token
         });
         if !confirmation_is_current
             || this.review_publication.is_publishing()
@@ -5106,7 +5124,7 @@ fn handle_open_pull_request(
         });
         return;
     }
-    let token = credentials.access_token;
+    let token = credentials.access_token().to_string();
     let can_load = entity.update(cx, |this, cx| {
         if matches!(
             this.local_command_state,
@@ -5560,7 +5578,8 @@ fn start_github_device_login(
                 .spawn(async move { github_auth::CredentialStore::save(&credentials_to_store) })
                 .await?;
             entity.update(cx, |this, cx| {
-                this.github_credentials = Some(credentials);
+                this.github_credentials =
+                    Some(github_auth::SessionCredentials::DeviceFlow(credentials));
                 this.github_auth_state = GitHubAuthState::SignedIn;
                 this.notice =
                     Some("GitHub connected. Remote actions still need confirmation.".into());
@@ -5648,7 +5667,8 @@ fn start_github_refresh(
                 .spawn(async move { github_auth::CredentialStore::save(&refreshed_to_store) })
                 .await?;
             entity.update(cx, |this, cx| {
-                this.github_credentials = Some(refreshed);
+                this.github_credentials =
+                    Some(github_auth::SessionCredentials::DeviceFlow(refreshed));
                 this.github_auth_state = GitHubAuthState::SignedIn;
                 this.notice = Some("GitHub session refreshed.".into());
                 cx.notify();

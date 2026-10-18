@@ -479,7 +479,7 @@ fn publish(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
             return None;
         }
         let pending = pending.clone();
-        let token = credentials.access_token.clone();
+        let token = credentials.access_token().to_string();
         this.review_publication.state = PublicationState::Publishing(pending.clone());
         cx.notify();
         Some((pending, token))

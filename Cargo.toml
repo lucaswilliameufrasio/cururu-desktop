@@ -35,7 +35,7 @@ tempfile = "3"
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "=0.31.3", features = ["signal"] }
+nix = { version = "=0.31.3", features = ["signal", "fs"] }
 
 [lints.rust]
 unsafe_code = "forbid"

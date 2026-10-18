@@ -98,6 +98,16 @@ individual thread replies use the separate explicit write flow below.
 **Disconnect GitHub** removes local credentials but does not revoke the grant at
 GitHub.
 
+Alternatively, explicitly choose **Use existing gh login (memory only)**. This
+runs only `gh auth token --hostname github.com` from a supported installed CLI
+location (system, Homebrew, or `~/.local/bin`), not from repository PATH entries.
+The command has a five-second deadline and a 16 KiB output bound. Environment
+tokens/provider keys are not inherited. It does not run login/logout, contact an
+evaluator, or persist the returned token in Cururu. This fallback inherits the
+existing gh credential's permissions, which may be broader than the GitHub App;
+its expiry/revocation remain managed by gh/GitHub. Disconnect only clears app
+memory. If rejected/expired, disconnect and explicitly select the fallback again.
+
 With a valid GitHub session, enter a PR as `owner/repository#number` and choose
 **Open GitHub PR** to load its metadata, changed-file patches, review
 submissions, inline comment threads, and general conversation comments. Inline

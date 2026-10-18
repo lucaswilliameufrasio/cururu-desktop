@@ -257,6 +257,23 @@ or log the token, and disconnecting this app must not sign the user out of `gh`.
 Device Flow remains the primary path. Validate the requested GitHub App scopes
 and revocation behavior before live use.
 
+The `gh` fallback is now an explicit **Use existing gh login (memory only)**
+action, never automatic after Device Flow failure. Invoke only installed `gh`
+from fixed system/Homebrew/user-local installation directories, not repository
+PATH entries; run `auth token --hostname github.com` without a shell, with a
+cleared environment (only home/config/keyring locators are restored), no stdin,
+discarded stderr, bounded 16 KiB nonblocking stdout and a five-second deadline.
+Terminate/reap its process group even when output pipes are held by descendants.
+Do not inherit GH_TOKEN/GITHUB_TOKEN or app/provider credentials. No live token
+is read during development tests; synthetic executables exercise the boundary.
+
+Session credentials distinguish Device Flow from `gh` at the type boundary:
+only the Device Flow payload can enter `CredentialStore`. gh token expiration
+is not known locally; GitHub remains authoritative and the user must disconnect
+and select the fallback again if rejected. Disconnecting a gh-backed session
+only clears app memory, without touching Cururu's OS-keyring entries or running
+`gh auth logout`. A saved Device Flow grant is not overwritten by the fallback.
+
 ### Read-only pull-request inspection
 
 The initial remote review journey identifies a PR with an explicit
