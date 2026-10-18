@@ -1,5 +1,15 @@
 # Cururu Desktop
 
+A plain single-line GitHub `suggestion` block on a current-head right-side inline
+comment can be imported into an explicitly chosen checkout. Load its source,
+choose a checkout already at the exact PR head, inspect the local diff, then
+confirm **Apply this exact preview locally**. The target must exactly match the
+reviewed GitHub source. A fresh read of the PR/comment plus local HEAD/diff/file
+checks blocks stale edits. This does not stage, commit, push or write to GitHub.
+Offsets, multiline/deletion/ambiguous blocks and outdated anchors are rejected.
+The separate **Open suggestion on GitHub** action hands remote application/commit
+to GitHub's own UI; it does not apply the suggestion automatically.
+
 The GitHub composer remembers a personal **Individual comments / Batch review**
 preview preference locally. This changes only the primary preview action: both
 paths still require explicit confirmation, and switching never publishes or

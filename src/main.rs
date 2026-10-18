@@ -34,6 +34,7 @@ mod local_context;
 mod local_context_ui;
 pub mod local_review;
 mod publication_preference;
+mod remote_suggestion;
 pub mod repository;
 mod repository_policy;
 mod review_publication;
@@ -128,6 +129,7 @@ struct ReviewWorkspace {
     evaluation_history: evaluation_history_ui::HistoryState,
     evaluator_result_anchor: Option<evaluation_history::EvaluationAnchor>,
     local_context_state: local_context_ui::ContextState,
+    remote_suggestion_state: remote_suggestion::RemoteSuggestionState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -449,6 +451,7 @@ impl ReviewWorkspace {
             evaluation_history: evaluation_history_ui::HistoryState::default(),
             evaluator_result_anchor: None,
             local_context_state: local_context_ui::ContextState::default(),
+            remote_suggestion_state: remote_suggestion::RemoteSuggestionState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -741,6 +744,9 @@ fn start_repository_picker(
     entity: Entity<ReviewWorkspace>,
     store: Option<session_store::SessionStore>,
 ) {
+    if entity.read(cx).remote_suggestion_state.is_busy() {
+        return;
+    }
     let receiver = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -798,6 +804,9 @@ fn start_reopen_last_session(
     path: PathBuf,
     store: Option<session_store::SessionStore>,
 ) {
+    if entity.read(cx).remote_suggestion_state.is_busy() {
+        return;
+    }
     cx.spawn(async move |cx| {
         let _ = entity.update(cx, |this, cx| {
             this.notice = Some("Scanning repository changes…".into());
@@ -1544,6 +1553,7 @@ impl ReviewWorkspace {
                     let entity = entity.clone();
                     let can_open = entity.update(cx, |this, cx| {
                         if this.is_opening_repository
+                            || this.remote_suggestion_state.is_busy()
                             || matches!(
                                 &this.suggested_change_state,
                                 SuggestedChangeState::Applying(_)
@@ -1584,6 +1594,7 @@ impl ReviewWorkspace {
                 let entity = entity.clone();
                 let can_open = entity.update(cx, |this, cx| {
                     if this.is_opening_repository
+                        || this.remote_suggestion_state.is_busy()
                         || matches!(
                             &this.suggested_change_state,
                             SuggestedChangeState::Applying(_)
@@ -2046,6 +2057,7 @@ impl ReviewWorkspace {
                     )
                     .child(self.render_evaluator_action(cx, snapshot))
                     .child(self.render_evaluation_history(cx, snapshot))
+                    .child(self.render_remote_suggestion(cx, snapshot))
                     .child(self.render_thread_reply_composer(cx))
             }
             (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
@@ -5158,6 +5170,9 @@ fn handle_open_pull_request(
     input_entity: Option<Entity<InputState>>,
     cx: &mut App,
 ) {
+    if entity.read(cx).remote_suggestion_state.is_busy() {
+        return;
+    }
     let Some(input) = input_entity else {
         return;
     };
