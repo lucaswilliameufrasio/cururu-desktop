@@ -30,6 +30,8 @@ pub mod github_auth;
 pub mod github_pr;
 mod github_session;
 pub mod local_command;
+mod local_context;
+mod local_context_ui;
 pub mod local_review;
 mod publication_preference;
 pub mod repository;
@@ -125,6 +127,7 @@ struct ReviewWorkspace {
     evaluator_result: Option<evaluator::CombinedReviewAnalysis>,
     evaluation_history: evaluation_history_ui::HistoryState,
     evaluator_result_anchor: Option<evaluation_history::EvaluationAnchor>,
+    local_context_state: local_context_ui::ContextState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -173,6 +176,7 @@ struct EvaluatorAnalysisRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalReviewRequestContext {
+    evidence_fingerprint: Option<String>,
     request_id: u64,
     repository_identity: String,
     config_fingerprint: String,
@@ -181,6 +185,7 @@ struct LocalReviewRequestContext {
 
 #[derive(Clone)]
 struct LocalReviewRequest {
+    evidence: Option<local_context::PreparedContext>,
     context: LocalReviewRequestContext,
     repository_root: PathBuf,
     settings: session_store::LocalReviewSettings,
@@ -194,6 +199,7 @@ struct PendingLocalCommand {
 
 #[derive(Clone)]
 struct SuggestedChangeRequest {
+    context: Option<local_context::PreparedContext>,
     request_id: u64,
     repository_root: PathBuf,
     repository_identity: String,
@@ -274,7 +280,7 @@ enum LocalReviewState {
         repository_identity: String,
     },
     Running(LocalReviewRequestContext),
-    Complete(local_review::LocalReviewResult),
+    Complete(Box<local_review::LocalReviewResult>),
     Failed(SharedString),
 }
 
@@ -442,6 +448,7 @@ impl ReviewWorkspace {
             evaluator_result: None,
             evaluation_history: evaluation_history_ui::HistoryState::default(),
             evaluator_result_anchor: None,
+            local_context_state: local_context_ui::ContextState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -2198,9 +2205,15 @@ impl ReviewWorkspace {
             is_authorized,
             store.is_some() && !is_authorization_busy,
         );
-        let validation = local_review::validate_snapshot(snapshot);
+        let validation = local_review::validate_snapshot(snapshot).and_then(|count| {
+            self.local_context_state.resolve(snapshot)?;
+            Ok(count)
+        });
+        let evidence = self.local_context_state.resolve(snapshot).ok().flatten();
         let request = validation.as_ref().ok().map(|_| LocalReviewRequest {
+            evidence: evidence.clone(),
             context: LocalReviewRequestContext {
+                evidence_fingerprint: evidence.as_ref().map(|context| context.fingerprint.clone()),
                 request_id: 0,
                 repository_identity: identity.to_string(),
                 config_fingerprint: fingerprint.clone(),
@@ -2237,9 +2250,10 @@ impl ReviewWorkspace {
             ))
             .child(validation_message)
             .child(render_local_review_limits())
-            .child("Repository .cururu.toml may only restrict review limits/files/findings; provider destinations and consent remain local.")
+            .child("Repository .cururu.toml may restrict review limits/files/findings and declare optional context/focus; provider destinations and consent remain local.")
             .child(authorization_message)
             .child(authorization_button)
+            .child(self.render_local_context(cx, snapshot))
             .child(send_button)
             .children(
                 local_review_state_message(&self.local_review_state).map(|message| {
@@ -3897,6 +3911,12 @@ fn start_local_review(
         return;
     };
     let request_context = entity.update(cx, |this, cx| {
+        if !this.context_matches_request(&request) {
+            this.notice =
+                Some("Choose or prepare the current repository context before sending.".into());
+            cx.notify();
+            return None;
+        }
         if matches!(
             &this.suggested_change_state,
             SuggestedChangeState::Applying(_)
@@ -3913,7 +3933,7 @@ fn start_local_review(
         this.local_review_state = LocalReviewState::Running(request.context.clone());
         this.suggested_change_state = SuggestedChangeState::Idle;
         this.notice =
-            Some("Preparing a fresh snapshot, then sending only the confirmed local diffs…".into());
+            Some("Preparing a fresh snapshot, then sending confirmed diffs and explicitly included context only…".into());
         cx.notify();
         Some(request.context.clone())
     });
@@ -3956,7 +3976,7 @@ fn start_local_review(
             }
             match result {
                 Ok(review) => {
-                    this.local_review_state = LocalReviewState::Complete(review);
+                    this.local_review_state = LocalReviewState::Complete(Box::new(review));
                     this.notice = Some(
                         "Local review completed. Findings are informational; no files were changed or published."
                             .into(),
@@ -3991,7 +4011,13 @@ async fn run_local_review(
         })
         .await?;
 
-    let result = local_review::review_snapshot(&request.settings, &secrets, &snapshot).await?;
+    let result = local_review::review_snapshot(
+        &request.settings,
+        &secrets,
+        &snapshot,
+        request.evidence.as_ref(),
+    )
+    .await?;
 
     let postflight_store = store;
     let postflight_request = request;
@@ -4049,6 +4075,7 @@ fn validate_local_review_snapshot(
         "working-tree changes differ from the reviewed preview; reopen the repository and try again"
     );
     local_review::validate_snapshot(snapshot)?;
+    local_context::validate(snapshot, request.evidence.as_ref())?;
     Ok(())
 }
 
@@ -4075,6 +4102,7 @@ fn render_local_review_result(
             let finding_for_display = finding.clone();
             let entity = entity.clone();
             let request = SuggestedChangeRequest {
+                context: result.context.clone(),
                 request_id: 0,
                 repository_root: repository_root.to_path_buf(),
                 repository_identity: repository_identity.to_string(),
@@ -4328,11 +4356,12 @@ fn begin_suggested_change_preview(
         let result = cx
             .background_executor()
             .spawn(async move {
-                suggested_change::prepare(
+                suggested_change::prepare_with_context(
                     &request.repository_root,
                     &request.repository_identity,
                     &request.reviewed_diff_fingerprint,
                     &request.finding,
+                    request.context.as_ref(),
                 )
             })
             .await;
@@ -6231,7 +6260,9 @@ mod tests {
         let config_fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
         let snapshot_fingerprint = super::local_review::snapshot_fingerprint(&snapshot);
         let request = LocalReviewRequest {
+            evidence: None,
             context: LocalReviewRequestContext {
+                evidence_fingerprint: None,
                 request_id: 1,
                 repository_identity: identity.clone(),
                 config_fingerprint: config_fingerprint.clone(),

@@ -18,6 +18,7 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Preview {
+    context: Option<crate::local_context::PreparedContext>,
     pub path: String,
     pub line: u32,
     pub title: String,
@@ -48,11 +49,28 @@ impl Preview {
     }
 }
 
+#[cfg(test)]
 pub fn prepare(
     repository_root: &Path,
     repository_identity: &str,
     reviewed_diff_fingerprint: &str,
     finding: &cururu_core::ReviewFinding,
+) -> anyhow::Result<Preview> {
+    prepare_with_context(
+        repository_root,
+        repository_identity,
+        reviewed_diff_fingerprint,
+        finding,
+        None,
+    )
+}
+
+pub fn prepare_with_context(
+    repository_root: &Path,
+    repository_identity: &str,
+    reviewed_diff_fingerprint: &str,
+    finding: &cururu_core::ReviewFinding,
+    context: Option<&crate::local_context::PreparedContext>,
 ) -> anyhow::Result<Preview> {
     let identity = local_review::repository_identity(repository_root)?;
     ensure!(
@@ -60,6 +78,7 @@ pub fn prepare(
         "the selected repository changed; reopen it before previewing this suggestion"
     );
     let snapshot = RepositorySnapshot::open(repository_root)?;
+    crate::local_context::validate(&snapshot, context)?;
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == reviewed_diff_fingerprint,
         "working-tree changes differ from the reviewed preview; run local review again"
@@ -96,6 +115,7 @@ pub fn prepare(
         .to_string();
 
     Ok(Preview {
+        context: context.cloned(),
         path: finding.path.clone(),
         line,
         title: finding.title.clone(),
@@ -117,6 +137,7 @@ pub fn apply(preview: &Preview) -> anyhow::Result<()> {
         "the selected repository changed after the preview; no file was modified"
     );
     let snapshot = RepositorySnapshot::open(&preview.root)?;
+    crate::local_context::validate(&snapshot, preview.context.as_ref())?;
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == preview.reviewed_diff_fingerprint,
         "working-tree changes differ from the preview; no file was modified"
@@ -436,6 +457,47 @@ mod tests {
 
         let permissions = fs::metadata(path).unwrap().permissions();
         assert_eq!(permissions.mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn context_edits_block_both_suggestion_preview_and_application_without_writing() {
+        let directory = repository_with_file("first_line()\nunsafe_call()\nlast_line()\n");
+        fs::write(directory.path().join(".gitignore"), "CONTEXT.md\n").unwrap();
+        fs::write(
+            directory.path().join(".cururu.toml"),
+            "version = 1\n[context]\nconventions = ['CONTEXT.md']",
+        )
+        .unwrap();
+        fs::write(directory.path().join("CONTEXT.md"), "Check calls\n").unwrap();
+        let snapshot = RepositorySnapshot::open(directory.path()).unwrap();
+        let evidence = crate::local_context::load(&snapshot).unwrap();
+        let identity = crate::local_review::repository_identity(directory.path()).unwrap();
+        let fingerprint = crate::local_review::snapshot_fingerprint(&snapshot);
+        let finding = finding("src/lib.rs", Some(2), "checked_call()");
+        let preview = super::prepare_with_context(
+            directory.path(),
+            &identity,
+            &fingerprint,
+            &finding,
+            Some(&evidence),
+        )
+        .unwrap();
+        fs::write(directory.path().join("CONTEXT.md"), "Changed context\n").unwrap();
+        assert!(
+            super::prepare_with_context(
+                directory.path(),
+                &identity,
+                &fingerprint,
+                &finding,
+                Some(&evidence)
+            )
+            .is_err()
+        );
+        assert!(apply(&preview).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "first_line()\nunsafe_call()\nlast_line()\n"
+        );
     }
 
     #[test]

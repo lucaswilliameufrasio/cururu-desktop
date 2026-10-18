@@ -1,4 +1,4 @@
-//! Host-owned, restriction-only interpretation of the shared repository schema.
+//! Host-owned restrictions and explicitly previewed context declarations.
 
 use std::{fs, io::Read as _, path::Path};
 
@@ -20,6 +20,7 @@ pub struct RepositoryPolicy {
     pub suggested_changes: bool,
     pub ignore: Vec<String>,
     pub provider_ignored: bool,
+    pub context: crate::local_context::ContextSpec,
 }
 
 impl Default for RepositoryPolicy {
@@ -34,6 +35,7 @@ impl Default for RepositoryPolicy {
             suggested_changes: true,
             ignore: vec![],
             provider_ignored: false,
+            context: crate::local_context::ContextSpec::default(),
         }
     }
 }
@@ -86,12 +88,20 @@ impl RepositoryPolicy {
             "[evaluator] is local-only and cannot be enabled by .cururu.toml"
         );
         ensure!(
-            parsed.config.is_none() && parsed.context.is_none() && parsed.analysis.is_none(),
-            "desktop review does not yet support [config], [context], or [analysis]; no extra context will be loaded"
+            parsed.config.is_none() && parsed.analysis.is_none(),
+            "desktop review does not yet support [config] or [analysis]; no shared configuration or analysis files will be loaded"
         );
         let mut policy = Self {
             fingerprint: format!("{:x}", Sha256::digest(raw.as_bytes())),
             provider_ignored: parsed.provider.is_some(),
+            context: crate::local_context::ContextSpec::parse(
+                parsed.context,
+                parsed
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.focus.clone())
+                    .unwrap_or_default(),
+            )?,
             ..Self::default()
         };
         if let Some(review) = parsed.review {
@@ -123,10 +133,9 @@ impl RepositoryPolicy {
         if let Some(repository) = parsed.policy {
             ensure!(
                 repository.fail_on.is_none()
-                    && repository.focus.as_ref().is_none_or(Vec::is_empty)
                     && !repository.incremental.unwrap_or(false)
                     && !repository.synthesis.unwrap_or(false),
-                "desktop review does not yet support policy.fail_on, focus, incremental, or synthesis"
+                "desktop review does not yet support policy.fail_on, incremental, or synthesis"
             );
             if let Some(confidence) = repository.minimum_confidence {
                 cururu_engine::config::validate_confidence(confidence)?;
