@@ -1,5 +1,17 @@
 # Desktop architecture decisions
 
+## Personal publication preview preference
+
+SQLite schema 8 stores an app-local individual/batch preference. Batch remains
+the default to preserve existing behavior. This only changes the primary preview
+action (next matching queued comment vs all matching queued comments). Both paths
+remain available. It grants no permission, triggers no publication, never drops
+drafts and cannot be set by repository configuration. Changing a preference
+invalidates an existing preview confirmation, but does not clear a failed or
+uncertain publication state that requires refresh. Persist changes off the UI
+thread; failures retain the previous preference. No OAuth/credential data is
+stored here. Migration tests preserve the existing evaluation archive and drafts.
+
 ## Explicit local evaluation archive
 
 SQLite schema 7 adds an immutable, explicitly saved second-opinion archive,

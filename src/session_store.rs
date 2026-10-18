@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 #[path = "evaluation_history_store.rs"]
 mod evaluation_history_store;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
@@ -94,6 +94,31 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    pub fn publication_preference(
+        &self,
+    ) -> anyhow::Result<crate::publication_preference::PublicationPreference> {
+        let connection = self.connect()?;
+        let mode: Option<String> = connection
+            .query_row(
+                "SELECT mode FROM publication_preference WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        mode.map_or_else(
+            || Ok(crate::publication_preference::PublicationPreference::default()),
+            |mode| crate::publication_preference::PublicationPreference::parse(&mode),
+        )
+    }
+
+    pub fn save_publication_preference(
+        &self,
+        preference: crate::publication_preference::PublicationPreference,
+    ) -> anyhow::Result<()> {
+        self.connect()?.execute("INSERT INTO publication_preference(id,mode) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET mode = excluded.mode", [preference.as_str()])?;
+        Ok(())
+    }
+
     pub fn open_default() -> anyhow::Result<Self> {
         let directories = ProjectDirs::from("com", "Cururu", "Cururu Desktop")
             .ok_or_else(|| anyhow::anyhow!("could not locate the application data directory"))?;
@@ -633,6 +658,9 @@ impl SessionStore {
         if version < 7 {
             evaluation_history_store::migrate(&transaction)?;
         }
+        if version < 8 {
+            transaction.execute_batch("CREATE TABLE publication_preference (id INTEGER PRIMARY KEY CHECK(id = 1), mode TEXT NOT NULL CHECK(mode IN ('individual','batch'))); PRAGMA user_version = 8;")?;
+        }
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -815,6 +843,56 @@ fn unix_timestamp() -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_preference_round_trip_and_schema_seven_migration_preserve_history() {
+        use crate::publication_preference::PublicationPreference;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("preferences.sqlite3");
+        let store = super::SessionStore::open(&path).unwrap();
+        assert_eq!(
+            store.publication_preference().unwrap(),
+            PublicationPreference::Batch
+        );
+        let record = crate::evaluation_history::sample_record();
+        store.save_evaluation(&record).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE publication_preference; PRAGMA user_version = 7;")
+            .unwrap();
+        let migrated = super::SessionStore::open(&path).unwrap();
+        assert_eq!(
+            migrated.evaluations(&record.anchor.reference, 0).unwrap()[0].record,
+            record
+        );
+        migrated
+            .save_publication_preference(PublicationPreference::Individual)
+            .unwrap();
+        let reopened = super::SessionStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.publication_preference().unwrap(),
+            PublicationPreference::Individual
+        );
+        assert_eq!(
+            reopened.evaluations(&record.anchor.reference, 0).unwrap()[0].record,
+            record
+        );
+        reopened
+            .save_publication_preference(PublicationPreference::Batch)
+            .unwrap();
+        assert_eq!(
+            migrated.publication_preference().unwrap(),
+            PublicationPreference::Batch
+        );
+        assert!(PublicationPreference::parse("publish-automatically").is_err());
+        assert!(
+            connection
+                .execute("UPDATE publication_preference SET mode = 'unknown'", [])
+                .is_err()
+        );
+        connection.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE publication_preference SET mode = 'unknown';").unwrap();
+        assert!(reopened.publication_preference().is_err());
+    }
+
     use super::{EvaluatorSettings, SessionStore};
 
     fn draft(path: &str, line: Option<u32>, body: &str) -> cururu_core::ReviewCommentDraft {
@@ -1068,7 +1146,7 @@ mod tests {
             .unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
+            .execute_batch("DROP TABLE publication_preference; DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(

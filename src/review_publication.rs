@@ -11,6 +11,7 @@ use gpui_component::{
 use crate::{GitHubAuthState, RemoteReviewState, ReviewWorkspace, github_pr};
 
 use crate::github_pr::PendingReview;
+use crate::publication_preference::PublicationPreference;
 
 impl PendingReview {
     fn matches(&self, snapshot: &github_pr::PullRequestSnapshot) -> bool {
@@ -37,6 +38,15 @@ pub struct ReviewPublication {
     storage: DraftStorage,
     storage_revision: i64,
     restored_summary: String,
+    preference: PreferenceState,
+}
+
+#[derive(Default)]
+enum PreferenceState {
+    #[default]
+    Default,
+    Ready(PublicationPreference),
+    Saving(PublicationPreference),
 }
 
 #[derive(Default)]
@@ -48,6 +58,33 @@ enum DraftStorage {
 }
 
 impl ReviewPublication {
+    pub const fn restore_preference(&mut self, preference: PublicationPreference) {
+        self.preference = PreferenceState::Ready(preference);
+    }
+
+    fn preference(&self) -> PublicationPreference {
+        match self.preference {
+            PreferenceState::Default => PublicationPreference::default(),
+            PreferenceState::Ready(value) | PreferenceState::Saving(value) => value,
+        }
+    }
+
+    fn preferred_preview(&self, snapshot: &github_pr::PullRequestSnapshot) -> Option<usize> {
+        match self.preference() {
+            PublicationPreference::Batch => None,
+            PublicationPreference::Individual => {
+                self.drafts.iter().position(|draft| draft.matches(snapshot))
+            }
+        }
+    }
+
+    fn change_preference(&mut self, preference: PublicationPreference) {
+        self.preference = PreferenceState::Ready(preference);
+        if matches!(self.state, PublicationState::Confirming(_)) {
+            self.state = PublicationState::Drafting;
+        }
+    }
+
     pub fn restore(
         &mut self,
         result: anyhow::Result<(i64, crate::session_store::GitHubDraftQueue)>,
@@ -171,6 +208,45 @@ impl ReviewPublication {
 }
 
 impl ReviewWorkspace {
+    fn render_publication_preference(&self, cx: &Context<Self>) -> gpui::Div {
+        let mut panel = gpui::div().flex().flex_col().gap_2().child(format!(
+            "Preferred preview: {} · local only, always requires confirmation",
+            self.review_publication.preference().label()
+        ));
+        for preference in [
+            PublicationPreference::Individual,
+            PublicationPreference::Batch,
+        ] {
+            let entity = cx.entity();
+            panel = panel.child(
+                Button::new(gpui::SharedString::from(format!(
+                    "prefer-{}",
+                    preference.as_str()
+                )))
+                .label(format!("Remember preference: {}", preference.label()))
+                .disabled(
+                    self.session_store.is_none()
+                        || self.review_publication.is_publishing()
+                        || matches!(
+                            self.review_publication.preference,
+                            PreferenceState::Saving(_)
+                        ),
+                )
+                .on_click(move |_, _, cx| save_preference(&entity, preference, cx)),
+            );
+        }
+        if self.review_publication.preference() == PublicationPreference::Individual {
+            let entity = cx.entity();
+            panel = panel.child(
+                Button::new("preview-all-despite-preference")
+                    .label("Preview all queued comments instead")
+                    .disabled(self.review_publication.is_publishing())
+                    .on_click(move |_, _, cx| preview(&entity, None, cx)),
+            );
+        }
+        panel
+    }
+
     pub fn ensure_review_comment_input(
         &mut self,
         window: &mut gpui::Window,
@@ -252,11 +328,25 @@ impl ReviewWorkspace {
             content = content.child(self.render_queued_comment(cx, snapshot, index, draft));
         }
         let entity = cx.entity();
+        let preferred = self.review_publication.preferred_preview(snapshot);
+        let preference = self.review_publication.preference();
+        content = content.child(self.render_publication_preference(cx));
         content = content.child(
             Button::new("preview-comment-review")
-                .label("Preview queued review for this PR/head")
-                .disabled(self.review_publication.is_publishing())
-                .on_click(move |_event, _window, cx| preview(&entity, None, cx)),
+                .label(match preference {
+                    PublicationPreference::Individual => "Preview next comment for this PR/head",
+                    PublicationPreference::Batch => "Preview queued review for this PR/head",
+                })
+                .disabled(
+                    self.review_publication.is_publishing()
+                        || (preference == PublicationPreference::Individual && preferred.is_none()),
+                )
+                .on_click(move |_event, _window, cx| {
+                    if preference == PublicationPreference::Individual && preferred.is_none() {
+                        return;
+                    }
+                    preview(&entity, preferred, cx);
+                }),
         );
         content
             .child("Review summary (required for publication)")
@@ -392,6 +482,50 @@ impl ReviewWorkspace {
         }
         content
     }
+}
+
+fn save_preference(
+    entity: &Entity<ReviewWorkspace>,
+    preference: PublicationPreference,
+    cx: &mut App,
+) {
+    let store = entity.update(cx, |this, cx| {
+        if this.review_publication.is_publishing()
+            || matches!(
+                this.review_publication.preference,
+                PreferenceState::Saving(_)
+            )
+        {
+            return None;
+        }
+        let store = this.session_store.clone()?;
+        let previous = this.review_publication.preference();
+        this.review_publication.change_preference(previous);
+        this.review_publication.preference = PreferenceState::Saving(previous);
+        cx.notify();
+        Some(store)
+    });
+    let Some(store) = store else {
+        return;
+    };
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = cx.background_executor().spawn(async move { store.save_publication_preference(preference) }).await;
+        let _ = entity.update(cx, |this, cx| {
+            let previous = this.review_publication.preference();
+            match result {
+                Ok(()) => {
+                    this.review_publication.change_preference(preference);
+                    this.notice = Some("Publication preference saved locally. Drafts were preserved; prepare a new preview before publishing.".into());
+                },
+                Err(error) => {
+                    this.review_publication.restore_preference(previous);
+                    this.notice = Some(format!("Could not save publication preference: {error}").into());
+                },
+            }
+            cx.notify();
+        });
+    }).detach();
 }
 
 fn preview(entity: &Entity<ReviewWorkspace>, only: Option<usize>, cx: &mut App) {
@@ -541,6 +675,43 @@ mod tests {
             line,
             body: format!("Check line {line}"),
         }
+    }
+
+    #[test]
+    fn changing_preference_preserves_drafts_and_requires_another_confirmation() {
+        let snapshot = snapshot();
+        let mut publication = ReviewPublication::default();
+        publication.queue(&snapshot, comment(1)).unwrap();
+        publication.queue(&snapshot, comment(2)).unwrap();
+        let drafts = publication.drafts.clone();
+        assert_eq!(publication.preferred_preview(&snapshot), None);
+        publication
+            .preview(&snapshot, None, "Review notes".to_string())
+            .unwrap();
+        publication.change_preference(PublicationPreference::Individual);
+        assert_eq!(publication.preferred_preview(&snapshot), Some(0));
+        assert!(matches!(publication.state, PublicationState::Drafting));
+        assert_eq!(publication.drafts, drafts);
+        publication
+            .preview(
+                &snapshot,
+                publication.preferred_preview(&snapshot),
+                "Review notes".to_string(),
+            )
+            .unwrap();
+        let PublicationState::Confirming(pending) = &publication.state else {
+            panic!("preview");
+        };
+        assert_eq!(pending.comments.len(), 1);
+        publication.change_preference(PublicationPreference::Batch);
+        assert!(matches!(publication.state, PublicationState::Drafting));
+        assert_eq!(publication.drafts, drafts);
+        publication.state = PublicationState::Failed("refresh required".to_string());
+        publication.change_preference(PublicationPreference::Individual);
+        assert!(matches!(publication.state, PublicationState::Failed(_)));
+        let mut other_head = snapshot;
+        other_head.head_sha = "c".repeat(40);
+        assert_eq!(publication.preferred_preview(&other_head), None);
     }
 
     #[test]

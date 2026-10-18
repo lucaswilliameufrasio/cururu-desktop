@@ -117,7 +117,7 @@ mod tests {
         let before = store.github_drafts().unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE evaluation_history; PRAGMA user_version = 6;")
+            .execute_batch("DROP TABLE publication_preference; DROP TABLE evaluation_history; PRAGMA user_version = 6;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(migrated.evaluator_settings().unwrap(), Some(settings));
