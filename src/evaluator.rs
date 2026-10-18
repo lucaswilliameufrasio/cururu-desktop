@@ -64,7 +64,8 @@ impl EvaluatorSecrets {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ReviewAnalysisInput {
     pub repository_identity: String,
     pub path: String,
@@ -97,7 +98,7 @@ pub struct Explanation {
     pub draft_response: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JevOpinion {
     pub model: String,
     pub defect_probability: f32,
@@ -105,7 +106,7 @@ pub struct JevOpinion {
     pub severity_confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CombinedReviewAnalysis {
     pub openai_model: String,
     pub jev: JevOpinion,
@@ -152,7 +153,8 @@ impl DualReviewEvaluator {
     ) -> anyhow::Result<String> {
         validate_settings(settings)?;
         let mut digest = Sha256::new();
-        digest.update(b"cururu-desktop-dual-evaluator-v1\0");
+        digest.update(b"cururu-desktop-dual-evaluator-v2\0");
+        digest.update(rubric_fingerprint().as_bytes());
         digest.update(settings.openai_endpoint.as_bytes());
         digest.update([0]);
         digest.update(settings.openai_model.as_bytes());
@@ -341,6 +343,21 @@ impl DualReviewEvaluator {
             severity_confidence,
         })
     }
+}
+
+pub fn input_fingerprint(input: &ReviewAnalysisInput) -> anyhow::Result<String> {
+    BoundedInput::new(input)?;
+    let encoded = serde_json::to_vec(input).context("could not fingerprint review evidence")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+#[must_use]
+pub fn rubric_fingerprint() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cururu-dual-evaluator-rubric-v1\0");
+    digest.update(OPENAI_SYSTEM_PROMPT.as_bytes());
+    digest.update(jev_questions().to_string().as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn jev_questions() -> serde_json::Value {
@@ -777,6 +794,27 @@ mod tests {
             openai_api_key: "openai-test-key".to_string(),
             jev_api_key: "jev-test-key".to_string(),
         }
+    }
+
+    #[test]
+    fn evidence_identity_changes_with_every_input_component() {
+        let original = analysis_input();
+        let hash = super::input_fingerprint(&original).unwrap();
+        let mut encoded = serde_json::to_value(&original).unwrap();
+        let fields: Vec<String> = encoded.as_object().unwrap().keys().cloned().collect();
+        for field in fields {
+            let previous = encoded[&field].clone();
+            encoded[&field] = match field.as_str() {
+                "repository_identity" => serde_json::json!("different/repository"),
+                "line" => serde_json::json!(999),
+                "thread_context" => serde_json::json!(["different thread evidence"]),
+                _ => serde_json::json!("different bounded evidence"),
+            };
+            let changed: ReviewAnalysisInput = serde_json::from_value(encoded.clone()).unwrap();
+            assert_ne!(super::input_fingerprint(&changed).unwrap(), hash, "{field}");
+            encoded[&field] = previous;
+        }
+        assert_eq!(super::input_fingerprint(&original).unwrap(), hash);
     }
 
     fn analysis_input() -> ReviewAnalysisInput {

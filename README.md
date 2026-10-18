@@ -1,5 +1,13 @@
 # Cururu Desktop
 
+Second opinions can be explicitly saved in the **Local evaluation archive**, with
+an optional manual assessment. Loading/deleting records is local only. Archived
+results are never restored as live analysis, consent or publication state, and
+are labeled stale/unverified unless their revision and evidence identity match.
+Provider prose can contain quoted code; full inputs and keys are not archived.
+Limits: 200 records, 64,000 bytes each, 20 per page; nothing is silently pruned.
+Manual assessments do not enable automatic filtering or calibrated thresholds.
+
 Cururu Desktop is a native code-review client built on GPUI and the shared
 `cururu-core` domain crate plus `cururu-engine` review contracts. Both Cururu
 dependencies are pinned to the same Git revision so app updates adopt engine
