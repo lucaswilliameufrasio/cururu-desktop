@@ -96,35 +96,98 @@ pub fn prepare_with_context(
         .context("the finding does not contain an applicable code suggestion")?;
     validate_replacement(&suggested_change.replacement)?;
 
-    let target = safe_worktree_target(repository_root, &finding.path)?;
+    prepare_file(
+        snapshot,
+        identity,
+        FileSuggestion {
+            path: &finding.path,
+            line,
+            title: &finding.title,
+            replacement: &suggested_change.replacement,
+        },
+        context,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FileSuggestion<'a> {
+    path: &'a str,
+    line: u32,
+    title: &'a str,
+    replacement: &'a str,
+}
+
+pub fn prepare_remote(
+    repository_root: &Path,
+    source: &crate::github_pr::PullRequestSourceFile,
+    line: u32,
+    replacement: &str,
+) -> anyhow::Result<Preview> {
+    let identity = local_review::repository_identity(repository_root)?;
+    let snapshot = RepositorySnapshot::open(repository_root)?;
+    ensure!(
+        snapshot.head_oid.as_deref() == Some(source.commit_sha.as_str()),
+        "selected checkout HEAD must equal the reviewed GitHub commit"
+    );
+    prepare_file(
+        snapshot,
+        identity,
+        FileSuggestion {
+            path: &source.path,
+            line,
+            title: "GitHub comment suggestion",
+            replacement,
+        },
+        None,
+        Some(&source.content),
+    )
+}
+
+fn prepare_file(
+    snapshot: RepositorySnapshot,
+    identity: String,
+    suggestion: FileSuggestion<'_>,
+    context: Option<&crate::local_context::PreparedContext>,
+    expected_source: Option<&str>,
+) -> anyhow::Result<Preview> {
+    let FileSuggestion {
+        path,
+        line,
+        title,
+        replacement,
+    } = suggestion;
+    validate_replacement(replacement)?;
+    let target = safe_worktree_target(&snapshot.root, path)?;
     let metadata = fs::symlink_metadata(&target)
         .context("could not inspect the suggested file before previewing")?;
     let original_source = read_bounded_source(&target, &metadata)?;
+    ensure!(
+        expected_source.is_none_or(|expected| expected == original_source),
+        "local target differs from the reviewed GitHub source; no file was modified"
+    );
     let original_line = source_line(&original_source, line)?;
-    let replacement_source = replace_line(&original_source, line, &suggested_change.replacement)?;
+    let replacement_source = replace_line(&original_source, line, replacement)?;
     ensure!(
         replacement_source != original_source,
         "the suggestion does not change the selected source line"
     );
     let diff = TextDiff::from_lines(&original_source, &replacement_source)
         .unified_diff()
-        .header(
-            &format!("a/{}", finding.path),
-            &format!("b/{}", finding.path),
-        )
+        .header(&format!("a/{path}"), &format!("b/{path}"))
         .to_string();
 
     Ok(Preview {
         context: context.cloned(),
-        path: finding.path.clone(),
+        path: path.to_string(),
         line,
-        title: finding.title.clone(),
+        title: title.to_string(),
         original_line,
-        replacement: suggested_change.replacement.clone(),
+        replacement: replacement.to_string(),
         diff,
+        reviewed_diff_fingerprint: local_review::snapshot_fingerprint(&snapshot),
         root: snapshot.root,
         repository_identity: identity,
-        reviewed_diff_fingerprint: reviewed_diff_fingerprint.to_string(),
         original_source,
         replacement_source,
     })

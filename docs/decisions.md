@@ -1,5 +1,28 @@
 # Desktop architecture decisions
 
+## Import GitHub suggestions without implicit commit/push
+
+Support exactly one plain single-line suggestion block on a current-head,
+right-side, non-outdated GitHub inline comment. Reject offsets, empty/deletion,
+multiline and ambiguous/nested fences instead of guessing ranges. Use loaded
+source at the same head and exact changed-line anchors. The user selects a local
+checkout, which must already be at that head; do not clone, checkout, fetch,
+stage, commit or push. Require the local target to match the full reviewed source
+and show a diff before a separate application confirmation.
+
+Before application, read fresh PR metadata/files/comments with the existing
+bounded client and 30-second timeout, compare reference/base/head/comment/anchor,
+then recheck the local snapshot and exact source through the existing safe-write
+boundary. No remote POST/PATCH/PUT/DELETE is used. This is a preflight, not a
+distributed lock on GitHub: a later remote update does not authorize a push.
+Busy preparation/application blocks checkout/PR navigation. A source already
+changed by the user is never overwritten; repeated application fails closed.
+
+A separate explicit link opens the validated repository/PR/comment URL at GitHub
+for its hosted application/commit flow, without using untrusted `html_url` as an
+arbitrary browser target. Native remote commit creation is not implemented by
+this import flow; application, commit and push remain distinct actions.
+
 ## Explicit local repository context and focus
 
 The desktop consumes engine pin dc7a270 and its bounded `ReviewContext` contract.
