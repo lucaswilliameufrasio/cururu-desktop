@@ -67,6 +67,7 @@ pub struct PolicySuppressedFinding {
 
 #[derive(Debug, Clone)]
 pub struct LocalReviewResult {
+    pub context: Option<crate::local_context::PreparedContext>,
     pub review: cururu_core::ReviewResult,
     pub usage: Option<cururu_engine::ReviewUsage>,
     pub diff_fingerprint: String,
@@ -94,7 +95,7 @@ pub fn repository_identity(root: &Path) -> anyhow::Result<String> {
 pub fn config_fingerprint(settings: &LocalReviewSettings) -> anyhow::Result<String> {
     settings.validate()?;
     let mut digest = Sha256::new();
-    digest.update(b"cururu-desktop-local-review-v1\0");
+    digest.update(b"cururu-desktop-local-review-v2-explicit-context\0");
     digest.update(settings.openai_endpoint.as_bytes());
     digest.update([0]);
     digest.update(settings.openai_model.as_bytes());
@@ -170,6 +171,7 @@ pub async fn review_snapshot(
     settings: &LocalReviewSettings,
     secrets: &LocalReviewSecrets,
     snapshot: &RepositorySnapshot,
+    context: Option<&crate::local_context::PreparedContext>,
 ) -> anyhow::Result<LocalReviewResult> {
     settings.validate()?;
     let chunks = bounded_chunks(snapshot)?;
@@ -182,9 +184,15 @@ pub async fn review_snapshot(
             max_output_tokens: REVIEW_MAX_OUTPUT_TOKENS,
         },
         system_prompt(),
-    )?;
+    )?
+    .with_review_context(&context.map_or_else(
+        cururu_engine::review_context::ReviewContext::default,
+        |context| context.evidence.clone(),
+    ))?;
     let chunk_results = cururu_engine::review_chunks(&agent, &chunks).await?;
-    assemble_review_result(settings, snapshot, chunk_results)
+    let mut result = assemble_review_result(settings, snapshot, chunk_results)?;
+    result.context = context.cloned();
+    Ok(result)
 }
 
 fn bounded_chunks(snapshot: &RepositorySnapshot) -> anyhow::Result<Vec<cururu_core::DiffChunk>> {
@@ -288,6 +296,7 @@ fn assemble_review_result(
     );
 
     Ok(LocalReviewResult {
+        context: None,
         review,
         usage,
         diff_fingerprint: snapshot_fingerprint(snapshot),

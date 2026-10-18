@@ -73,7 +73,7 @@ it after rechecking the reviewed diff and exact file contents. Applying a
 suggestion does not run commands, stage, commit, or push.
 
 Local review reads a regular `.cururu.toml` at the checkout root (up to 64 KiB)
-using the shared engine schema. The initial desktop support is restriction-only:
+using the shared engine schema. Supported restriction fields are:
 `review.max_diff_bytes`, `chunk_bytes`, `ignore`, and `policy.minimum_confidence`,
 `max_findings`, `allowed_severities`, `suggested_changes`. Limits cannot exceed
 the desktop ceilings. Valid policy-suppressed findings remain visible with a
@@ -82,9 +82,25 @@ and consent remain local. The config file's patch is not sent for review.
 Configuration changes invalidate an in-flight review even when Git ignores the
 file. Unsupported or invalid configuration blocks AI review; manual diff/drafts
 remain available subject to the worktree reader's existing file limits and
-non-symlink-file support. Context/shared-base/analyzer sections and unsupported review/policy
+non-symlink-file support. Shared-base/analyzer sections and unsupported review/policy
 fields are not implemented in the desktop yet and block AI sends rather than
 being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
+
+`policy.focus` and exact paths under `context.conventions`, `specifications`,
+`skills` and `additional` are optional evidence. Parsing only lists declarations:
+**Load declared context locally for preview** explicitly reads them, then
+**Include this previewed context** approves inclusion in the next review.
+Alternatively choose **Review diff only** to explicitly exclude context/focus.
+Nothing is sent by loading/previewing. These choices stay in memory and are
+bound to the checkout and diff/configuration identity. Provider consent remains
+separate. Context is JSON user data, never system instructions; skills are not
+executed. Paths are descriptor-relative with no symlinks; credential locations,
+hardlinks, special files, non-text and over-budget evidence are rejected. Limits
+are 32 files, 16,000 bytes/file and 64,000 bytes total, lowered by
+`context.max_bytes`. Evidence is repeated per diff chunk. Globs and automatic
+discovery are unsupported (only `context.auto.enabled = false` is accepted).
+Context is re-read before/after sending and before previewing/applying a resulting
+suggestion; a changed document invalidates approval, including ignored files.
 
 Local tests and analyzers are a separate, manually entered workflow. Cururu
 shows the resolved executable, literal arguments, checkout, working directory,

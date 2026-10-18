@@ -1,5 +1,32 @@
 # Desktop architecture decisions
 
+## Explicit local repository context and focus
+
+The desktop consumes engine pin dc7a270 and its bounded `ReviewContext` contract.
+This extends the earlier restriction-only configuration slice for local context
+and focus only. Shared-base fetching, globs, automatic context discovery and
+analyzer ingestion remain unsupported/fail-closed. Accept exact configured paths
+and `policy.focus`; parsing must not open referenced files. List declarations,
+require a separate local Load action, show the text, then require inclusion or
+an explicit diff-only choice. Do not silently omit declared evidence. Choices
+are memory-only and bound to canonical checkout plus diff/configuration hash.
+Provider consent is separate and its fingerprint is versioned for this extension.
+
+Host reads use descriptor-relative `openat` with no-follow flags on every path
+component, bounded nonblocking reads and regular-file/link checks. Block known
+credential/configuration paths, traversal, globs, symlinks, hardlinks, special
+files, binary text and excesses; do not truncate. This is not a general secret
+scanner: warn that document contents may be private and require visual inspection
+before inclusion. Limits intersect engine ceilings (32 files, 16kB/file, 64kB
+content total); context is repeated for each of at most four diff chunks.
+
+Keep approved context in the request/result, not SQLite. Re-read approved files
+in pre/postflight and before preparing/applying suggestions. Compare evidence
+hashes even when Git ignores the document. Context stays separate from canonical
+diff anchors and the system prompt: the shared adapter sends it as JSON user
+data with an untrusted-evidence warning. Existing empty-context wire behavior is
+preserved. Skills referenced as context are not executable agent instructions.
+
 ## Personal publication preview preference
 
 SQLite schema 8 stores an app-local individual/batch preference. Batch remains
