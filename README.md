@@ -1,5 +1,10 @@
 # Cururu Desktop
 
+The GitHub composer remembers a personal **Individual comments / Batch review**
+preview preference locally. This changes only the primary preview action: both
+paths still require explicit confirmation, and switching never publishes or
+discards drafts.
+
 Second opinions can be explicitly saved in the **Local evaluation archive**, with
 an optional manual assessment. Loading/deleting records is local only. Archived
 results are never restored as live analysis, consent or publication state, and

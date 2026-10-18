@@ -31,6 +31,7 @@ pub mod github_pr;
 mod github_session;
 pub mod local_command;
 pub mod local_review;
+mod publication_preference;
 pub mod repository;
 mod repository_policy;
 mod review_publication;
@@ -457,6 +458,13 @@ impl ReviewWorkspace {
         let mut workspace = Self::sample();
         match session_store::SessionStore::open_default() {
             Ok(store) => {
+                match store.publication_preference() {
+                    Ok(preference) => workspace.review_publication.restore_preference(preference),
+                    Err(error) => {
+                        workspace.notice =
+                            Some(format!("Could not read publication preference: {error}").into());
+                    }
+                }
                 if let Err(error) = workspace.review_publication.restore(store.github_drafts()) {
                     workspace.session_store_error =
                         Some(format!("Could not restore GitHub drafts: {error}").into());
