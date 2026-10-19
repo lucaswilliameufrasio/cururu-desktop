@@ -1,5 +1,23 @@
 # Desktop architecture decisions
 
+## Incremental local review skips only exact saved inputs
+
+CLI incremental behavior checks whether a review summary exists for the current
+SCM revision. Desktop adapts that host-owned decision to its working-tree model:
+after fresh checkout/context/consent validation, query bounded immutable history
+for the same canonical checkout, HEAD, diff/config, provider configuration,
+context and approved-base fingerprints. On a match, show the archived record ID
+as a skipped outcome before any keyring/provider access. Do not restore findings,
+permissions, suggestions or publication state. An annotation is not a calibrated
+verdict; it does not change cache identity.
+
+No match runs the normal explicitly requested review. A separate force-send
+button bypasses archive lookup, not consent/freshness/limits. Perform postflight
+validation for both skip and provider results; corruption/storage errors fail
+closed rather than silently sending. Bound lookup to the existing 200 records.
+Only explicitly saved results participate; this introduces neither autosave nor
+automatic review execution. Static artifacts are still separate local evidence.
+
 ## Explicit revision-bound local static artifacts
 
 Consume the shared SARIF parser from principal ADR 010 (pin f041ed2). A configured

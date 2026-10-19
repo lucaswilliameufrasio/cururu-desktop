@@ -479,7 +479,7 @@ mod tests {
         );
         assert!(
             crate::repository_policy::RepositoryPolicy::parse(
-                "version = 1\n[policy]\nincremental = true"
+                "version = 1\n[policy]\nincremental = 'invalid'"
             )
             .is_err()
         );

@@ -33,6 +33,7 @@ mod gh_cli;
 pub mod github_auth;
 pub mod github_pr;
 mod github_session;
+mod incremental_review;
 mod local_analysis;
 mod local_analysis_ui;
 pub mod local_command;
@@ -202,6 +203,7 @@ struct LocalReviewRequestContext {
 
 #[derive(Clone)]
 struct LocalReviewRequest {
+    force_recheck: bool,
     base: Option<shared_base::ApprovedBase>,
     evidence: Option<local_context::PreparedContext>,
     context: LocalReviewRequestContext,
@@ -300,6 +302,7 @@ enum LocalReviewState {
     },
     Running(LocalReviewRequestContext),
     Complete(Box<local_review::LocalReviewResult>),
+    Skipped(String),
     Failed(SharedString),
 }
 
@@ -2258,6 +2261,7 @@ impl ReviewWorkspace {
         let validation = self.validate_review_evidence(snapshot);
         let evidence = self.local_context_state.resolve(snapshot).ok().flatten();
         let request = validation.as_ref().ok().map(|_| LocalReviewRequest {
+            force_recheck: false,
             base: shared_base::approval(snapshot),
             evidence: evidence.clone(),
             context: LocalReviewRequestContext {
@@ -2280,6 +2284,7 @@ impl ReviewWorkspace {
                 && !is_local_command_running
                 && !is_authorization_busy
                 && !is_suggestion_busy,
+            incremental_review::enabled(snapshot),
         );
         let validation_message = local_review_validation_message(snapshot, validation);
         let authorization_message = local_review_authorization_message(is_authorized);
@@ -3025,6 +3030,7 @@ fn local_review_state_message(state: &LocalReviewState) -> Option<SharedString> 
             "Review completed. Findings are informational; nothing was changed or published."
                 .into(),
         ),
+        LocalReviewState::Skipped(id) => Some(format!("Incremental: an exact input match was observed in saved record {id}. No provider request or restoration of findings/permissions occurred.").into()),
         LocalReviewState::Failed(message) => Some(message.clone()),
     }
 }
@@ -3438,13 +3444,14 @@ fn local_policy_summary(snapshot: &repository::RepositorySnapshot) -> String {
         return "repository policy unavailable".to_string();
     };
     format!(
-        "profile {:?}; minimum confidence {}; max findings {}; severities {:?}; suggestions {}; synthesis {}; informational quality threshold {:?}",
+        "profile {:?}; minimum confidence {}; max findings {}; severities {:?}; suggestions {}; synthesis {}; reuse {:?}; informational quality threshold {:?}",
         policy.profile,
         policy.minimum_confidence,
         policy.max_findings,
         policy.allowed_severities,
         policy.suggested_changes,
         policy.synthesis,
+        policy.review_reuse,
         policy.fail_on
     )
 }
@@ -3700,6 +3707,39 @@ fn complete_local_review_authorization(
 }
 
 fn render_local_review_send_button(
+    entity: &Entity<ReviewWorkspace>,
+    request: Option<LocalReviewRequest>,
+    can_review: bool,
+    allow_force: bool,
+) -> impl IntoElement + use<> {
+    let forced = request.clone().map(|mut request| {
+        request.force_recheck = true;
+        request
+    });
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(render_single_local_review_send_button(
+            entity, request, can_review,
+        ));
+    if allow_force {
+        let entity = entity.clone();
+        panel = panel.child(
+            Button::new("force-fresh-local-review")
+                .label("Explicitly send again even if an exact archive exists")
+                .disabled(!can_review || forced.is_none())
+                .on_click(move |_, _, cx| {
+                    if let Some(request) = forced.clone() {
+                        start_local_review(&entity, request, cx);
+                    }
+                }),
+        );
+    }
+    panel
+}
+
+fn render_single_local_review_send_button(
     entity: &Entity<ReviewWorkspace>,
     request: Option<LocalReviewRequest>,
     can_review: bool,
@@ -4045,12 +4085,16 @@ fn start_local_review(
                 return;
             }
             match result {
-                Ok(review) => {
-                    this.local_review_state = LocalReviewState::Complete(Box::new(review));
+                Ok(incremental_review::Outcome::Complete(review)) => {
+                    this.local_review_state = LocalReviewState::Complete(review);
                     this.notice = Some(
                         "Local review completed. Findings are informational; no files were changed or published."
                             .into(),
                     );
+                }
+                Ok(incremental_review::Outcome::Skipped(id)) => {
+                    this.local_review_state = LocalReviewState::Skipped(id);
+                    this.notice = Some("Exact archived inputs found; no keyring/provider access was needed and no findings or permissions were restored. Inspect saved history or explicitly force a fresh review.".into());
                 }
                 Err(error) => {
                     this.local_review_state = LocalReviewState::Failed(error.to_string().into());
@@ -4066,29 +4110,31 @@ async fn run_local_review(
     store: session_store::SessionStore,
     request: LocalReviewRequest,
     executor: BackgroundExecutor,
-) -> anyhow::Result<local_review::LocalReviewResult> {
+) -> anyhow::Result<incremental_review::Outcome> {
     let preflight_store = store.clone();
     let preflight_request = request.clone();
-    let (snapshot, secrets) = executor
-        .spawn(async move {
-            validate_local_review_request(&preflight_store, &preflight_request)?;
-            let snapshot =
-                repository::RepositorySnapshot::open(&preflight_request.repository_root)?
-                    .with_shared_base(preflight_request.base.as_ref())?;
-            validate_local_review_snapshot(&preflight_request, &snapshot)?;
-            let secrets = local_review::LocalReviewSecrets::load()?
-                .context("local review API key is unavailable in the OS keyring")?;
-            Ok::<_, anyhow::Error>((snapshot, secrets))
-        })
+    let (snapshot, matching) = executor
+        .spawn(async move { incremental_review::preflight(&preflight_store, &preflight_request) })
         .await?;
 
-    let result = local_review::review_snapshot(
-        &request.settings,
-        &secrets,
-        &snapshot,
-        request.evidence.as_ref(),
-    )
-    .await?;
+    let result = if let Some(id) = matching {
+        incremental_review::Outcome::Skipped(id)
+    } else {
+        let secrets = executor
+            .spawn(async move {
+                local_review::LocalReviewSecrets::load()?
+                    .context("local review API key is unavailable in the OS keyring")
+            })
+            .await?;
+        let review = local_review::review_snapshot(
+            &request.settings,
+            &secrets,
+            &snapshot,
+            request.evidence.as_ref(),
+        )
+        .await?;
+        incremental_review::Outcome::Complete(Box::new(review))
+    };
 
     let postflight_store = store;
     let postflight_request = request;
@@ -6350,6 +6396,7 @@ mod tests {
         let config_fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
         let snapshot_fingerprint = super::local_review::snapshot_fingerprint(&snapshot);
         let request = LocalReviewRequest {
+            force_recheck: false,
             base: None,
             evidence: None,
             context: LocalReviewRequestContext {
