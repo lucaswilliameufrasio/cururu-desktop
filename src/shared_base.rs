@@ -287,6 +287,30 @@ mod tests {
     }
 
     #[test]
+    fn reopening_for_context_preview_keeps_approved_base_without_fetching_again() {
+        let (root, _) = fixture();
+        std::fs::write(root.path().join("CONTEXT.md"), "Check errors\n").unwrap();
+        let snapshot = crate::repository::RepositorySnapshot::open(root.path()).unwrap();
+        let approved = ApprovedBase::prepare(
+            &snapshot,
+            "version = 1\n[context]\nconventions = ['CONTEXT.md']",
+        )
+        .unwrap();
+        let resolved = snapshot.with_shared_base(Some(&approved)).unwrap();
+        // Prepare the same UI preview path against a fresh local snapshot.
+        let fresh = resolved.reopen_with_approved_base().unwrap();
+        assert_eq!(fingerprint(&fresh), fingerprint(&resolved));
+        assert_eq!(
+            crate::local_context::scope(&fresh).unwrap(),
+            crate::local_context::scope(&resolved).unwrap()
+        );
+        let context = crate::local_context::load(&fresh).unwrap();
+        assert_eq!(context.evidence.files[0].content, "Check errors\n");
+        assert_eq!(context.evidence.focus, ["correctness"]);
+        assert!(crate::local_context::validate(&fresh, Some(&context)).is_ok());
+    }
+
+    #[test]
     fn approved_base_is_reused_locally_and_config_edits_block_suggestion_application() {
         let (root, snapshot) = fixture();
         let approved = ApprovedBase::prepare(&snapshot, "version = 1").unwrap();

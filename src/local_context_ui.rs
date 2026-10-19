@@ -202,7 +202,7 @@ fn load_context(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
         let result = cx
             .background_executor()
             .spawn(async move {
-                let current = RepositorySnapshot::open(&snapshot.root)?;
+                let current = snapshot.reopen_with_approved_base()?;
                 ensure!(
                     local_context::scope(&current)? == local_context::scope(&snapshot)?,
                     "checkout/configuration changed before context preview"
