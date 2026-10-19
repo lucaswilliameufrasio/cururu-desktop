@@ -34,6 +34,8 @@ pub mod local_command;
 mod local_context;
 mod local_context_ui;
 pub mod local_review;
+mod local_review_history;
+mod local_review_history_ui;
 mod publication_preference;
 mod remote_suggestion;
 pub mod repository;
@@ -134,6 +136,7 @@ struct ReviewWorkspace {
     local_context_state: local_context_ui::ContextState,
     remote_suggestion_state: remote_suggestion::RemoteSuggestionState,
     shared_base_state: shared_base_ui::SharedBaseState,
+    local_history_state: local_review_history_ui::HistoryState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -460,6 +463,7 @@ impl ReviewWorkspace {
             local_context_state: local_context_ui::ContextState::default(),
             remote_suggestion_state: remote_suggestion::RemoteSuggestionState::default(),
             shared_base_state: shared_base_ui::SharedBaseState::default(),
+            local_history_state: local_review_history_ui::HistoryState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -1961,11 +1965,16 @@ impl ReviewWorkspace {
     fn render_finding_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         let Some(selected_file) = self.selected_file else {
             return div()
+                .id("review-detail-panel")
+                .min_h_0()
+                .overflow_y_scroll()
                 .w(px(300.0))
                 .flex_shrink_0()
                 .border_l_1()
                 .border_color(rgb(0x002b_3946))
-                .bg(rgb(0x0015_1e27));
+                .bg(rgb(0x0015_1e27))
+                .p_4()
+                .child(self.render_local_history(cx));
         };
         let file = &self.files[selected_file];
         let line = &file.lines[self.selected_line];
@@ -1990,6 +1999,9 @@ impl ReviewWorkspace {
         };
         let review_controls = self.render_review_controls(cx, file.path.as_ref(), line.new_number);
         div()
+            .id("review-detail-panel")
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .w(px(300.0))
@@ -2090,6 +2102,7 @@ impl ReviewWorkspace {
                 .flex_col()
                 .gap_2()
                 .child(self.render_local_review_action(cx))
+                .child(self.render_local_history(cx))
                 .child(self.render_local_command_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
