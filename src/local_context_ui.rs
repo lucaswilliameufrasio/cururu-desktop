@@ -349,6 +349,7 @@ mod tests {
         workspace.local_context_state = included;
         let evidence = workspace.local_context_state.resolve(&snapshot).unwrap();
         let mut request = crate::LocalReviewRequest {
+            force_recheck: false,
             base: None,
             context: crate::LocalReviewRequestContext {
                 base_fingerprint: None,

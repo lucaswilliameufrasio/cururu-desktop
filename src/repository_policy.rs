@@ -9,6 +9,22 @@ use sha2::{Digest as _, Sha256};
 
 const MAX_CONFIG_BYTES: usize = 65_536;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewReuse {
+    Fresh,
+    ExactArchive,
+}
+
+impl ReviewReuse {
+    const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::ExactArchive
+        } else {
+            Self::Fresh
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryPolicy {
     pub profile: Option<String>,
@@ -19,6 +35,7 @@ pub struct RepositoryPolicy {
     pub max_findings: usize,
     pub fail_on: cururu_core::FailOn,
     pub synthesis: bool,
+    pub review_reuse: ReviewReuse,
     pub allowed_severities: Vec<Severity>,
     pub suggested_changes: bool,
     pub ignore: Vec<String>,
@@ -41,6 +58,7 @@ impl Default for RepositoryPolicy {
             max_findings: crate::local_review::MAX_REVIEW_FINDINGS,
             fail_on: cururu_core::FailOn::Off,
             synthesis: false,
+            review_reuse: ReviewReuse::Fresh,
             allowed_severities: Severity::all(),
             suggested_changes: true,
             ignore: vec![],
@@ -67,15 +85,10 @@ impl RepositoryPolicy {
             .map_err(|_| anyhow::anyhow!("review.profile is unsupported"))
     }
 
-    fn from_profile(
-        profile: Option<&cururu_engine::review_policy::ReviewPolicy>,
-    ) -> anyhow::Result<Self> {
+    fn from_profile(profile: Option<&cururu_engine::review_policy::ReviewPolicy>) -> Self {
         let mut policy = Self::default();
         if let Some(profile) = profile {
-            ensure!(
-                !profile.incremental,
-                "desktop review does not support incremental profiles"
-            );
+            policy.review_reuse = ReviewReuse::from_enabled(profile.incremental);
             policy.profile = Some(profile.profile.trim().to_ascii_lowercase());
             policy.minimum_confidence = profile.minimum_confidence;
             policy.max_findings = profile
@@ -88,7 +101,7 @@ impl RepositoryPolicy {
             policy.suggested_changes = profile.suggested_changes;
             policy.synthesis = profile.synthesis;
         }
-        Ok(policy)
+        policy
     }
 
     pub fn load(root: &Path) -> anyhow::Result<Self> {
@@ -158,7 +171,7 @@ impl RepositoryPolicy {
                             .map_or_else(Vec::new, |profile| profile.focus.clone())
                     }),
             )?,
-            ..Self::from_profile(profile.as_ref())?
+            ..Self::from_profile(profile.as_ref())
         };
         if policy.shared_base.is_some() {
             policy.local_document = Some(crate::shared_base::ConfigDocument::new(raw));
@@ -189,10 +202,9 @@ impl RepositoryPolicy {
             policy.ignore_set()?;
         }
         if let Some(repository) = parsed.policy {
-            ensure!(
-                !repository.incremental.unwrap_or(false),
-                "desktop review does not yet support policy.incremental"
-            );
+            if let Some(incremental) = repository.incremental {
+                policy.review_reuse = ReviewReuse::from_enabled(incremental);
+            }
             if let Some(threshold) = repository.fail_on {
                 policy.fail_on = cururu_core::FailOn::from_name(&threshold)
                     .context("policy.fail_on contains an unsupported severity")?;

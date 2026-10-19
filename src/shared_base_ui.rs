@@ -70,6 +70,8 @@ impl ReviewWorkspace {
             SharedBaseState::Preview(base) => {
                 if let Ok(effective) = base.resolve(snapshot) {
                     let entity = cx.entity();
+                    panel =
+                        panel.child(format!("Local review reuse: {:?}", effective.review_reuse));
                     panel = panel.child(format!(
                         "Local analysis declarations (no execution): {:?}",
                         effective.analysis

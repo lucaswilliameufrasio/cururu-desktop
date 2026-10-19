@@ -25,7 +25,12 @@ uses its severity quality gate and shows an informational passed/failed/disabled
 status for retained findings, also preserved in newly saved review snapshots.
 This status never publishes, suppresses findings, applies changes or blocks human
 discussion automatically. Legacy archives without a threshold show it as unknown.
-`policy.incremental` is still unsupported.
+`policy.incremental = true` skips a manually requested provider review when an
+explicitly saved record matches the exact checkout/HEAD/diff/provider/context/base
+inputs. The panel shows its ID without reading the keyring or calling the provider;
+it does not restore findings or apply/publish permissions. A separate explicit
+send-again button bypasses this lookup, never consent/freshness/limits. Only saved
+records participate. Storage corruption fails closed rather than silently sending.
 
 Explicit `review.profile` supports balanced/strict/security/minimal through the
 same pure catalog as CLI, followed by explicit policy overrides and desktop
