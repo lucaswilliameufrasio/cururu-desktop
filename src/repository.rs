@@ -20,6 +20,12 @@ pub struct RepositorySnapshot {
 }
 
 impl RepositorySnapshot {
+    /// Reopens only local state and reapplies already-approved pinned bytes.
+    /// This never fetches remote configuration or grants a new approval.
+    pub fn reopen_with_approved_base(&self) -> anyhow::Result<Self> {
+        Self::open(&self.root)?.with_shared_base(crate::shared_base::approval(self).as_ref())
+    }
+
     pub fn with_shared_base(
         mut self,
         base: Option<&crate::shared_base::ApprovedBase>,
