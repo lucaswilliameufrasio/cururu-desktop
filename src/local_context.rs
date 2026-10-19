@@ -134,6 +134,7 @@ pub fn load(snapshot: &crate::repository::RepositorySnapshot) -> anyhow::Result<
         .review_policy
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    policy.require_ready()?;
     let mut evidence = ReviewContext {
         focus: policy.context.focus.clone(),
         files: Vec::new(),
@@ -186,6 +187,10 @@ pub fn scope(snapshot: &crate::repository::RepositorySnapshot) -> anyhow::Result
     digest.update(crate::local_review::repository_identity(&snapshot.root)?.as_bytes());
     digest.update([0]);
     digest.update(crate::local_review::snapshot_fingerprint(snapshot).as_bytes());
+    if let Some(base) = crate::shared_base::fingerprint(snapshot) {
+        digest.update([0]);
+        digest.update(base.as_bytes());
+    }
     Ok(format!("{:x}", digest.finalize()))
 }
 

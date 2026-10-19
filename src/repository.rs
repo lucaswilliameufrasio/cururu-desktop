@@ -20,6 +20,16 @@ pub struct RepositorySnapshot {
 }
 
 impl RepositorySnapshot {
+    pub fn with_shared_base(
+        mut self,
+        base: Option<&crate::shared_base::ApprovedBase>,
+    ) -> anyhow::Result<Self> {
+        if let Some(base) = base {
+            self.review_policy = Ok(base.resolve(&self)?);
+        }
+        Ok(self)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let repository = gix::discover(path.as_ref())?;
         let root = repository
