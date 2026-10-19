@@ -52,7 +52,7 @@ This status never publishes, suppresses findings, applies changes or blocks huma
 discussion automatically. Legacy archives without a threshold show it as unknown.
 `policy.incremental = true` skips a manually requested provider review when an
 explicitly saved record matches the exact checkout/HEAD/diff/provider/context/base
-inputs. The panel shows its ID without reading the keyring or calling the provider;
+and included static-evidence inputs. The panel shows its ID without reading the keyring or calling the provider;
 it does not restore findings or apply/publish permissions. A separate explicit
 send-again button bypasses this lookup, never consent/freshness/limits. Only saved
 records participate. Storage corruption fails closed rather than silently sending.
@@ -186,9 +186,10 @@ HTTPS OpenAI-compatible endpoint and model; the API key is stored in a dedicated
 OS-keyring entry, separate from evaluator credentials. Saving settings and
 authorizing a checkout send no code. Consent is stored per canonical checkout
 path and provider/prompt fingerprint. Before the send action, the workspace shows
-the destination, changed-file count, and limits. Only changed-file paths and
-bounded unified diffs are sent (up to 100 files, 45,000 bytes per file, and
-180,000 bytes total). The app rechecks consent and the exact diff before sending
+the destination, changed-file count, and limits. The base request sends changed-file
+paths and bounded unified diffs (up to 100 files, 45,000 bytes per file, and
+180,000 bytes total). Context/presentation data and normalized static evidence
+require their separate explicit inclusion choices described above. The app rechecks consent and the exact diff before sending
 and discards the result if the checkout changes during review. Findings are
 informational and are never applied automatically. A structured single-line
 suggestion can be previewed as a local diff; only a separate confirmation applies
@@ -198,16 +199,18 @@ suggestion does not run commands, stage, commit, or push.
 Local review reads a regular `.cururu.toml` at the checkout root (up to 64 KiB)
 using the shared engine schema. Supported restriction fields are:
 `review.max_diff_bytes`, `chunk_bytes`, `ignore`, and `policy.minimum_confidence`,
-`max_findings`, `allowed_severities`, `suggested_changes`. Limits cannot exceed
+`max_findings`, `allowed_severities`, `suggested_changes`. Explicit profiles,
+presentation, synthesis, informational quality status, incremental reuse and local
+analysis artifacts are also supported under the consent boundaries above. Limits cannot exceed
 the desktop ceilings. Valid policy-suppressed findings remain visible with a
 reason. Provider settings in the repository are ignored: destination/model/key
 and consent remain local. The config file's patch is not sent for review.
 Configuration changes invalidate an in-flight review even when Git ignores the
 file. Unsupported or invalid configuration blocks AI review; manual diff/drafts
 remain available subject to the worktree reader's existing file limits and
-non-symlink-file support. Analyzer sections and unsupported review/policy
-fields are not implemented in the desktop yet and block AI sends rather than
-being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
+non-symlink-file support. Unsupported configurations (including automatic extra
+recommendation requests, remote check runs and unbound SARIF) block AI sends
+rather than being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
 
 `policy.focus` and paths/globs under `context.conventions`, `specifications`,
 `skills` and `additional` are optional evidence. Parsing only lists declarations:
