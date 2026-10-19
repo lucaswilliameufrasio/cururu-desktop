@@ -1,5 +1,22 @@
 # Desktop architecture decisions
 
+## Explicit approved presentation preferences and advisory publication hints
+
+Use engine ReviewPreferences (ADR 011, pin 20b17be) for explicit language/tone/
+technical_level/suggestion_detail only; do not duplicate CLI defaults. Extend the
+existing context choice to preview/include or exclude these bounded preferences.
+They are fingerprinted with evidence and revalidated through review/suggestion/
+incremental guards, then sent as a separate JSON user message, never system
+instructions or synthetic repository files. No preference changes provider,
+model, key, permissions or request count. No declaration means the prior wire
+shape remains unchanged. Excluding context also excludes these preferences.
+
+Accept valid comment_mode only as a visible advisory hint: personal publication
+controls remain authoritative. Accept recommendations=false; reject true because
+repository configuration cannot authorize extra provider calls. Credentials and
+raw approved preference/context data are not added to SQLite snapshots. This
+supersedes the unsupported explicit-style limitation, not consent boundaries.
+
 ## Incremental local review skips only exact saved inputs
 
 CLI incremental behavior checks whether a review summary exists for the current

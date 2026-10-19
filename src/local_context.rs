@@ -24,6 +24,7 @@ pub enum ContextSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSpec {
+    pub preferences: cururu_engine::review_preferences::ReviewPreferences,
     pub focus: Vec<String>,
     pub paths: Vec<ContextPath>,
     pub max_bytes: usize,
@@ -33,6 +34,7 @@ pub struct ContextSpec {
 impl Default for ContextSpec {
     fn default() -> Self {
         Self {
+            preferences: cururu_engine::review_preferences::ReviewPreferences::default(),
             focus: Vec::new(),
             paths: Vec::new(),
             max_bytes: MAX_CONTEXT_BYTES,
@@ -42,6 +44,17 @@ impl Default for ContextSpec {
 }
 
 impl ContextSpec {
+    pub fn with_preferences(
+        mut self,
+        preferences: cururu_engine::review_preferences::ReviewPreferences,
+    ) -> anyhow::Result<Self> {
+        preferences.validate().map_err(|_| {
+            anyhow::anyhow!("review presentation preferences are invalid or oversized")
+        })?;
+        self.preferences = preferences;
+        Ok(self)
+    }
+
     pub fn parse(context: Option<ContextToml>, focus: Vec<String>) -> anyhow::Result<Self> {
         let mut spec = Self {
             focus,
@@ -91,12 +104,16 @@ impl ContextSpec {
     }
 
     pub const fn requires_choice(&self) -> bool {
-        !self.focus.is_empty() || !self.paths.is_empty() || self.auto.enabled
+        !self.focus.is_empty()
+            || !self.paths.is_empty()
+            || self.auto.enabled
+            || !self.preferences.is_empty()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PreparedContext {
+    pub preferences: cururu_engine::review_preferences::ReviewPreferences,
     pub snapshot_fingerprint: String,
     pub fingerprint: String,
     pub evidence: ReviewContext,
@@ -158,8 +175,9 @@ pub fn load_manifest(
         });
     }
     evidence.validate()?;
-    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&evidence)?));
+    let fingerprint = context_fingerprint(&evidence, &policy.context.preferences)?;
     Ok(PreparedContext {
+        preferences: policy.context.preferences.clone(),
         snapshot_fingerprint: scope(snapshot)?,
         fingerprint,
         evidence,
@@ -212,10 +230,7 @@ pub fn validate(
     if let Some(approved) = approved {
         approved.evidence.validate()?;
         ensure!(
-            format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&approved.evidence)?)
-            ) == approved.fingerprint,
+            context_fingerprint(&approved.evidence, &approved.preferences)? == approved.fingerprint,
             "approved context no longer matches its fingerprint"
         );
         ensure!(
@@ -229,6 +244,17 @@ pub fn validate(
         );
     }
     Ok(())
+}
+
+fn context_fingerprint(
+    evidence: &ReviewContext,
+    preferences: &cururu_engine::review_preferences::ReviewPreferences,
+) -> anyhow::Result<String> {
+    preferences.validate()?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(evidence, preferences))?)
+    ))
 }
 
 #[cfg(unix)]
@@ -390,5 +416,47 @@ mod tests {
         )
         .unwrap();
         assert!(load(&snapshot).is_err());
+    }
+    #[test]
+    fn presentation_preferences_require_preview_inclusion_and_are_bound_to_the_context_hash() {
+        let root = tempfile::tempdir().unwrap();
+        gix::init(root.path()).unwrap();
+        let config = "version = 1\n[review]\nlanguage = 'pt-BR'\ntone = 'didactic'\ntechnical_level = 'expert'\nsuggestion_detail = 'detailed'\ncomment_mode = 'summary'\nrecommendations = false";
+        std::fs::write(root.path().join(".cururu.toml"), config).unwrap();
+        let snapshot = crate::repository::RepositorySnapshot::open(root.path()).unwrap();
+        assert!(
+            crate::local_context_ui::ContextState::Undecided
+                .resolve(&snapshot)
+                .is_err()
+        );
+        let prepared = super::load(&snapshot).unwrap();
+        assert!(prepared.evidence.files.is_empty());
+        assert_eq!(prepared.preferences.language.as_deref(), Some("pt-BR"));
+        assert!(
+            crate::local_context_ui::ContextState::Preview(prepared.clone())
+                .resolve(&snapshot)
+                .is_err()
+        );
+        let included = crate::local_context_ui::ContextState::Included(prepared.clone())
+            .resolve(&snapshot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(included.preferences, prepared.preferences);
+        assert!(
+            crate::local_context_ui::ContextState::Excluded(super::scope(&snapshot).unwrap())
+                .resolve(&snapshot)
+                .unwrap()
+                .is_none()
+        );
+        let mut tampered = prepared.clone();
+        tampered.preferences.tone = Some("direct".to_string());
+        assert!(super::validate(&snapshot, Some(&tampered)).is_err());
+        std::fs::write(
+            root.path().join(".cururu.toml"),
+            config.replace("didactic", "neutral"),
+        )
+        .unwrap();
+        let changed = crate::repository::RepositorySnapshot::open(root.path()).unwrap();
+        assert!(super::validate(&changed, Some(&prepared)).is_err());
     }
 }

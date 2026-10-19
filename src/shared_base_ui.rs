@@ -70,6 +70,7 @@ impl ReviewWorkspace {
             SharedBaseState::Preview(base) => {
                 if let Ok(effective) = base.resolve(snapshot) {
                     let entity = cx.entity();
+                    panel = panel.child(format!("Repository publication hint: {:?} (advisory only; personal controls remain authoritative)", effective.publication_hint));
                     panel =
                         panel.child(format!("Local review reuse: {:?}", effective.review_reuse));
                     panel = panel.child(format!(

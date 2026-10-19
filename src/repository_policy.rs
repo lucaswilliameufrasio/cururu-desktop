@@ -28,6 +28,7 @@ impl ReviewReuse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryPolicy {
     pub profile: Option<String>,
+    pub publication_hint: Option<String>,
     pub fingerprint: String,
     pub max_diff_bytes: usize,
     pub chunk_bytes: usize,
@@ -51,6 +52,7 @@ impl Default for RepositoryPolicy {
     fn default() -> Self {
         Self {
             profile: None,
+            publication_hint: None,
             fingerprint: "absent".to_string(),
             max_diff_bytes: crate::local_review::MAX_LOCAL_DIFF_BYTES,
             chunk_bytes: crate::local_review::MAX_LOCAL_FILE_DIFF_BYTES,
@@ -73,6 +75,18 @@ impl Default for RepositoryPolicy {
 }
 
 impl RepositoryPolicy {
+    fn presentation(parsed: &CururuToml) -> cururu_engine::review_preferences::ReviewPreferences {
+        let Some(review) = &parsed.review else {
+            return cururu_engine::review_preferences::ReviewPreferences::default();
+        };
+        cururu_engine::review_preferences::ReviewPreferences {
+            language: review.language.clone(),
+            tone: review.tone.clone(),
+            technical_level: review.technical_level.clone(),
+            suggestion_detail: review.suggestion_detail.clone(),
+        }
+    }
+
     fn selected_profile(
         parsed: &CururuToml,
     ) -> anyhow::Result<Option<cururu_engine::review_policy::ReviewPolicy>> {
@@ -151,6 +165,7 @@ impl RepositoryPolicy {
             "[evaluator] is local-only and cannot be enabled by .cururu.toml"
         );
         let profile = Self::selected_profile(&parsed)?;
+        let preferences = Self::presentation(&parsed);
         let mut policy = Self {
             analysis: crate::local_analysis::AnalysisSpec::parse(parsed.analysis)?,
             shared_base: parsed
@@ -170,7 +185,8 @@ impl RepositoryPolicy {
                             .as_ref()
                             .map_or_else(Vec::new, |profile| profile.focus.clone())
                     }),
-            )?,
+            )?
+            .with_preferences(preferences)?,
             ..Self::from_profile(profile.as_ref())
         };
         if policy.shared_base.is_some() {
@@ -178,14 +194,18 @@ impl RepositoryPolicy {
         }
         if let Some(review) = parsed.review {
             ensure!(
-                review.language.is_none()
-                    && review.tone.is_none()
-                    && review.technical_level.is_none()
-                    && review.suggestion_detail.is_none()
-                    && review.comment_mode.is_none()
-                    && review.recommendations.is_none(),
-                "desktop review currently supports only review.profile, max_diff_bytes, chunk_bytes, and ignore"
+                !review.recommendations.unwrap_or(false),
+                "repository recommendations cannot enable extra provider requests; only recommendations = false is supported"
             );
+            if let Some(mode) = review.comment_mode {
+                cururu_engine::config::validate_choice(
+                    "review.comment_mode",
+                    &mode,
+                    &["inline", "summary"],
+                )
+                .map_err(|_| anyhow::anyhow!("review.comment_mode is invalid"))?;
+                policy.publication_hint = Some(mode.trim().to_ascii_lowercase());
+            }
             policy.max_diff_bytes = review
                 .max_diff_bytes
                 .unwrap_or(policy.max_diff_bytes)
@@ -274,6 +294,26 @@ impl RepositoryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_is_bounded_and_repository_publication_hints_do_not_choose_personal_mode() {
+        let policy = RepositoryPolicy::parse(
+            "version = 1\n[review]\ncomment_mode = 'summary'\nrecommendations = false",
+        )
+        .unwrap();
+        assert_eq!(policy.publication_hint.as_deref(), Some("summary"));
+        assert!(!policy.context.requires_choice());
+        for raw in [
+            "language = ''",
+            "tone = 'unsupported'",
+            "technical_level = 'unsupported'",
+            "suggestion_detail = 'unsupported'",
+            "comment_mode = 'unsupported'",
+            "recommendations = true",
+        ] {
+            assert!(RepositoryPolicy::parse(&format!("version = 1\n[review]\n{raw}")).is_err());
+        }
+    }
 
     #[test]
     fn explicit_profiles_match_the_shared_catalog_but_absence_preserves_desktop_defaults() {
