@@ -230,6 +230,14 @@ fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
     for finding in &record.review.findings {
         panel = panel.child(finding_text(finding));
     }
+    if let Some(threshold) = record.fail_on {
+        panel = panel.child(format!(
+            "Archived quality status (informational): {:?}",
+            cururu_core::evaluate_quality(&record.review, threshold)
+        ));
+    } else {
+        panel = panel.child("Legacy record: quality threshold was not recorded.");
+    }
     panel = panel.child(format!("Annotation parent: {:?} · {} individual decision(s). Historical annotations do not change live findings or evaluator thresholds.", record.parent, record.finding_decisions.len()));
     for decision in &record.finding_decisions {
         panel = panel.child(format!(
@@ -542,6 +550,7 @@ mod tests {
         let mut review = saved.review;
         review.findings[0].path = "source.rs".to_string();
         let result = crate::local_review::LocalReviewResult {
+            fail_on: cururu_core::FailOn::Off,
             config_fingerprint: crate::local_review::config_fingerprint(&settings).unwrap(),
             base: None,
             context: None,

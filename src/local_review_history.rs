@@ -43,6 +43,8 @@ pub struct LocalReviewRecord {
     pub usage: Option<SavedUsage>,
     pub assessment: HumanAssessment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_on: Option<cururu_core::FailOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_decisions: Vec<FindingDecision>,
@@ -115,6 +117,7 @@ impl LocalReviewRecord {
                 cost: usage.cost,
             }),
             assessment,
+            fail_on: Some(result.fail_on),
             parent: None,
             finding_decisions: Vec::new(),
         };
@@ -327,6 +330,7 @@ pub fn sample_record() -> LocalReviewRecord {
         chunk_count: 1,
         usage: None,
         assessment: HumanAssessment::Unreviewed,
+        fail_on: None,
         parent: None,
         finding_decisions: Vec::new(),
     }
@@ -382,6 +386,7 @@ mod tests {
         .unwrap();
         let saved = sample_record();
         let result = LocalReviewResult {
+            fail_on: cururu_core::FailOn::Off,
             config_fingerprint: saved.config_fingerprint.clone(),
             base: Some(base),
             context: Some(crate::local_context::PreparedContext {

@@ -4234,6 +4234,7 @@ fn render_local_review_result(
             result.diff_bytes
         ))
         .child(result.review.summary.clone())
+        .child(format!("Quality status (informational only): {:?}. No apply/publish action is authorized by this status.", cururu_core::evaluate_quality(&result.review, result.fail_on)))
         .child(render_policy_suppressions(result))
         .children(rows)
 }
