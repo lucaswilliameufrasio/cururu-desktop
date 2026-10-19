@@ -640,6 +640,7 @@ fn publish(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
         }
         .await;
         let _ = entity.update(cx, |this, cx| {
+            this.capture_action(crate::action_history::review(&pending, &result));
             this.review_publication.complete(&pending, result);
             cx.notify();
         });

@@ -249,7 +249,7 @@ mod tests {
         store
             .connect()
             .unwrap()
-            .execute_batch("DROP TABLE local_review_history; PRAGMA user_version = 8;")
+            .execute_batch("DROP TABLE action_history; DROP TABLE local_review_history; PRAGMA user_version = 8;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(

@@ -18,6 +18,7 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Preview {
+    pub head_oid: Option<String>,
     context: Option<crate::local_context::PreparedContext>,
     base: Option<crate::shared_base::ApprovedBase>,
     pub path: String,
@@ -181,6 +182,7 @@ fn prepare_file(
         .to_string();
 
     Ok(Preview {
+        head_oid: snapshot.head_oid.clone(),
         base: snapshot
             .review_policy
             .as_ref()

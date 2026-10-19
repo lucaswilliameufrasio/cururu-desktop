@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod action_history;
+mod action_history_ui;
 mod automatic_context;
 mod context_discovery;
 mod diff_view;
@@ -138,6 +140,7 @@ struct ReviewWorkspace {
     remote_suggestion_state: remote_suggestion::RemoteSuggestionState,
     shared_base_state: shared_base_ui::SharedBaseState,
     local_history_state: local_review_history_ui::HistoryState,
+    action_history: action_history_ui::ActionHistory,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -465,6 +468,7 @@ impl ReviewWorkspace {
             remote_suggestion_state: remote_suggestion::RemoteSuggestionState::default(),
             shared_base_state: shared_base_ui::SharedBaseState::default(),
             local_history_state: local_review_history_ui::HistoryState::default(),
+            action_history: action_history_ui::ActionHistory::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -1975,7 +1979,8 @@ impl ReviewWorkspace {
                 .border_color(rgb(0x002b_3946))
                 .bg(rgb(0x0015_1e27))
                 .p_4()
-                .child(self.render_local_history(cx));
+                .child(self.render_local_history(cx))
+                .child(self.render_action_history(cx));
         };
         let file = &self.files[selected_file];
         let line = &file.lines[self.selected_line];
@@ -1998,7 +2003,12 @@ impl ReviewWorkspace {
                 "The new calculation may return an invalid value without preserving the parser error.",
             ),
         };
-        let review_controls = self.render_review_controls(cx, file.path.as_ref(), line.new_number);
+        let review_controls = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_review_controls(cx, file.path.as_ref(), line.new_number))
+            .child(self.render_action_history(cx));
         div()
             .id("review-detail-panel")
             .min_h_0()
@@ -3906,6 +3916,7 @@ fn complete_local_command_run(
     }
     match result {
         Ok(local_command::ExecutionResult::Completed(output)) => {
+            let receipt = action_history::command(&pending.plan, &output);
             this.notice = Some(match (output.was_cancelled(), output.timed_out()) {
                 (true, _) => "Command cancelled; its output is available in memory only.".into(),
                 (_, true) => "Command reached the 10-minute limit and was stopped.".into(),
@@ -3915,6 +3926,7 @@ fn complete_local_command_run(
                 pending: pending.clone(),
                 output,
             };
+            this.capture_action(receipt);
         }
         Ok(local_command::ExecutionResult::Stale) => {
             this.local_command_state = LocalCommandState::Failed(
@@ -4596,6 +4608,12 @@ fn finish_successful_suggested_change(
     this.notice = Some(
         "The confirmed suggestion was applied locally. Previous findings are stale; nothing was staged, committed, or pushed.".into(),
     );
+    this.capture_action(
+        action_history::suggestion(&pending.preview, false).map(|mut record| {
+            record.outcome = action_history::ActionOutcome::Confirmed;
+            record
+        }),
+    );
     cx.notify();
 }
 
@@ -5004,6 +5022,7 @@ fn finish_thread_reply_publication(
     ) {
         return;
     }
+    let receipt = action_history::reply(&pending, &result);
     match result {
         Ok(comment) => {
             let updated_current_view = match &mut this.remote_review_state {
@@ -5040,6 +5059,7 @@ fn finish_thread_reply_publication(
             );
         }
     }
+    this.capture_action(receipt);
     cx.notify();
 }
 
