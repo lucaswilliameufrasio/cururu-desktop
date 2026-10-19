@@ -15,6 +15,7 @@ pub enum AnalysisState {
     Loading(String),
     Manifest(AnalysisPreview),
     Complete(Box<PreparedAnalysis>),
+    Included(Box<PreparedAnalysis>),
     Failed(String),
 }
 
@@ -24,6 +25,76 @@ enum Prepared {
 }
 
 impl ReviewWorkspace {
+    #[must_use]
+    pub fn approved_analysis(&self) -> Option<&PreparedAnalysis> {
+        match &self.local_analysis_state {
+            AnalysisState::Included(report) => Some(report),
+            _ => None,
+        }
+    }
+
+    pub const fn evidence_edits_busy(&self) -> bool {
+        self.is_opening_repository
+            || matches!(self.local_analysis_state, AnalysisState::Loading(_))
+            || matches!(
+                self.local_review_state,
+                crate::LocalReviewState::Running(_)
+                    | crate::LocalReviewState::SavingSettings
+                    | crate::LocalReviewState::Authorizing { .. }
+                    | crate::LocalReviewState::Revoking { .. }
+            )
+            || matches!(
+                self.suggested_change_state,
+                crate::SuggestedChangeState::Preparing(_)
+                    | crate::SuggestedChangeState::Applying(_)
+            )
+            || matches!(
+                self.local_command_state,
+                crate::LocalCommandState::Preparing(_) | crate::LocalCommandState::Running { .. }
+            )
+    }
+
+    pub fn revoke_analysis_inclusion(&mut self) {
+        self.local_analysis_state = match std::mem::take(&mut self.local_analysis_state) {
+            AnalysisState::Included(report) => {
+                self.local_review_state = crate::LocalReviewState::Idle;
+                self.suggested_change_state = crate::SuggestedChangeState::Idle;
+                AnalysisState::Complete(report)
+            }
+            state => state,
+        };
+    }
+
+    fn update_analysis_inclusion(&mut self, fingerprint: &str, include: bool) -> bool {
+        if self.evidence_edits_busy() {
+            return false;
+        }
+        let (AnalysisState::Complete(report) | AnalysisState::Included(report)) =
+            &self.local_analysis_state
+        else {
+            return false;
+        };
+        if report.fingerprint != fingerprint
+            || self
+                .local_repository_snapshot
+                .as_ref()
+                .and_then(|snapshot| crate::local_context::scope(snapshot).ok())
+                .as_ref()
+                != Some(&report.preview.scope)
+        {
+            return false;
+        }
+        let report = report.clone();
+        self.local_analysis_state = if include {
+            AnalysisState::Included(report)
+        } else {
+            AnalysisState::Complete(report)
+        };
+        self.local_review_state = crate::LocalReviewState::Idle;
+        self.suggested_change_state = crate::SuggestedChangeState::Idle;
+        true
+    }
+
     pub fn render_local_analysis(&self, cx: &Context<Self>) -> gpui::Div {
         if matches!(
             self.remote_review_state,
@@ -40,8 +111,7 @@ impl ReviewWorkspace {
         if !policy.analysis.enabled {
             return div();
         }
-        let busy = matches!(self.local_analysis_state, AnalysisState::Loading(_))
-            || self.is_opening_repository;
+        let busy = self.evidence_edits_busy();
         let entity = cx.entity();
         let mut panel = div().flex().flex_col().gap_2()
             .child("LOCAL STATIC ANALYSIS · artifact inspection only; no analyzer or provider is started")
@@ -62,7 +132,9 @@ impl ReviewWorkspace {
         let scope = crate::local_context::scope(snapshot).ok();
         let stale = match &self.local_analysis_state {
             AnalysisState::Manifest(preview) => scope.as_ref() != Some(&preview.scope),
-            AnalysisState::Complete(report) => scope.as_ref() != Some(&report.preview.scope),
+            AnalysisState::Complete(report) | AnalysisState::Included(report) => {
+                scope.as_ref() != Some(&report.preview.scope)
+            }
             _ => false,
         };
         if stale {
@@ -90,33 +162,48 @@ impl ReviewWorkspace {
                             .on_click(move |_, _, cx| prepare(&entity, Some(preview.clone()), cx)),
                     );
             }
-            AnalysisState::Complete(report) => {
-                panel = panel.child(format!("Local artifact evidence (not merged into final AI findings) · {} · status {} · {} anchored finding(s); {} invalid anchors discarded. Navigation revalidates artifacts and checkout first.", report.fingerprint, report.report.status, report.report.findings.len(), report.discarded));
-                for (index, finding) in report.report.findings.iter().enumerate() {
-                    let entity = cx.entity();
-                    let report = report.clone();
-                    panel = panel
-                        .child(format!(
-                            "{:?} / {:?} · {} · {}:{}\n{}\n{}",
-                            finding.source,
-                            finding.rule,
-                            finding.severity,
-                            finding.path,
-                            finding.line.unwrap_or_default(),
-                            finding.title,
-                            finding.message
-                        ))
-                        .child(
-                            Button::new(("navigate-static-finding", index))
-                                .label("Revalidate and show this finding in the diff")
-                                .disabled(busy)
-                                .on_click(move |_, _, cx| {
-                                    navigate(&entity, (*report).clone(), index, cx);
-                                }),
-                        );
-                }
+            AnalysisState::Complete(report) | AnalysisState::Included(report) => {
+                panel = panel.child(self.render_static_report(cx, report, busy));
             }
             AnalysisState::Idle => {}
+        }
+        panel
+    }
+
+    fn render_static_report(
+        &self,
+        cx: &Context<Self>,
+        report: &PreparedAnalysis,
+        busy: bool,
+    ) -> gpui::Div {
+        let entity = cx.entity();
+        let fingerprint = report.fingerprint.clone();
+        let included = matches!(self.local_analysis_state, AnalysisState::Included(_));
+        let mut panel = div().flex().flex_col().gap_2()
+            .child(format!("Local static evidence · {} · status {} · {} anchored finding(s); {} invalid anchors discarded. Included for AI: {included}. Navigation revalidates artifacts and checkout first.", report.fingerprint, report.report.status, report.report.findings.len(), report.discarded))
+            .child("Diagnostics/tool messages may contain private content and repeat per chunk (up to 64,000 bytes × 4 chunks). Inclusion clears active findings; save first if needed. No raw SARIF is sent.")
+            .child(Button::new("toggle-analysis-inclusion").label(if included { "Exclude static evidence from AI (keep local preview)" } else { "Explicitly include this normalized evidence with the next AI review" }).disabled(busy)
+                .on_click(move |_, _, cx| set_inclusion(&entity, &fingerprint, !included, cx)));
+        for (index, finding) in report.report.findings.iter().enumerate() {
+            let entity = cx.entity();
+            let fingerprint = report.fingerprint.clone();
+            panel = panel
+                .child(format!(
+                    "{:?} / {:?} · {} · {}:{}\n{}\n{}",
+                    finding.source,
+                    finding.rule,
+                    finding.severity,
+                    finding.path,
+                    finding.line.unwrap_or_default(),
+                    finding.title,
+                    finding.message
+                ))
+                .child(
+                    Button::new(("navigate-static-finding", index))
+                        .label("Revalidate and show this finding in the diff")
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| navigate(&entity, &fingerprint, index, cx)),
+                );
         }
         panel
     }
@@ -124,7 +211,7 @@ impl ReviewWorkspace {
 
 fn prepare(entity: &Entity<ReviewWorkspace>, preview: Option<AnalysisPreview>, cx: &mut App) {
     let request = entity.update(cx, |this, cx| {
-        if matches!(this.local_analysis_state, AnalysisState::Loading(_)) || this.is_opening_repository {
+        if this.evidence_edits_busy() {
             return None;
         }
         let snapshot = this.local_repository_snapshot.clone()?;
@@ -133,6 +220,7 @@ fn prepare(entity: &Entity<ReviewWorkspace>, preview: Option<AnalysisPreview>, c
             && !matches!(&this.local_analysis_state, AnalysisState::Manifest(current) if current == preview) {
             return None;
         }
+        this.revoke_analysis_inclusion();
         this.local_analysis_state = AnalysisState::Loading(scope.clone());
         cx.notify();
         Some((snapshot, scope))
@@ -180,26 +268,25 @@ fn loading_is_current(workspace: &ReviewWorkspace) -> bool {
         if workspace.local_repository_snapshot.as_ref().and_then(|snapshot| crate::local_context::scope(snapshot).ok()).as_ref() == Some(scope))
 }
 
-fn navigate(
-    entity: &Entity<ReviewWorkspace>,
-    report: PreparedAnalysis,
-    index: usize,
-    cx: &mut App,
-) {
+fn navigate(entity: &Entity<ReviewWorkspace>, fingerprint: &str, index: usize, cx: &mut App) {
     let request = entity.update(cx, |this, cx| {
-        let AnalysisState::Complete(current) = &this.local_analysis_state else {
+        let (AnalysisState::Complete(current) | AnalysisState::Included(current)) =
+            &this.local_analysis_state
+        else {
             return None;
         };
-        if current.fingerprint != report.fingerprint || this.is_opening_repository {
+        if current.fingerprint != fingerprint || this.evidence_edits_busy() {
             return None;
         }
         let snapshot = this.local_repository_snapshot.clone()?;
+        let was_included = matches!(this.local_analysis_state, AnalysisState::Included(_));
+        let report = (**current).clone();
         let finding = report.report.findings.get(index)?.clone();
         this.local_analysis_state = AnalysisState::Loading(report.preview.scope.clone());
         cx.notify();
-        Some((snapshot, finding))
+        Some((snapshot, finding, report, was_included))
     });
-    let Some((snapshot, finding)) = request else {
+    let Some((snapshot, finding, report, was_included)) = request else {
         return;
     };
     let entity = entity.clone();
@@ -237,9 +324,17 @@ fn navigate(
                                 gpui::ScrollStrategy::Center,
                             );
                         }
-                        this.local_analysis_state = AnalysisState::Complete(Box::new(original));
+                        this.local_analysis_state = if was_included {
+                            AnalysisState::Included(Box::new(original))
+                        } else {
+                            AnalysisState::Complete(Box::new(original))
+                        };
                     }
                     Err(error) => {
+                        if was_included {
+                            this.local_review_state = crate::LocalReviewState::Idle;
+                            this.suggested_change_state = crate::SuggestedChangeState::Idle;
+                        }
                         this.local_analysis_state = AnalysisState::Failed(error.to_string());
                     }
                 }
@@ -250,4 +345,63 @@ fn navigate(
         });
     })
     .detach();
+}
+
+fn set_inclusion(entity: &Entity<ReviewWorkspace>, fingerprint: &str, include: bool, cx: &mut App) {
+    entity.update(cx, |this, cx| {
+        if !this.update_analysis_inclusion(fingerprint, include) {
+            return;
+        }
+        this.notice = Some("Static evidence choice updated in memory. No provider request was made; active findings were cleared.".into());
+        cx.notify();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_preview_is_not_consent_and_inclusion_is_scoped_busy_guarded_and_revocable() {
+        let root = tempfile::tempdir().unwrap();
+        gix::init(root.path()).unwrap();
+        let snapshot = RepositorySnapshot::open(root.path()).unwrap();
+        let report = PreparedAnalysis {
+            preview: AnalysisPreview {
+                scope: crate::local_context::scope(&snapshot).unwrap(),
+                manifest_hash: "a".repeat(64),
+                paths: Vec::new(),
+                tools: Vec::new(),
+            },
+            fingerprint: "b".repeat(64),
+            report: cururu_core::AnalysisReport::from_parts(Vec::new(), Vec::new()),
+            discarded: 0,
+        };
+        let mut workspace = ReviewWorkspace::sample();
+        workspace.local_repository_snapshot = Some(snapshot);
+        workspace.local_analysis_state = AnalysisState::Complete(Box::new(report.clone()));
+        assert!(workspace.approved_analysis().is_none());
+        assert!(!workspace.update_analysis_inclusion("wrong", true));
+        workspace.is_opening_repository = true;
+        assert!(!workspace.update_analysis_inclusion(&report.fingerprint, true));
+        workspace.is_opening_repository = false;
+        workspace.local_review_state = crate::LocalReviewState::Skipped("prior".to_string());
+        assert!(workspace.update_analysis_inclusion(&report.fingerprint, true));
+        assert!(matches!(
+            workspace.local_review_state,
+            crate::LocalReviewState::Idle
+        ));
+        assert_eq!(
+            workspace.approved_analysis().unwrap().fingerprint,
+            report.fingerprint
+        );
+        workspace.revoke_analysis_inclusion();
+        assert!(workspace.approved_analysis().is_none());
+        assert!(matches!(
+            workspace.local_analysis_state,
+            AnalysisState::Complete(_)
+        ));
+        workspace.local_repository_snapshot = None;
+        assert!(!workspace.update_analysis_inclusion(&report.fingerprint, true));
+    }
 }

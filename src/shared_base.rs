@@ -336,6 +336,7 @@ mod tests {
             &finding,
             None,
             Some(&approved),
+            None,
         )
         .unwrap();
         std::fs::write(

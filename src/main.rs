@@ -193,6 +193,7 @@ struct EvaluatorAnalysisRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalReviewRequestContext {
+    analysis_fingerprint: Option<String>,
     base_fingerprint: Option<String>,
     evidence_fingerprint: Option<String>,
     request_id: u64,
@@ -203,6 +204,7 @@ struct LocalReviewRequestContext {
 
 #[derive(Clone)]
 struct LocalReviewRequest {
+    analysis: Option<local_analysis::PreparedAnalysis>,
     force_recheck: bool,
     base: Option<shared_base::ApprovedBase>,
     evidence: Option<local_context::PreparedContext>,
@@ -219,6 +221,7 @@ struct PendingLocalCommand {
 
 #[derive(Clone)]
 struct SuggestedChangeRequest {
+    analysis: Option<local_analysis::PreparedAnalysis>,
     base: Option<shared_base::ApprovedBase>,
     context: Option<local_context::PreparedContext>,
     request_id: u64,
@@ -2239,16 +2242,6 @@ impl ReviewWorkspace {
                 | LocalReviewState::Authorizing { .. }
                 | LocalReviewState::Revoking { .. }
         );
-        let is_review_running = matches!(self.local_review_state, LocalReviewState::Running(_));
-        let is_local_command_running = matches!(
-            self.local_command_state,
-            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
-        );
-        let is_suggestion_busy = is_local_command_running
-            || matches!(
-                &self.suggested_change_state,
-                SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
-            );
         let store = self.session_store.clone();
         let authorization_button = render_local_review_authorization_button(
             &cx.entity(),
@@ -2261,10 +2254,14 @@ impl ReviewWorkspace {
         let validation = self.validate_review_evidence(snapshot);
         let evidence = self.local_context_state.resolve(snapshot).ok().flatten();
         let request = validation.as_ref().ok().map(|_| LocalReviewRequest {
+            analysis: self.approved_analysis().cloned(),
             force_recheck: false,
             base: shared_base::approval(snapshot),
             evidence: evidence.clone(),
             context: LocalReviewRequestContext {
+                analysis_fingerprint: self
+                    .approved_analysis()
+                    .map(|analysis| analysis.fingerprint.clone()),
                 base_fingerprint: shared_base::fingerprint(snapshot),
                 evidence_fingerprint: evidence.as_ref().map(|context| context.fingerprint.clone()),
                 request_id: 0,
@@ -2278,12 +2275,7 @@ impl ReviewWorkspace {
         let send_button = render_local_review_send_button(
             &cx.entity(),
             request,
-            store.is_some()
-                && is_authorized
-                && !is_review_running
-                && !is_local_command_running
-                && !is_authorization_busy
-                && !is_suggestion_busy,
+            store.is_some() && is_authorized && !self.evidence_edits_busy(),
             incremental_review::enabled(snapshot),
         );
         let validation_message = local_review_validation_message(snapshot, validation);
@@ -2329,7 +2321,14 @@ impl ReviewWorkspace {
     ) -> gpui::Div {
         let result = match &self.local_review_state {
             LocalReviewState::Complete(result)
-                if result.diff_fingerprint == snapshot_fingerprint =>
+                if result.diff_fingerprint == snapshot_fingerprint
+                    && result
+                        .analysis
+                        .as_ref()
+                        .map(|analysis| &analysis.fingerprint)
+                        == self
+                            .approved_analysis()
+                            .map(|analysis| &analysis.fingerprint) =>
             {
                 Some(render_local_review_result(
                     result,
@@ -4021,6 +4020,11 @@ fn start_local_review(
         return;
     };
     let request_context = entity.update(cx, |this, cx| {
+        if this.evidence_edits_busy() {
+            this.notice = Some("Finish the active review, command, suggestion or evidence operation before starting another review.".into());
+            cx.notify();
+            return None;
+        }
         if !this.context_matches_request(&request) {
             this.notice =
                 Some("Choose or prepare the current repository context before sending.".into());
@@ -4071,6 +4075,7 @@ fn start_local_review(
                 .as_ref()
                 .map(local_review::snapshot_fingerprint);
             let still_matches = current_identity == Some(request_context.repository_identity.as_str())
+                && this.approved_analysis().map(|analysis| analysis.fingerprint.clone()) == request_context.analysis_fingerprint
                 && this.local_repository_snapshot.as_ref().and_then(shared_base::fingerprint) == request_context.base_fingerprint
                 && current_fingerprint.as_deref()
                     == Some(request_context.config_fingerprint.as_str())
@@ -4132,6 +4137,7 @@ async fn run_local_review(
             &secrets,
             &snapshot,
             request.evidence.as_ref(),
+            request.analysis.as_ref(),
         )
         .await?;
         incremental_review::Outcome::Complete(Box::new(review))
@@ -4199,6 +4205,17 @@ fn validate_local_review_snapshot(
         "shared base approval changed after the review preview"
     );
     local_context::validate(snapshot, request.evidence.as_ref())?;
+    anyhow::ensure!(
+        request
+            .analysis
+            .as_ref()
+            .map(|analysis| &analysis.fingerprint)
+            == request.context.analysis_fingerprint.as_ref(),
+        "analysis approval identity changed"
+    );
+    if let Some(analysis) = &request.analysis {
+        local_analysis::validate(snapshot, analysis)?;
+    }
     Ok(())
 }
 
@@ -4225,6 +4242,7 @@ fn render_local_review_result(
             let finding_for_display = finding.clone();
             let entity = entity.clone();
             let request = SuggestedChangeRequest {
+                analysis: result.analysis.clone(),
                 base: result.base.clone(),
                 context: result.context.clone(),
                 request_id: 0,
@@ -4261,6 +4279,10 @@ fn render_local_review_result(
                     finding_for_display.line.unwrap_or_default()
                 ))
                 .child(finding_for_display.title)
+                .child(format!(
+                    "Origin {:?} · rule {:?}",
+                    finding_for_display.source, finding_for_display.rule
+                ))
                 .child(finding_for_display.message)
                 .children((!finding_for_display.suggestion.is_empty()).then(|| {
                     div()
@@ -4270,23 +4292,7 @@ fn render_local_review_result(
                 .children(apply_button)
                 .on_click(move |_event, _window, cx| {
                     entity.update(cx, |this, cx| {
-                        let line_number = line.and_then(|line| usize::try_from(line).ok());
-                        if let Some(file_index) = this
-                            .files
-                            .iter()
-                            .position(|file| file.path.as_ref() == path)
-                            && let Some(line_index) = this.files[file_index]
-                                .lines
-                                .iter()
-                                .position(|diff_line| diff_line.new_number == line_number)
-                        {
-                            this.selected_file = Some(file_index);
-                            this.selected_line = line_index;
-                            this.diff_scroll_handle.scroll_to_item(
-                                this.diff_display_index(line_index),
-                                ScrollStrategy::Center,
-                            );
-                        }
+                        navigate_local_finding(this, &path, line);
                         cx.notify();
                     });
                 })
@@ -4307,6 +4313,26 @@ fn render_local_review_result(
         .child(format!("Quality status (informational only): {:?}. No apply/publish action is authorized by this status.", cururu_core::evaluate_quality(&result.review, result.fail_on)))
         .child(render_policy_suppressions(result))
         .children(rows)
+}
+
+fn navigate_local_finding(workspace: &mut ReviewWorkspace, path: &str, line: Option<u32>) {
+    let line_number = line.and_then(|line| usize::try_from(line).ok());
+    if let Some(file_index) = workspace
+        .files
+        .iter()
+        .position(|file| file.path.as_ref() == path)
+        && let Some(line_index) = workspace.files[file_index]
+            .lines
+            .iter()
+            .position(|diff_line| diff_line.new_number == line_number)
+    {
+        workspace.selected_file = Some(file_index);
+        workspace.selected_line = line_index;
+        workspace.diff_scroll_handle.scroll_to_item(
+            workspace.diff_display_index(line_index),
+            ScrollStrategy::Center,
+        );
+    }
 }
 
 fn render_policy_suppressions(result: &local_review::LocalReviewResult) -> gpui::Div {
@@ -4452,7 +4478,8 @@ fn begin_suggested_change_preview(
             == Some(request.repository_identity.as_str());
         match suggested_change_preview_decision(
             already_busy,
-            review_matches && snapshot_matches && identity_matches,
+            review_matches && snapshot_matches && identity_matches
+                && request.analysis.as_ref().map(|analysis| &analysis.fingerprint) == this.approved_analysis().map(|analysis| &analysis.fingerprint),
         ) {
             SuggestedChangePreviewDecision::IgnoreBusy => return None,
             SuggestedChangePreviewDecision::RejectStale => {
@@ -4488,6 +4515,7 @@ fn begin_suggested_change_preview(
                     &request.finding,
                     request.context.as_ref(),
                     request.base.as_ref(),
+                    request.analysis.as_ref(),
                 )
             })
             .await;
@@ -4579,7 +4607,11 @@ fn start_suggested_change_application(
             is_current_preview
                 && current_review_matches
                 && current_snapshot_matches
-                && identity_matches,
+                && identity_matches
+                && pending.preview.analysis_fingerprint()
+                    == this
+                        .approved_analysis()
+                        .map(|analysis| analysis.fingerprint.as_str()),
         ) {
             this.suggested_change_state = SuggestedChangeState::Failed(
                 "The review or checkout changed after preview; no file was modified.".into(),
@@ -6397,10 +6429,12 @@ mod tests {
         let config_fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
         let snapshot_fingerprint = super::local_review::snapshot_fingerprint(&snapshot);
         let request = LocalReviewRequest {
+            analysis: None,
             force_recheck: false,
             base: None,
             evidence: None,
             context: LocalReviewRequestContext {
+                analysis_fingerprint: None,
                 base_fingerprint: None,
                 evidence_fingerprint: None,
                 request_id: 1,

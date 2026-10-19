@@ -1,5 +1,26 @@
 # Desktop architecture decisions
 
+## Explicit inclusion of normalized static evidence in a provider review
+
+Pin principal ba7a259 (ADR 012). A loaded local artifact report is not consent:
+only a distinct Include action makes it available to the next manually requested
+AI review. Show normalized diagnostics/tool claims and repeated-chunk budget;
+never send raw SARIF. Send the approved normalized report as JSON user data,
+never system instructions or execution authority. Diff-only revokes static
+inclusion too; a later explicit inclusion is shown separately from excluded
+files/focus/preferences. Include/exclude clears active findings and suggestions,
+not immutable history; it is blocked while review/command/suggestion/evidence
+operations are active.
+
+Bind report+artifact fingerprints to request identity, UI completion, incremental
+lookup, archived provider records and suggestion preview/application. Reopen and
+revalidate artifacts in review pre/postflight, save and application, rejecting
+changed or tampered normalized evidence. Merge original static candidates with
+the existing core collector before final policy; preserve tool/rule on retained
+and policy-suppressed findings. Static-only snapshots remain separate and do not
+satisfy provider incremental lookup. No archive restores inclusion or permission.
+Evaluator filtering/calibration remains disabled and is not implied by this path.
+
 ## Static evidence snapshots share the immutable local history
 
 Explicitly save the loaded normalized static report, independent of AI settings

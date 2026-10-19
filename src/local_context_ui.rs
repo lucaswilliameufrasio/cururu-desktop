@@ -59,11 +59,29 @@ impl ContextState {
 impl ReviewWorkspace {
     pub fn validate_review_evidence(&self, snapshot: &RepositorySnapshot) -> anyhow::Result<usize> {
         let count = crate::local_review::validate_snapshot(snapshot)?;
+        if let Some(analysis) = self.approved_analysis() {
+            ensure!(
+                analysis.preview.scope == local_context::scope(snapshot)?,
+                "included static evidence belongs to another checkout/snapshot"
+            );
+        }
         self.local_context_state.resolve(snapshot)?;
         Ok(count)
     }
 
     pub fn context_matches_request(&self, request: &crate::LocalReviewRequest) -> bool {
+        if self
+            .approved_analysis()
+            .map(|analysis| &analysis.fingerprint)
+            != request.context.analysis_fingerprint.as_ref()
+            || request
+                .analysis
+                .as_ref()
+                .map(|analysis| &analysis.fingerprint)
+                != request.context.analysis_fingerprint.as_ref()
+        {
+            return false;
+        }
         self.local_repository_snapshot
             .as_ref()
             .is_some_and(|snapshot| {
@@ -99,7 +117,7 @@ impl ReviewWorkspace {
             return div();
         }
         let busy = matches!(self.local_context_state, ContextState::Loading(_))
-            || matches!(self.local_review_state, LocalReviewState::Running(_));
+            || self.evidence_edits_busy();
         let entity = cx.entity();
         let without_entity = entity.clone();
         let mut panel = div().flex().flex_col().gap_2()
@@ -156,7 +174,7 @@ impl ReviewWorkspace {
             ContextState::Failed(error) => format!("Context preview failed: {error}"),
             ContextState::Resolved(_) => "Names resolved only. Review this list, then explicitly load contents.".to_string(),
             ContextState::Included(_) if self.local_context_state.resolve(snapshot).is_ok() => "Previewed context will be included in the explicit send below.".to_string(),
-            ContextState::Excluded(_) if self.local_context_state.resolve(snapshot).is_ok() => "Diff-only chosen explicitly. Context files/focus will not be sent.".to_string(),
+            ContextState::Excluded(_) if self.local_context_state.resolve(snapshot).is_ok() => if self.approved_analysis().is_some() { "Files/focus/preferences excluded; static evidence was separately included by your later choice.".to_string() } else { "Diff-only chosen explicitly. Context files/focus/preferences and static evidence will not be sent.".to_string() },
             _ => "Send blocked until a current preview is included or diff-only is chosen explicitly.".to_string(),
         };
         panel.child(message)
@@ -201,7 +219,7 @@ impl ReviewWorkspace {
 fn choose(entity: &Entity<ReviewWorkspace>, include: bool, cx: &mut App) {
     entity.update(cx, |this, cx| {
         if matches!(this.local_context_state, ContextState::Loading(_))
-            || matches!(this.local_review_state, LocalReviewState::Running(_))
+            || this.evidence_edits_busy()
         {
             return;
         }
@@ -223,8 +241,10 @@ fn choose(entity: &Entity<ReviewWorkspace>, include: bool, cx: &mut App) {
             this.local_context_state = ContextState::Included(context.clone());
         } else {
             this.local_context_state = ContextState::Excluded(scope);
+            this.revoke_analysis_inclusion();
         }
         this.local_review_state = LocalReviewState::Idle;
+        this.suggested_change_state = crate::SuggestedChangeState::Idle;
         cx.notify();
     });
 }
@@ -232,7 +252,7 @@ fn choose(entity: &Entity<ReviewWorkspace>, include: bool, cx: &mut App) {
 fn prepare_context(entity: &Entity<ReviewWorkspace>, preparation: Preparation, cx: &mut App) {
     let snapshot = entity.update(cx, |this, cx| {
         if matches!(this.local_context_state, ContextState::Loading(_))
-            || matches!(this.local_review_state, LocalReviewState::Running(_))
+            || this.evidence_edits_busy()
         {
             return None;
         }
@@ -349,9 +369,11 @@ mod tests {
         workspace.local_context_state = included;
         let evidence = workspace.local_context_state.resolve(&snapshot).unwrap();
         let mut request = crate::LocalReviewRequest {
+            analysis: None,
             force_recheck: false,
             base: None,
             context: crate::LocalReviewRequestContext {
+                analysis_fingerprint: None,
                 base_fingerprint: None,
                 request_id: 0,
                 repository_identity: String::new(),
