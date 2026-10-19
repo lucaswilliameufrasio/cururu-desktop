@@ -11,6 +11,7 @@ const MAX_CONFIG_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryPolicy {
+    pub profile: Option<String>,
     pub fingerprint: String,
     pub max_diff_bytes: usize,
     pub chunk_bytes: usize,
@@ -31,11 +32,12 @@ pub struct RepositoryPolicy {
 impl Default for RepositoryPolicy {
     fn default() -> Self {
         Self {
+            profile: None,
             fingerprint: "absent".to_string(),
             max_diff_bytes: crate::local_review::MAX_LOCAL_DIFF_BYTES,
             chunk_bytes: crate::local_review::MAX_LOCAL_FILE_DIFF_BYTES,
             minimum_confidence: 0.0,
-            max_findings: 100,
+            max_findings: crate::local_review::MAX_REVIEW_FINDINGS,
             fail_on: cururu_core::FailOn::Off,
             synthesis: false,
             allowed_severities: Severity::all(),
@@ -51,6 +53,42 @@ impl Default for RepositoryPolicy {
 }
 
 impl RepositoryPolicy {
+    fn selected_profile(
+        parsed: &CururuToml,
+    ) -> anyhow::Result<Option<cururu_engine::review_policy::ReviewPolicy>> {
+        parsed
+            .review
+            .as_ref()
+            .and_then(|review| review.profile.as_deref())
+            .map(cururu_engine::review_policy::profile_defaults)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("review.profile is unsupported"))
+    }
+
+    fn from_profile(
+        profile: Option<&cururu_engine::review_policy::ReviewPolicy>,
+    ) -> anyhow::Result<Self> {
+        let mut policy = Self::default();
+        if let Some(profile) = profile {
+            ensure!(
+                !profile.incremental,
+                "desktop review does not support incremental profiles"
+            );
+            policy.profile = Some(profile.profile.trim().to_ascii_lowercase());
+            policy.minimum_confidence = profile.minimum_confidence;
+            policy.max_findings = profile
+                .max_findings
+                .min(crate::local_review::MAX_REVIEW_FINDINGS);
+            policy.fail_on = profile.fail_on;
+            policy
+                .allowed_severities
+                .clone_from(&profile.allowed_severities);
+            policy.suggested_changes = profile.suggested_changes;
+            policy.synthesis = profile.synthesis;
+        }
+        Ok(policy)
+    }
+
     pub fn load(root: &Path) -> anyhow::Result<Self> {
         let path = root.join(".cururu.toml");
         match fs::symlink_metadata(&path) {
@@ -101,6 +139,7 @@ impl RepositoryPolicy {
             parsed.analysis.is_none(),
             "desktop review does not yet support [analysis]; no analyzer files will be loaded"
         );
+        let profile = Self::selected_profile(&parsed)?;
         let mut policy = Self {
             shared_base: parsed
                 .config
@@ -114,23 +153,26 @@ impl RepositoryPolicy {
                     .policy
                     .as_ref()
                     .and_then(|policy| policy.focus.clone())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        profile
+                            .as_ref()
+                            .map_or_else(Vec::new, |profile| profile.focus.clone())
+                    }),
             )?,
-            ..Self::default()
+            ..Self::from_profile(profile.as_ref())?
         };
         if policy.shared_base.is_some() {
             policy.local_document = Some(crate::shared_base::ConfigDocument::new(raw));
         }
         if let Some(review) = parsed.review {
             ensure!(
-                review.profile.is_none()
-                    && review.language.is_none()
+                review.language.is_none()
                     && review.tone.is_none()
                     && review.technical_level.is_none()
                     && review.suggestion_detail.is_none()
                     && review.comment_mode.is_none()
                     && review.recommendations.is_none(),
-                "desktop review currently supports only review.max_diff_bytes, chunk_bytes, and ignore"
+                "desktop review currently supports only review.profile, max_diff_bytes, chunk_bytes, and ignore"
             );
             policy.max_diff_bytes = review
                 .max_diff_bytes
@@ -156,7 +198,7 @@ impl RepositoryPolicy {
                 policy.fail_on = cururu_core::FailOn::from_name(&threshold)
                     .context("policy.fail_on contains an unsupported severity")?;
             }
-            policy.synthesis = repository.synthesis.unwrap_or(false);
+            policy.synthesis = repository.synthesis.unwrap_or(policy.synthesis);
             if let Some(confidence) = repository.minimum_confidence {
                 cururu_engine::config::validate_confidence(confidence)?;
                 policy.minimum_confidence = confidence;
@@ -164,8 +206,10 @@ impl RepositoryPolicy {
             policy.max_findings = repository
                 .max_findings
                 .unwrap_or(policy.max_findings)
-                .min(policy.max_findings);
-            policy.suggested_changes = repository.suggested_changes.unwrap_or(true);
+                .min(crate::local_review::MAX_REVIEW_FINDINGS);
+            policy.suggested_changes = repository
+                .suggested_changes
+                .unwrap_or(policy.suggested_changes);
             if let Some(severities) = repository.allowed_severities {
                 policy.allowed_severities = severities
                     .iter()
@@ -221,6 +265,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_profiles_match_the_shared_catalog_but_absence_preserves_desktop_defaults() {
+        let absent = RepositoryPolicy::parse("version = 1").unwrap();
+        assert_eq!(
+            absent.minimum_confidence,
+            RepositoryPolicy::default().minimum_confidence
+        );
+        assert_eq!(
+            absent.max_findings,
+            crate::local_review::MAX_REVIEW_FINDINGS
+        );
+        assert!(absent.profile.is_none());
+        for name in ["balanced", "strict", "security", "minimal"] {
+            let expected = cururu_engine::review_policy::profile_defaults(name).unwrap();
+            let policy =
+                RepositoryPolicy::parse(&format!("version = 1\n[review]\nprofile = '{name}'"))
+                    .unwrap();
+            assert_eq!(policy.minimum_confidence, expected.minimum_confidence);
+            assert_eq!(policy.max_findings, expected.max_findings);
+            assert_eq!(policy.fail_on, expected.fail_on);
+            assert_eq!(policy.allowed_severities, expected.allowed_severities);
+            assert_eq!(policy.suggested_changes, expected.suggested_changes);
+            assert_eq!(policy.context.focus, expected.focus);
+            assert_eq!(policy.profile.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn explicit_overrides_follow_profile_and_are_bounded_by_host_not_profile_limits() {
+        let raw = "version = 1\n[review]\nprofile = 'minimal'\n[policy]\nmax_findings = 80\nminimum_confidence = 0.9\nallowed_severities = ['medium']\nsuggested_changes = true\nsynthesis = true\nfail_on = 'critical'\nfocus = ['correctness']";
+        let policy = RepositoryPolicy::parse(raw).unwrap();
+        assert_eq!(policy.max_findings, 80);
+        assert_eq!(policy.minimum_confidence, 0.9);
+        assert_eq!(policy.allowed_severities, [Severity::Medium]);
+        assert!(policy.suggested_changes && policy.synthesis);
+        assert_eq!(policy.fail_on, cururu_core::FailOn::Critical);
+        assert_eq!(policy.context.focus, ["correctness"]);
+        let clamped =
+            RepositoryPolicy::parse(&raw.replace("max_findings = 80", "max_findings = 999999"))
+                .unwrap();
+        assert_eq!(
+            clamped.max_findings,
+            crate::local_review::MAX_REVIEW_FINDINGS
+        );
+        let security =
+            RepositoryPolicy::parse("version = 1\n[review]\nprofile = 'security'").unwrap();
+        assert!(security.context.requires_choice());
+        let override_focus = RepositoryPolicy::parse(
+            "version = 1\n[review]\nprofile = 'security'\n[policy]\nfocus = []",
+        )
+        .unwrap();
+        assert!(!override_focus.context.requires_choice());
+    }
+
+    #[test]
     fn repo_limits_cannot_expand_local_budgets_or_change_provider() {
         let policy = RepositoryPolicy::parse("version = 1\n[provider]\nbase_url = 'https://untrusted.test'\n[review]\nmax_diff_bytes = 999999\nchunk_bytes = 999999\n[policy]\nmax_findings = 999999").unwrap();
         assert_eq!(
@@ -254,7 +352,7 @@ mod tests {
         for raw in [
             "version = 1\n[evaluator]\nmode = 'filter'",
             "version = 1\n[context]\nadditional = ['../secret']",
-            "version = 1\n[review]\nprofile = 'strict'",
+            "version = 1\n[review]\nprofile = 'unsupported'",
             "version = 1\n[review]\nignore = ['[']",
             "version = 1\n[policy]\nminimum_confidence = nan",
             "version = 1\n[review]\nchunk_bytes = 0",

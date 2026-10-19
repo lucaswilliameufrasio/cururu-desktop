@@ -1,5 +1,19 @@
 # Desktop architecture decisions
 
+## Explicit shared profile catalog, host-owned overrides
+
+Accepted principal ADR 009 shares only pure profile values/defaults, as explicitly
+confirmed by the user. Desktop pins d8626ad and calls the same profile_defaults
+catalog as CLI. Apply it only for a declared review.profile; no declaration keeps
+the existing desktop defaults. Apply explicit fields afterward, with desktop
+ceilings independent of profile values (an explicit max_findings can override a
+profile up to the host ceiling). Explicit focus replaces the profile focus,
+matching CLI behavior. Profiles cannot authorize provider access, file reads,
+commands, application or publication. Security focus still requires context
+choice. Unknown/unsupported profile behavior fails closed without echoing input.
+This supersedes the earlier unsupported-profile limitation only; runtime
+AppConfig/env precedence/permissions remain host-owned, as do style settings.
+
 ## Repository synthesis and informational quality status
 
 Accept explicit `policy.synthesis` through the existing core candidate collector,

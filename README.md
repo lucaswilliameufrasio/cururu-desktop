@@ -5,7 +5,13 @@ uses its severity quality gate and shows an informational passed/failed/disabled
 status for retained findings, also preserved in newly saved review snapshots.
 This status never publishes, suppresses findings, applies changes or blocks human
 discussion automatically. Legacy archives without a threshold show it as unknown.
-`policy.incremental` and review profiles are still unsupported.
+`policy.incremental` is still unsupported.
+
+Explicit `review.profile` supports balanced/strict/security/minimal through the
+same pure catalog as CLI, followed by explicit policy overrides and desktop
+ceilings. With no profile, desktop defaults do not change. An explicit focus
+replaces profile focus; a security focus still requires a separate context
+choice. Profiles never grant provider/command/apply/publish permissions.
 
 **Action receipts** keep observed suggestion applications/imports, GitHub reviews
 and replies, and command completions in memory until you explicitly save them.
