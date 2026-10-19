@@ -67,6 +67,7 @@ pub struct PolicySuppressedFinding {
 
 #[derive(Debug, Clone)]
 pub struct LocalReviewResult {
+    pub fail_on: cururu_core::FailOn,
     pub config_fingerprint: String,
     pub base: Option<crate::shared_base::ApprovedBase>,
     pub context: Option<crate::local_context::PreparedContext>,
@@ -251,7 +252,7 @@ fn assemble_review_result(
         Vec::new(),
         cururu_core::CandidateOptions {
             include_suggested_changes: true,
-            synthesize: false,
+            synthesize: policy.synthesis,
         },
     );
 
@@ -298,6 +299,7 @@ fn assemble_review_result(
     );
 
     Ok(LocalReviewResult {
+        fail_on: policy.fail_on,
         config_fingerprint: config_fingerprint(settings)?,
         base: snapshot
             .review_policy
@@ -436,6 +438,51 @@ mod tests {
             &[1],
         )]);
         assert!(bounded_chunks(&too_many_bytes).is_err());
+    }
+
+    #[test]
+    fn repository_synthesis_and_quality_status_use_shared_core_rules() {
+        let mut snapshot = snapshot(vec![changed_file("src/lib.rs", "+changed", &[3])]);
+        let candidate = finding("src/lib.rs", Some(3));
+        let chunk = cururu_engine::ChunkResult {
+            review: ReviewResult {
+                model: "model".to_string(),
+                files_reviewed: 1,
+                summary: String::new(),
+                findings: vec![candidate.clone(), candidate],
+            },
+            usage: None,
+        };
+        let settings = settings("https://api.example.test/v1", "model");
+        let default = assemble_review_result(&settings, &snapshot, vec![chunk.clone()]).unwrap();
+        assert_eq!(default.review.findings.len(), 2);
+        assert_eq!(
+            cururu_core::evaluate_quality(&default.review, default.fail_on).status,
+            "disabled"
+        );
+        snapshot.review_policy = Ok(crate::repository_policy::RepositoryPolicy::parse(
+            "version = 1\n[policy]\nsynthesis = true\nfail_on = 'high'",
+        )
+        .unwrap());
+        let result = assemble_review_result(&settings, &snapshot, vec![chunk]).unwrap();
+        assert_eq!(result.review.findings.len(), 1);
+        let quality = cururu_core::evaluate_quality(&result.review, result.fail_on);
+        assert_eq!(quality.status, "failed");
+        assert_eq!(quality.high_count, 1);
+        assert_eq!(result.fail_on, cururu_core::FailOn::High);
+        assert!(result.policy_suppressed.is_empty());
+        assert!(
+            crate::repository_policy::RepositoryPolicy::parse(
+                "version = 1\n[policy]\nfail_on = 'unsupported'"
+            )
+            .is_err()
+        );
+        assert!(
+            crate::repository_policy::RepositoryPolicy::parse(
+                "version = 1\n[policy]\nincremental = true"
+            )
+            .is_err()
+        );
     }
 
     #[test]

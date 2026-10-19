@@ -1,5 +1,12 @@
 # Cururu Desktop
 
+`policy.synthesis` uses the shared core's candidate deduplication. `policy.fail_on`
+uses its severity quality gate and shows an informational passed/failed/disabled
+status for retained findings, also preserved in newly saved review snapshots.
+This status never publishes, suppresses findings, applies changes or blocks human
+discussion automatically. Legacy archives without a threshold show it as unknown.
+`policy.incremental` and review profiles are still unsupported.
+
 **Action receipts** keep observed suggestion applications/imports, GitHub reviews
 and replies, and command completions in memory until you explicitly save them.
 SQLite schema 10 stores only typed kind/outcome, time/revision, scope/input/result

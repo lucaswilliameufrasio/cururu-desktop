@@ -1,5 +1,18 @@
 # Desktop architecture decisions
 
+## Repository synthesis and informational quality status
+
+Accept explicit `policy.synthesis` through the existing core candidate collector,
+without copying its ordering/deduplication rules. Parse `policy.fail_on` with the
+core enum and evaluate the final retained findings through `evaluate_quality`.
+Desktop is not a CI process: show passed/failed/disabled with counts, but do not
+turn it into automatic publication, suppression, suggestion application or a
+ban on manual discussion. Keep suppressed findings inspectable. Save the chosen
+threshold in new result snapshots so archived status can be recomputed; missing
+threshold on legacy snapshots means unknown, not assumed disabled. Neither field
+enables a provider or remote side effect. Profiles and incremental semantics
+remain separately unsupported until their runtime behavior is integrated.
+
 ## Explicit saves of observed action receipts
 
 SQLite schema 10 adds bounded, immutable metadata receipts for local suggestions,

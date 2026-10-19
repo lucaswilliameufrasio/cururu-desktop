@@ -70,6 +70,10 @@ impl ReviewWorkspace {
             SharedBaseState::Preview(base) => {
                 if let Ok(effective) = base.resolve(snapshot) {
                     let entity = cx.entity();
+                    panel = panel.child(format!(
+                        "Effective synthesis: {} · quality threshold: {:?} (informational)",
+                        effective.synthesis, effective.fail_on
+                    ));
                     panel = panel.child(format!("EFFECTIVE PREVIEW · {}\nDiff budget {} bytes · chunk {} · minimum confidence {} · max findings {} · severities {:?} · suggestions {}\nIgnore {:?}\nFocus {:?}\nContext declarations {:?}\nProvider settings ignored: {}. Summary/unknown settings are not applied. Raw TOML is not displayed because it may contain credentials.",
                         base.fingerprint, effective.max_diff_bytes, effective.chunk_bytes, effective.minimum_confidence,
                         effective.max_findings, effective.allowed_severities, effective.suggested_changes, effective.ignore,

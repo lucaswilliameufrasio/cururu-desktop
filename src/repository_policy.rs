@@ -16,6 +16,8 @@ pub struct RepositoryPolicy {
     pub chunk_bytes: usize,
     pub minimum_confidence: f32,
     pub max_findings: usize,
+    pub fail_on: cururu_core::FailOn,
+    pub synthesis: bool,
     pub allowed_severities: Vec<Severity>,
     pub suggested_changes: bool,
     pub ignore: Vec<String>,
@@ -34,6 +36,8 @@ impl Default for RepositoryPolicy {
             chunk_bytes: crate::local_review::MAX_LOCAL_FILE_DIFF_BYTES,
             minimum_confidence: 0.0,
             max_findings: 100,
+            fail_on: cururu_core::FailOn::Off,
+            synthesis: false,
             allowed_severities: Severity::all(),
             suggested_changes: true,
             ignore: vec![],
@@ -145,11 +149,14 @@ impl RepositoryPolicy {
         }
         if let Some(repository) = parsed.policy {
             ensure!(
-                repository.fail_on.is_none()
-                    && !repository.incremental.unwrap_or(false)
-                    && !repository.synthesis.unwrap_or(false),
-                "desktop review does not yet support policy.fail_on, incremental, or synthesis"
+                !repository.incremental.unwrap_or(false),
+                "desktop review does not yet support policy.incremental"
             );
+            if let Some(threshold) = repository.fail_on {
+                policy.fail_on = cururu_core::FailOn::from_name(&threshold)
+                    .context("policy.fail_on contains an unsupported severity")?;
+            }
+            policy.synthesis = repository.synthesis.unwrap_or(false);
             if let Some(confidence) = repository.minimum_confidence {
                 cururu_engine::config::validate_confidence(confidence)?;
                 policy.minimum_confidence = confidence;
