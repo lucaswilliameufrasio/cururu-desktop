@@ -26,8 +26,13 @@ Limits: 64,000-byte manifest / 8 tools, 8 exact SARIF files of 128,000 bytes,
 100 candidates and a 64,000-byte normalized report. Unsafe/nonregular files,
 excess and stale/missing bindings fail rather than truncate. Globs, unbound
 standalone SARIF, remote check-run fetching and disabling current-revision checks
-remain unsupported. Reports are memory-only and are not implicitly merged or
-sent with AI reviews. Existing approved/sandboxed commands remain separate.
+remain unsupported. Reports stay in memory unless explicitly saved from Local
+review history. Static snapshots preserve normalized findings/tool claims and
+artifact hashes, not source artifact bytes, provider tokens or permissions.
+Saving revalidates the checkout/artifacts. Saved static findings can receive
+immutable human annotations, but are not restored into active analysis or used
+as provider incremental hits. No implicit merge or send with AI reviews occurs.
+Existing approved/sandboxed commands remain separate.
 
 `policy.synthesis` uses the shared core's candidate deduplication. `policy.fail_on`
 uses its severity quality gate and shows an informational passed/failed/disabled

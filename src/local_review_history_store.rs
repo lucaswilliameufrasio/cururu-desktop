@@ -39,7 +39,7 @@ impl SessionStore {
     pub fn save_local_review(&self, record: &LocalReviewRecord) -> anyhow::Result<String> {
         record.validate()?;
         ensure!(
-            record.version == 1,
+            record.parent.is_none(),
             "annotate saved findings through the scoped archive operation"
         );
         let mut connection = self.connect()?;
