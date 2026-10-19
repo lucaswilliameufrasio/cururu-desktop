@@ -111,9 +111,11 @@ non-symlink-file support. Analyzer sections and unsupported review/policy
 fields are not implemented in the desktop yet and block AI sends rather than
 being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
 
-`policy.focus` and exact paths under `context.conventions`, `specifications`,
+`policy.focus` and paths/globs under `context.conventions`, `specifications`,
 `skills` and `additional` are optional evidence. Parsing only lists declarations:
-**Load declared context locally for preview** explicitly reads them, then
+**Discover declared paths (names only)** expands glob matches from the Git index
+without opening declared contents. Inspect the resolved list, then **Load these
+exact paths locally for preview** explicitly reads them. Finally,
 **Include this previewed context** approves inclusion in the next review.
 Alternatively choose **Review diff only** to explicitly exclude context/focus.
 Nothing is sent by loading/previewing. These choices stay in memory and are
@@ -122,8 +124,13 @@ separate. Context is JSON user data, never system instructions; skills are not
 executed. Paths are descriptor-relative with no symlinks; credential locations,
 hardlinks, special files, non-text and over-budget evidence are rejected. Limits
 are 32 files, 16,000 bytes/file and 64,000 bytes total, lowered by
-`context.max_bytes`. Evidence is repeated per diff chunk. Globs and automatic
-discovery are unsupported (only `context.auto.enabled = false` is accepted).
+`context.max_bytes`. Evidence is repeated per diff chunk.
+Only tracked regular, unconflicted Git index paths can match globs; exact paths
+may explicitly name untracked files. Overlaps are deduplicated in declaration
+order. Missing matches, sensitive/non-file paths and more than 32 resolved files
+fail rather than being silently omitted. Changed membership invalidates the
+manifest before any newly matched contents are opened. Automatic context
+discovery is still unsupported (only `context.auto.enabled = false` is accepted).
 Context is re-read before/after sending and before previewing/applying a resulting
 suggestion; a changed document invalidates approval, including ignored files.
 

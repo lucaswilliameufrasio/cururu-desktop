@@ -1,5 +1,27 @@
 # Desktop architecture decisions
 
+## Explicit names-only context glob discovery
+
+Extend exact context paths with the core's glob semantics. Resolve globs only
+against tracked, unconflicted regular-file Git index entries, never a recursive
+filesystem walk. Compile glob sets with the same defaults used by core matching;
+tests compare matches to `cururu_core::context_path_matches`. Exact declarations
+can name untracked files explicitly. Bound discovery to 200,000 index entries
+and 32 resolved files; reject invalid/no-match/sensitive/non-file/excess results
+instead of skipping or truncating. Deduplicate overlapping paths in declaration
+order, keeping the first label.
+
+Discovery is a separate user action that produces only a names manifest. Show
+the resolved list, require an explicit Load to read those exact files, then
+require inclusion or an explicit diff-only choice. Neither discovery nor Load
+authorizes transmission. Memory-only enum states distinguish each phase. Before
+reading, recompute names and compare the complete manifest, scope and labels;
+new matches must not be opened under an earlier approval. Content/revision guards
+continue to use safe descriptor-relative reads and shared-base approval.
+Automatic context discovery remains unsupported: configuration cannot initiate
+these actions. This supersedes the earlier exact-path-only limitation, not the
+consent, size, credential or execution boundaries.
+
 ## Pinned shared-base configuration with explicit approval
 
 Use shared schema and pure TOML composition from engine pin af32737 (ADR 007 in

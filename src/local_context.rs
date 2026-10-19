@@ -62,36 +62,7 @@ impl ContextSpec {
                 ("Additional", context.additional),
             ] {
                 for path in paths.unwrap_or_default() {
-                    ensure!(
-                        !path.contains(['*', '?', '[', ']']),
-                        "desktop context currently requires exact paths, not globs"
-                    );
-                    ensure!(
-                        !path.eq_ignore_ascii_case(".cururu.toml")
-                            && path.split('/').all(|part| {
-                                let lower = part.to_ascii_lowercase();
-                                !matches!(
-                                    lower.as_str(),
-                                    ".git"
-                                        | ".ssh"
-                                        | ".aws"
-                                        | ".gnupg"
-                                        | ".config"
-                                        | ".npmrc"
-                                        | ".netrc"
-                                        | "id_rsa"
-                                        | "id_ed25519"
-                                        | "credentials"
-                                        | "credentials.json"
-                                ) && lower != ".env"
-                                    && !lower.starts_with(".env.")
-                                    && !Path::new(part).extension().is_some_and(|extension| {
-                                        extension.eq_ignore_ascii_case("pem")
-                                            || extension.eq_ignore_ascii_case("key")
-                                    })
-                            }),
-                        "context references a credential/configuration location that cannot be sent"
-                    );
+                    crate::context_discovery::validate_path(&path)?;
                     spec.paths.push(ContextPath {
                         label: label.to_string(),
                         path,
@@ -129,7 +100,20 @@ pub struct PreparedContext {
     pub evidence: ReviewContext,
 }
 
+#[cfg(test)]
 pub fn load(snapshot: &crate::repository::RepositorySnapshot) -> anyhow::Result<PreparedContext> {
+    let manifest = crate::context_discovery::discover(snapshot)?;
+    load_manifest(snapshot, &manifest)
+}
+
+pub fn load_manifest(
+    snapshot: &crate::repository::RepositorySnapshot,
+    manifest: &crate::context_discovery::ContextManifest,
+) -> anyhow::Result<PreparedContext> {
+    ensure!(
+        manifest == &crate::context_discovery::discover(snapshot)?,
+        "resolved context paths changed; discover them again before reading any new contents"
+    );
     let policy = snapshot
         .review_policy
         .as_ref()
@@ -140,7 +124,7 @@ pub fn load(snapshot: &crate::repository::RepositorySnapshot) -> anyhow::Result<
         files: Vec::new(),
     };
     let mut total = 0_usize;
-    for entry in &policy.context.paths {
+    for entry in &manifest.paths {
         let mut file = open_file(&snapshot.root, &entry.path)
             .context("could not safely open a declared context file")?;
         ensure!(
@@ -211,7 +195,19 @@ pub fn validate(
             approved.snapshot_fingerprint == scope(snapshot)?,
             "approved context belongs to a different repository snapshot"
         );
-        let current = load(snapshot)?;
+        let manifest = crate::context_discovery::ContextManifest {
+            snapshot_fingerprint: approved.snapshot_fingerprint.clone(),
+            paths: approved
+                .evidence
+                .files
+                .iter()
+                .map(|file| ContextPath {
+                    label: file.label.clone(),
+                    path: file.path.clone(),
+                })
+                .collect(),
+        };
+        let current = load_manifest(snapshot, &manifest)?;
         ensure!(
             current.fingerprint == approved.fingerprint,
             "declared context changed after approval; prepare it again"
@@ -319,7 +315,7 @@ mod tests {
             "key.key",
             "id_rsa",
             "credentials.json",
-            "docs/**",
+            "[",
             "/etc/passwd",
         ] {
             let raw = format!("version = 1\n[context]\nadditional = ['{path}']");

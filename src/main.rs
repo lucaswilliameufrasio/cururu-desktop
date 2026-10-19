@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod context_discovery;
 mod diff_view;
 mod evaluation_history;
 mod evaluation_history_ui;
