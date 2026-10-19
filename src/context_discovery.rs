@@ -117,6 +117,7 @@ pub fn discover(snapshot: &RepositorySnapshot) -> anyhow::Result<ContextManifest
                 ContextPath {
                     label: declaration.label.clone(),
                     path: path.to_string(),
+                    source: crate::local_context::ContextSource::Worktree,
                 },
             )?;
         }
@@ -125,6 +126,7 @@ pub fn discover(snapshot: &RepositorySnapshot) -> anyhow::Result<ContextManifest
             "a context glob matched no tracked index paths; choose diff-only or update the declaration"
         );
     }
+    crate::automatic_context::append_candidates(snapshot, &mut paths)?;
     Ok(ContextManifest {
         snapshot_fingerprint: crate::local_context::scope(snapshot)?,
         paths,

@@ -73,7 +73,7 @@ impl ReviewWorkspace {
                     panel = panel.child(format!("EFFECTIVE PREVIEW · {}\nDiff budget {} bytes · chunk {} · minimum confidence {} · max findings {} · severities {:?} · suggestions {}\nIgnore {:?}\nFocus {:?}\nContext declarations {:?}\nProvider settings ignored: {}. Summary/unknown settings are not applied. Raw TOML is not displayed because it may contain credentials.",
                         base.fingerprint, effective.max_diff_bytes, effective.chunk_bytes, effective.minimum_confidence,
                         effective.max_findings, effective.allowed_severities, effective.suggested_changes, effective.ignore,
-                        effective.context.focus, effective.context.paths, effective.provider_ignored))
+                        effective.context.focus, effective.context, effective.provider_ignored))
                         .child(Button::new("approve-shared-base").label("Approve this effective policy for this checkout/configuration")
                             .disabled(busy(self)).on_click(move |_, _, cx| approve(&entity, cx)));
                 } else {

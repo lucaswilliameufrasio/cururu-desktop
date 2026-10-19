@@ -255,6 +255,10 @@ mod tests {
             config_fingerprint: saved.config_fingerprint.clone(),
             base: Some(base),
             context: Some(crate::local_context::PreparedContext {
+                manifest: crate::context_discovery::ContextManifest {
+                    snapshot_fingerprint: "d".repeat(64),
+                    paths: Vec::new(),
+                },
                 snapshot_fingerprint: "d".repeat(64),
                 fingerprint: "e".repeat(64),
                 evidence: cururu_engine::review_context::ReviewContext {

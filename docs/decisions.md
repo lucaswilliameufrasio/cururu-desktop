@@ -1,5 +1,24 @@
 # Desktop architecture decisions
 
+## Automatic HEAD context remains an explicit proposal
+
+Following accepted principal ADR 008 and the user's confirmed pure-rule scope,
+reuse engine auto-context defaults and candidate matching. Desktop candidates
+are changed paths present as regular files in the loaded HEAD tree, excluding
+already-declared paths. Names-only discovery may inspect tree entries/OIDs but
+does not load blob content. Show revision and source per path; a separate Load
+reads exactly those pinned blobs, never the current working files as a fallback.
+New/unborn paths without a HEAD version have no base candidate. No network read.
+
+Keep Discover → Load → Include (or diff-only). Require fresh HEAD/manifest checks
+before content loading and final review/suggestion guards. Apply desktop file,
+count and aggregate ceilings on top of shared settings. Unlike CLI's best-effort
+truncation/skipping, desktop rejects oversized/non-text/sensitive candidates or
+count excess; no silently incomplete evidence under a preview approval. Automatic
+max_bytes/max_files include explicitly declared context, matching CLI accounting.
+Configuration enables proposals, not filesystem or provider access. Revisit for
+another base revision only with explicit provenance and approval semantics.
+
 ## Explicit history for local review results and suppressions
 
 SQLite schema 9 adds a separate immutable local-review archive, with explicit
