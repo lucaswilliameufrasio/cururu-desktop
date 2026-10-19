@@ -13,6 +13,13 @@ use std::{io::Read as _, path::Path};
 pub struct ContextPath {
     pub label: String,
     pub path: String,
+    pub source: ContextSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextSource {
+    Worktree,
+    Head { commit: String, blob: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +27,7 @@ pub struct ContextSpec {
     pub focus: Vec<String>,
     pub paths: Vec<ContextPath>,
     pub max_bytes: usize,
+    pub auto: cururu_engine::auto_context::AutoContextConfig,
 }
 
 impl Default for ContextSpec {
@@ -28,6 +36,7 @@ impl Default for ContextSpec {
             focus: Vec::new(),
             paths: Vec::new(),
             max_bytes: MAX_CONTEXT_BYTES,
+            auto: cururu_engine::auto_context::AutoContextConfig::default(),
         }
     }
 }
@@ -40,15 +49,7 @@ impl ContextSpec {
         };
         if let Some(context) = context {
             if let Some(auto) = context.auto {
-                ensure!(
-                    auto.enabled == Some(false)
-                        && auto.max_bytes.is_none()
-                        && auto.max_files.is_none()
-                        && auto.per_file_bytes.is_none()
-                        && auto.include.is_none()
-                        && auto.exclude.is_none(),
-                    "automatic context discovery is unsupported; only context.auto.enabled = false is accepted"
-                );
+                spec.auto = crate::automatic_context::settings(auto)?;
             }
             spec.max_bytes = context
                 .max_bytes
@@ -66,6 +67,7 @@ impl ContextSpec {
                     spec.paths.push(ContextPath {
                         label: label.to_string(),
                         path,
+                        source: ContextSource::Worktree,
                     });
                 }
             }
@@ -89,7 +91,7 @@ impl ContextSpec {
     }
 
     pub const fn requires_choice(&self) -> bool {
-        !self.focus.is_empty() || !self.paths.is_empty()
+        !self.focus.is_empty() || !self.paths.is_empty() || self.auto.enabled
     }
 }
 
@@ -98,6 +100,7 @@ pub struct PreparedContext {
     pub snapshot_fingerprint: String,
     pub fingerprint: String,
     pub evidence: ReviewContext,
+    pub manifest: crate::context_discovery::ContextManifest,
 }
 
 #[cfg(test)]
@@ -125,29 +128,26 @@ pub fn load_manifest(
     };
     let mut total = 0_usize;
     for entry in &manifest.paths {
-        let mut file = open_file(&snapshot.root, &entry.path)
-            .context("could not safely open a declared context file")?;
-        ensure!(
-            file.metadata()?.is_file(),
-            "declared context must be a regular file"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            ensure!(
-                file.metadata()?.nlink() == 1,
-                "hard-linked context files are not supported"
-            );
-        }
-        let limit = MAX_CONTEXT_FILE_BYTES.min(policy.context.max_bytes.saturating_sub(total));
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(u64::try_from(limit + 1)?)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= limit,
-            "declared context exceeds its per-file or aggregate budget; no text was truncated"
-        );
+        let aggregate = if policy.context.auto.enabled {
+            policy.context.max_bytes.min(policy.context.auto.max_bytes)
+        } else {
+            policy.context.max_bytes
+        };
+        let per_file = match entry.source {
+            ContextSource::Worktree => MAX_CONTEXT_FILE_BYTES,
+            ContextSource::Head { .. } => policy
+                .context
+                .auto
+                .per_file_bytes
+                .min(MAX_CONTEXT_FILE_BYTES),
+        };
+        let limit = per_file.min(aggregate.saturating_sub(total));
+        let bytes = match &entry.source {
+            ContextSource::Worktree => read_worktree(&snapshot.root, &entry.path, limit)?,
+            ContextSource::Head { commit, blob } => {
+                crate::automatic_context::read_head(snapshot, &entry.path, commit, blob, limit)?
+            }
+        };
         total += bytes.len();
         let content = String::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("declared context must be UTF-8 text"))?;
@@ -163,7 +163,34 @@ pub fn load_manifest(
         snapshot_fingerprint: scope(snapshot)?,
         fingerprint,
         evidence,
+        manifest: manifest.clone(),
     })
+}
+
+fn read_worktree(root: &Path, path: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let mut file =
+        open_file(root, path).context("could not safely open a declared context file")?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "declared context must be a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        ensure!(
+            file.metadata()?.nlink() == 1,
+            "hard-linked context files are not supported"
+        );
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(u64::try_from(limit + 1)?)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= limit,
+        "declared context exceeds its per-file or aggregate budget; no text was truncated"
+    );
+    Ok(bytes)
 }
 
 pub fn scope(snapshot: &crate::repository::RepositorySnapshot) -> anyhow::Result<String> {
@@ -195,19 +222,7 @@ pub fn validate(
             approved.snapshot_fingerprint == scope(snapshot)?,
             "approved context belongs to a different repository snapshot"
         );
-        let manifest = crate::context_discovery::ContextManifest {
-            snapshot_fingerprint: approved.snapshot_fingerprint.clone(),
-            paths: approved
-                .evidence
-                .files
-                .iter()
-                .map(|file| ContextPath {
-                    label: file.label.clone(),
-                    path: file.path.clone(),
-                })
-                .collect(),
-        };
-        let current = load_manifest(snapshot, &manifest)?;
+        let current = load_manifest(snapshot, &approved.manifest)?;
         ensure!(
             current.fingerprint == approved.fingerprint,
             "declared context changed after approval; prepare it again"
@@ -326,7 +341,7 @@ mod tests {
         }
         assert!(
             crate::repository_policy::RepositoryPolicy::parse(
-                "version = 1\n[context.auto]\nenabled = true"
+                "version = 1\n[context.auto]\nenabled = true\nmax_files = 0"
             )
             .is_err()
         );

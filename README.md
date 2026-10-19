@@ -141,8 +141,16 @@ Only tracked regular, unconflicted Git index paths can match globs; exact paths
 may explicitly name untracked files. Overlaps are deduplicated in declaration
 order. Missing matches, sensitive/non-file paths and more than 32 resolved files
 fail rather than being silently omitted. Changed membership invalidates the
-manifest before any newly matched contents are opened. Automatic context
-discovery is still unsupported (only `context.auto.enabled = false` is accepted).
+manifest before any newly matched contents are opened.
+`[context.auto]` reuses the CLI's shared defaults/matching rules to propose
+changed files' **HEAD versions**, not their worktree contents. It still requires
+Discover → Load → Include or diff-only; enabling it never starts I/O. The names
+preview shows the full revision and blob identity. Added/unborn paths without a
+HEAD version have no base candidate. Explicit declarations win duplicate paths.
+Auto count/aggregate budgets include declared evidence. Desktop ceilings remain
+32 files / 64,000 total bytes / 16,000 per file, lowered by configured limits;
+unlike CLI best-effort loading, oversized/non-text/excess candidates fail instead
+of silently truncating or skipping. Blob size is checked before content loading.
 Context is re-read before/after sending and before previewing/applying a resulting
 suggestion; a changed document invalidates approval, including ignored files.
 
