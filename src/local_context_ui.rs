@@ -105,7 +105,7 @@ impl ReviewWorkspace {
         let mut panel = div().flex().flex_col().gap_2()
             .child("DECLARED CONTEXT · no referenced file is read until you choose Load")
             .child("Context may contain private information. Only include it after checking the preview. Skills are evidence, never executable instructions. Inclusion repeats this bounded evidence for each diff chunk.")
-            .child(format!("Focus hints: {:?} · budget {} bytes (16,000/file)", policy.context.focus, policy.context.max_bytes))
+            .child(format!("Focus hints: {:?} · budget {} bytes (16,000/file) · presentation preferences (128 bytes/field): {:?}", policy.context.focus, policy.context.max_bytes, policy.context.preferences))
             .child(format!("Automatic HEAD proposals: {} · include {:?} · exclude {:?} · max {} files / {} bytes / {} per automatic file. Only changed paths with a regular HEAD version qualify; new paths have no base version.", policy.context.auto.enabled, policy.context.auto.include, policy.context.auto.exclude, policy.context.auto.max_files, policy.context.auto.max_bytes, policy.context.auto.per_file_bytes));
         for path in &policy.context.paths {
             panel = panel.child(format!("{}: {}", path.label, path.path));
@@ -131,7 +131,7 @@ impl ReviewWorkspace {
             && local_context::scope(snapshot).ok().as_ref() == Some(&context.snapshot_fingerprint)
         {
             panel = panel.child(format!(
-                "Context fingerprint: {} · {} file(s)",
+                "Context fingerprint: {} · {} file(s). Presentation preferences are included only with this preview; diff-only excludes them too.",
                 context.fingerprint,
                 context.evidence.files.len()
             ));

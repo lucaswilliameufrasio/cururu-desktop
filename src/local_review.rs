@@ -191,6 +191,10 @@ pub async fn review_snapshot(
     .with_review_context(&context.map_or_else(
         cururu_engine::review_context::ReviewContext::default,
         |context| context.evidence.clone(),
+    ))?
+    .with_review_preferences(&context.map_or_else(
+        cururu_engine::review_preferences::ReviewPreferences::default,
+        |context| context.preferences.clone(),
     ))?;
     let chunk_results = cururu_engine::review_chunks(&agent, &chunks).await?;
     let mut result = assemble_review_result(settings, snapshot, chunk_results)?;

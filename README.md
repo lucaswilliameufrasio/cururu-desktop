@@ -1,5 +1,14 @@
 # Cururu Desktop
 
+Explicit `review.language`, `tone`, `technical_level` and `suggestion_detail` are
+bounded optional preferences, shown in the context preview and sent only after
+inclusion. They travel as JSON user data, never system instructions, and are
+covered by context/review/suggestion/incremental fingerprints. Diff-only excludes
+them as well. No defaults or provider/permission settings are copied from CLI.
+Valid `review.comment_mode` is an advisory hint only; personal publication controls
+still choose the actual workflow. `recommendations = false` is accepted; true
+remains blocked because it must not authorize extra provider calls from the repo.
+
 **Local static analysis** supports explicit `[analysis] enabled = true` with an
 exact `manifest` path and optional exact `sarif_paths`. Read the manifest first
 to inspect its tool claims and referenced names, then explicitly load SARIF.

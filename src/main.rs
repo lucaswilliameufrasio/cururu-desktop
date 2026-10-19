@@ -3444,7 +3444,7 @@ fn local_policy_summary(snapshot: &repository::RepositorySnapshot) -> String {
         return "repository policy unavailable".to_string();
     };
     format!(
-        "profile {:?}; minimum confidence {}; max findings {}; severities {:?}; suggestions {}; synthesis {}; reuse {:?}; informational quality threshold {:?}",
+        "profile {:?}; minimum confidence {}; max findings {}; severities {:?}; suggestions {}; synthesis {}; reuse {:?}; informational quality threshold {:?}; publication hint {:?} (does not change personal controls)",
         policy.profile,
         policy.minimum_confidence,
         policy.max_findings,
@@ -3452,7 +3452,8 @@ fn local_policy_summary(snapshot: &repository::RepositorySnapshot) -> String {
         policy.suggested_changes,
         policy.synthesis,
         policy.review_reuse,
-        policy.fail_on
+        policy.fail_on,
+        policy.publication_hint
     )
 }
 
