@@ -71,6 +71,10 @@ impl ReviewWorkspace {
                 if let Ok(effective) = base.resolve(snapshot) {
                     let entity = cx.entity();
                     panel = panel.child(format!(
+                        "Local analysis declarations (no execution): {:?}",
+                        effective.analysis
+                    ));
+                    panel = panel.child(format!(
                         "Effective profile: {:?} · synthesis: {} · quality threshold: {:?} (informational)",
                         effective.profile, effective.synthesis, effective.fail_on
                     ));

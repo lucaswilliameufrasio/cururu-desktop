@@ -1,5 +1,25 @@
 # Cururu Desktop
 
+**Local static analysis** supports explicit `[analysis] enabled = true` with an
+exact `manifest` path and optional exact `sarif_paths`. Read the manifest first
+to inspect its tool claims and referenced names, then explicitly load SARIF.
+Findings use the shared parser/core model and can navigate to valid changed-line
+anchors after checkout/artifact revalidation, without an AI key or network access.
+Loading never executes a command, sends evidence, applies or publishes anything.
+
+The manifest needs schema 1, `commit_sha` equal to current HEAD and
+`desktop_diff_fingerprint` copied from the panel. Its `tools` entries use
+`name`, `status` (passed/succeeded/failed/not_run), optional `exit_code`, `message`
+and `sarif_path`. These are untrusted claims, not proof a tool ran. Keep artifact
+files in a Git-ignored directory (such as an ignored build directory), outside
+the working-tree diff; otherwise the manifest fingerprint becomes self-referential.
+Limits: 64,000-byte manifest / 8 tools, 8 exact SARIF files of 128,000 bytes,
+100 candidates and a 64,000-byte normalized report. Unsafe/nonregular files,
+excess and stale/missing bindings fail rather than truncate. Globs, unbound
+standalone SARIF, remote check-run fetching and disabling current-revision checks
+remain unsupported. Reports are memory-only and are not implicitly merged or
+sent with AI reviews. Existing approved/sandboxed commands remain separate.
+
 `policy.synthesis` uses the shared core's candidate deduplication. `policy.fail_on`
 uses its severity quality gate and shows an informational passed/failed/disabled
 status for retained findings, also preserved in newly saved review snapshots.

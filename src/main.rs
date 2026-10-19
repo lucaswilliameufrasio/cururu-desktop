@@ -33,6 +33,8 @@ mod gh_cli;
 pub mod github_auth;
 pub mod github_pr;
 mod github_session;
+mod local_analysis;
+mod local_analysis_ui;
 pub mod local_command;
 mod local_context;
 mod local_context_ui;
@@ -141,6 +143,7 @@ struct ReviewWorkspace {
     shared_base_state: shared_base_ui::SharedBaseState,
     local_history_state: local_review_history_ui::HistoryState,
     action_history: action_history_ui::ActionHistory,
+    local_analysis_state: local_analysis_ui::AnalysisState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -469,6 +472,7 @@ impl ReviewWorkspace {
             shared_base_state: shared_base_ui::SharedBaseState::default(),
             local_history_state: local_review_history_ui::HistoryState::default(),
             action_history: action_history_ui::ActionHistory::default(),
+            local_analysis_state: local_analysis_ui::AnalysisState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -1980,6 +1984,7 @@ impl ReviewWorkspace {
                 .bg(rgb(0x0015_1e27))
                 .p_4()
                 .child(self.render_local_history(cx))
+                .child(self.render_local_analysis(cx))
                 .child(self.render_action_history(cx));
         };
         let file = &self.files[selected_file];
@@ -2114,6 +2119,7 @@ impl ReviewWorkspace {
                 .gap_2()
                 .child(self.render_local_review_action(cx))
                 .child(self.render_local_history(cx))
+                .child(self.render_local_analysis(cx))
                 .child(self.render_local_command_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
