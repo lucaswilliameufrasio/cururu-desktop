@@ -1,0 +1,429 @@
+//! Explicit immutable local review history. Archived findings have no actions.
+
+use crate::{
+    LocalReviewState, ReviewWorkspace,
+    evaluation_history::HumanAssessment,
+    local_review_history::{self, LocalReviewRecord, StoredLocalReview},
+};
+use anyhow::{Context as _, ensure};
+use gpui::{App, Context, Entity, ParentElement as _, Styled as _, div};
+use gpui_component::{Disableable as _, button::Button};
+
+#[derive(Default)]
+pub enum HistoryState {
+    #[default]
+    Idle,
+    Busy,
+    Loaded {
+        repository_key: String,
+        page: usize,
+        rows: Vec<StoredLocalReview>,
+        selected: Option<String>,
+    },
+}
+
+enum Action {
+    Load,
+    Save(Box<LocalReviewRecord>),
+    Delete(String),
+}
+
+impl ReviewWorkspace {
+    fn current_history_record(
+        &self,
+        assessment: HumanAssessment,
+    ) -> anyhow::Result<LocalReviewRecord> {
+        let snapshot = self
+            .local_repository_snapshot
+            .as_ref()
+            .context("local checkout is unavailable")?;
+        let LocalReviewState::Complete(result) = &self.local_review_state else {
+            anyhow::bail!("no completed local review is available");
+        };
+        ensure!(
+            result.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
+                && result.base.as_ref().map(|base| &base.fingerprint)
+                    == crate::shared_base::fingerprint(snapshot).as_ref(),
+            "local review identity changed"
+        );
+        let context = self.local_context_state.resolve(snapshot)?;
+        ensure!(
+            context.as_ref().map(|context| &context.fingerprint)
+                == result.context.as_ref().map(|context| &context.fingerprint),
+            "local review context choice changed"
+        );
+        let config = crate::local_review::config_fingerprint(
+            self.local_review_settings
+                .as_ref()
+                .context("local review settings are unavailable")?,
+        )?;
+        ensure!(
+            config == result.config_fingerprint,
+            "local review provider configuration changed"
+        );
+        LocalReviewRecord::from_result(&snapshot.root, result, assessment)
+    }
+
+    pub fn render_local_history(&self, cx: &Context<Self>) -> gpui::Div {
+        let Some(snapshot) = &self.local_repository_snapshot else {
+            return div();
+        };
+        let Ok(key) = local_review_history::repository_key(&snapshot.root) else {
+            return div();
+        };
+        let busy =
+            matches!(self.local_history_state, HistoryState::Busy) || self.session_store.is_none();
+        let mut panel = div().flex().flex_col().gap_2()
+            .child("LOCAL REVIEW HISTORY · explicit saves; records never restore apply/publish permissions")
+            .child("Save results, suppressions and an optional whole-review assessment. Finding prose may quote code. Keys, raw inputs, context files and shared configuration documents are excluded. Assessments are not calibrated labels. Limit: 200 local review records, 64,000 bytes each; delete explicitly.")
+            .child(button(cx.entity(), key.clone(), 0, Action::Load, "load-local-history".into(), "Load saved local reviews", busy));
+        if matches!(self.local_history_state, HistoryState::Busy) {
+            panel = panel.child("Loading or updating local history…");
+        }
+        panel = panel.child(self.render_history_save_options(cx, &key, busy));
+        if let HistoryState::Loaded {
+            repository_key,
+            page,
+            rows,
+            selected,
+        } = &self.local_history_state
+            && repository_key == &key
+        {
+            panel = panel.child(format!("Page {} · {} saved records", page + 1, rows.len()));
+            if *page > 0 {
+                panel = panel.child(button(
+                    cx.entity(),
+                    key.clone(),
+                    page - 1,
+                    Action::Load,
+                    "local-history-previous".into(),
+                    "Previous page",
+                    busy,
+                ));
+            }
+            if rows.len() == 20 && *page < 9 {
+                panel = panel.child(button(
+                    cx.entity(),
+                    key.clone(),
+                    page + 1,
+                    Action::Load,
+                    "local-history-next".into(),
+                    "Next page",
+                    busy,
+                ));
+            }
+            for row in rows {
+                let entity = cx.entity();
+                let id = row.id.clone();
+                panel = panel
+                    .child(format!(
+                        "{} · {} finding(s), {} suppressed · {} · saved {} ms since epoch",
+                        crate::short_sha(&row.id),
+                        row.record.review.findings.len(),
+                        row.record.suppressed.len(),
+                        row.record.assessment.label(),
+                        row.created_at
+                    ))
+                    .child(
+                        Button::new(gpui::SharedString::from(format!(
+                            "inspect-local-review-{}",
+                            row.id
+                        )))
+                        .label("Inspect saved result (read only)")
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                if let HistoryState::Loaded { selected, .. } =
+                                    &mut this.local_history_state
+                                {
+                                    *selected = Some(id.clone());
+                                }
+                                cx.notify();
+                            });
+                        }),
+                    )
+                    .child(button(
+                        cx.entity(),
+                        key.clone(),
+                        *page,
+                        Action::Delete(row.id.clone()),
+                        format!("delete-local-review-{}", row.id),
+                        "Delete this local history record",
+                        busy,
+                    ));
+                if selected.as_ref() == Some(&row.id) {
+                    panel = panel.child(render_record(
+                        &row.record,
+                        self.loaded_identity_matches(&row.record),
+                    ));
+                }
+            }
+        }
+        panel
+    }
+
+    fn render_history_save_options(&self, cx: &Context<Self>, key: &str, busy: bool) -> gpui::Div {
+        let mut panel = div().flex().flex_col().gap_2();
+        for assessment in [
+            HumanAssessment::Unreviewed,
+            HumanAssessment::Agree,
+            HumanAssessment::Disagree,
+            HumanAssessment::NeedsMoreEvidence,
+        ] {
+            if let Ok(record) = self.current_history_record(assessment) {
+                panel = panel.child(button(
+                    cx.entity(),
+                    key.to_string(),
+                    0,
+                    Action::Save(Box::new(record)),
+                    format!("save-local-review-{}", assessment.label()),
+                    &format!("Save current review · {}", assessment.label()),
+                    busy,
+                ));
+            }
+        }
+        panel
+    }
+
+    fn loaded_identity_matches(&self, record: &LocalReviewRecord) -> bool {
+        let Some(snapshot) = &self.local_repository_snapshot else {
+            return false;
+        };
+        let config = self
+            .local_review_settings
+            .as_ref()
+            .and_then(|settings| crate::local_review::config_fingerprint(settings).ok());
+        let context = self.local_context_state.resolve(snapshot);
+        record.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
+            && record.head_oid == snapshot.head_oid
+            && config.as_ref() == Some(&record.config_fingerprint)
+            && record.base_fingerprint == crate::shared_base::fingerprint(snapshot)
+            && context.is_ok_and(|context| {
+                context.as_ref().map(|context| &context.fingerprint)
+                    == record.context_fingerprint.as_ref()
+            })
+    }
+}
+
+fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
+    let mut panel = div().flex().flex_col().gap_2()
+        .child(if matches { "Matches loaded identity only; the current filesystem was not revalidated by opening history." } else { "STALE / context or settings not verified. This is an archived result only." })
+        .child(format!("head {} · model {} · diff {} · context {:?} · base {:?}\n{}", record.head_oid.as_deref().unwrap_or("unborn"), record.review.model, record.diff_fingerprint, record.context_fingerprint, record.base_fingerprint, record.review.summary));
+    for finding in &record.review.findings {
+        panel = panel.child(finding_text(finding));
+    }
+    for suppressed in &record.suppressed {
+        panel = panel.child(format!(
+            "SUPPRESSED: {}\n{}",
+            suppressed.reason,
+            finding_text(&suppressed.finding)
+        ));
+    }
+    panel = panel.child(format!(
+        "{} invalid candidates discarded · {} diff bytes · {} chunks",
+        record.discarded_findings, record.diff_bytes, record.chunk_count
+    ));
+    if let Some(usage) = &record.usage {
+        panel = panel.child(format!(
+            "Usage: {} input · {} output · cost {:?}",
+            usage.prompt_tokens, usage.completion_tokens, usage.cost
+        ));
+    }
+    panel
+}
+
+fn finding_text(finding: &cururu_core::ReviewFinding) -> String {
+    format!(
+        "{} · {}:{} · confidence {}\n{}\n{}\n{}\nSuggested change: {:?}",
+        finding.severity,
+        finding.path,
+        finding.line.unwrap_or_default(),
+        finding.confidence,
+        finding.title,
+        finding.message,
+        finding.suggestion,
+        finding
+            .suggested_change
+            .as_ref()
+            .map(|change| &change.replacement)
+    )
+}
+
+fn button(
+    entity: Entity<ReviewWorkspace>,
+    key: String,
+    page: usize,
+    action: Action,
+    id: String,
+    label: &str,
+    disabled: bool,
+) -> Button {
+    Button::new(gpui::SharedString::from(id))
+        .label(label.to_owned())
+        .disabled(disabled)
+        .on_click(move |_, _, cx| {
+            let action = match &action {
+                Action::Load => Action::Load,
+                Action::Save(record) => Action::Save(record.clone()),
+                Action::Delete(id) => Action::Delete(id.clone()),
+            };
+            run(&entity, key.clone(), page, action, cx);
+        })
+}
+
+fn validate_save(
+    snapshot: &crate::repository::RepositorySnapshot,
+    result: &crate::local_review::LocalReviewResult,
+) -> anyhow::Result<()> {
+    let fresh = snapshot.reopen_with_approved_base()?;
+    ensure!(
+        crate::local_review::snapshot_fingerprint(&fresh) == result.diff_fingerprint
+            && crate::shared_base::fingerprint(&fresh).as_ref()
+                == result.base.as_ref().map(|base| &base.fingerprint),
+        "checkout or base approval changed before saving local review"
+    );
+    crate::local_context::validate(&fresh, result.context.as_ref())
+}
+
+fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Action, cx: &mut App) {
+    let request = entity.update(cx, |this, cx| {
+        if matches!(this.local_history_state, HistoryState::Busy) {
+            return None;
+        }
+        let current_key = this
+            .local_repository_snapshot
+            .as_ref()
+            .and_then(|snapshot| local_review_history::repository_key(&snapshot.root).ok())?;
+        if current_key != key {
+            return None;
+        }
+        let store = this.session_store.clone()?;
+        let evidence = if let Action::Save(record) = &action {
+            let current = this
+                .current_history_record(record.assessment)
+                .and_then(|current| current.id());
+            if !current.is_ok_and(|id| record.id().is_ok_and(|expected| expected == id)) {
+                this.notice = Some("Local review changed; save cancelled.".into());
+                cx.notify();
+                return None;
+            }
+            let LocalReviewState::Complete(result) = &this.local_review_state else {
+                return None;
+            };
+            Some((this.local_repository_snapshot.clone()?, result.clone()))
+        } else {
+            None
+        };
+        this.local_history_state = HistoryState::Busy;
+        cx.notify();
+        Some((store, evidence))
+    });
+    let Some((store, evidence)) = request else {
+        return;
+    };
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let query_key = key.clone();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                match action {
+                    Action::Load => {}
+                    Action::Save(record) => {
+                        let (snapshot, result) =
+                            evidence.context("review evidence is unavailable")?;
+                        validate_save(&snapshot, &result)?;
+                        store.save_local_review(&record)?;
+                    }
+                    Action::Delete(id) => {
+                        store.delete_local_review(&query_key, &id)?;
+                    }
+                }
+                store.local_review_history(&query_key, page)
+            })
+            .await;
+        let _ = entity.update(cx, |this, cx| {
+            match result {
+                Ok(rows) => {
+                    this.local_history_state = HistoryState::Loaded {
+                        repository_key: key,
+                        page,
+                        rows,
+                        selected: None,
+                    };
+                    this.notice = Some(
+                        "Local review history updated. No remote action was performed.".into(),
+                    );
+                }
+                Err(error) => {
+                    this.local_history_state = HistoryState::Idle;
+                    this.notice = Some(format!("Local review history unavailable: {error}").into());
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saving_requires_current_provider_diff_and_evidence_and_revalidates_the_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        gix::init(root.path()).unwrap();
+        std::fs::write(root.path().join("source.rs"), "code\n").unwrap();
+        let snapshot = crate::repository::RepositorySnapshot::open(root.path()).unwrap();
+        let settings = crate::session_store::LocalReviewSettings {
+            openai_endpoint: "https://api.openai.com/v1".to_string(),
+            openai_model: "test-model".to_string(),
+        };
+        let saved = local_review_history::sample_record();
+        let mut review = saved.review;
+        review.findings[0].path = "source.rs".to_string();
+        let result = crate::local_review::LocalReviewResult {
+            config_fingerprint: crate::local_review::config_fingerprint(&settings).unwrap(),
+            base: None,
+            context: None,
+            review,
+            usage: None,
+            diff_fingerprint: crate::local_review::snapshot_fingerprint(&snapshot),
+            head_oid: snapshot.head_oid.clone(),
+            diff_bytes: 100,
+            chunk_count: 1,
+            discarded_findings: 0,
+            policy_suppressed: Vec::new(),
+        };
+        assert!(validate_save(&snapshot, &result).is_ok());
+        let mut workspace = ReviewWorkspace::sample();
+        workspace.local_repository_snapshot = Some(snapshot.clone());
+        workspace.local_review_settings = Some(settings.clone());
+        workspace.local_review_state = LocalReviewState::Complete(Box::new(result.clone()));
+        assert!(
+            workspace
+                .current_history_record(HumanAssessment::Unreviewed)
+                .is_ok()
+        );
+        workspace
+            .local_review_settings
+            .as_mut()
+            .unwrap()
+            .openai_model = "changed-model".to_string();
+        assert!(
+            workspace
+                .current_history_record(HumanAssessment::Agree)
+                .is_err()
+        );
+        workspace.local_review_settings = Some(settings);
+        std::fs::write(root.path().join("source.rs"), "user edit\n").unwrap();
+        assert!(validate_save(&snapshot, &result).is_err());
+        workspace.local_repository_snapshot =
+            Some(crate::repository::RepositorySnapshot::open(root.path()).unwrap());
+        assert!(
+            workspace
+                .current_history_record(HumanAssessment::Unreviewed)
+                .is_err()
+        );
+    }
+}

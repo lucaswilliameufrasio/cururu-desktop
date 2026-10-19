@@ -67,6 +67,7 @@ pub struct PolicySuppressedFinding {
 
 #[derive(Debug, Clone)]
 pub struct LocalReviewResult {
+    pub config_fingerprint: String,
     pub base: Option<crate::shared_base::ApprovedBase>,
     pub context: Option<crate::local_context::PreparedContext>,
     pub review: cururu_core::ReviewResult,
@@ -297,6 +298,7 @@ fn assemble_review_result(
     );
 
     Ok(LocalReviewResult {
+        config_fingerprint: config_fingerprint(settings)?,
         base: snapshot
             .review_policy
             .as_ref()

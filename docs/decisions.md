@@ -1,5 +1,30 @@
 # Desktop architecture decisions
 
+## Explicit history for local review results and suppressions
+
+SQLite schema 9 adds a separate immutable local-review archive, with explicit
+Save/Load/Inspect/Delete actions and optional whole-review human annotations.
+Persist normalized findings, policy suppressions with reasons, discarded counts,
+usage/model and head/diff/provider/context/base fingerprints. Use a canonical
+checkout hash as the repository key rather than copying its absolute path into
+the payload. Do not persist raw prompts, source snapshots, credentials, approved
+context files or shared-base documents: an explicit result DTO makes these
+in-memory capability types unavailable to serialization.
+
+Finding explanations/suggestions can quote code; warn before Save. Revalidate
+the current UI/provider/context/base identity and a fresh local snapshot before
+saving. Record identity includes the human annotation; edits create another
+record instead of replacing history. These annotations are subjective and do
+not authorize evaluator filtering or constitute calibrated labels.
+
+Bound this archive independently to 200 records, 64,000 bytes/record and 20 per
+page. Reject excess/corruption rather than truncate or evict. Inspect one result
+at a time. Archived results are plain read-only text, without apply/publish
+controls or restoration into live analysis/consent state. Loaded identity matches
+are not proof of current filesystem freshness. Deletion is explicit and does
+not promise secure erasure from SQLite/backups. Migration 8→9 preserves the
+second-opinion archive, publication preferences and queued drafts.
+
 ## Explicit names-only context glob discovery
 
 Extend exact context paths with the core's glob semantics. Resolve globs only

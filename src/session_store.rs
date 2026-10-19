@@ -10,8 +10,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 #[path = "evaluation_history_store.rs"]
 mod evaluation_history_store;
+#[path = "local_review_history_store.rs"]
+mod local_review_history_store;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
@@ -652,15 +654,7 @@ impl SessionStore {
                 )
                 .context("failed to apply local session database migration 5")?;
         }
-        if version < 6 {
-            transaction.execute_batch("CREATE TABLE github_draft_queue (id INTEGER PRIMARY KEY CHECK(id = 1), revision INTEGER NOT NULL CHECK(revision > 0), payload TEXT NOT NULL); PRAGMA user_version = 6;")?;
-        }
-        if version < 7 {
-            evaluation_history_store::migrate(&transaction)?;
-        }
-        if version < 8 {
-            transaction.execute_batch("CREATE TABLE publication_preference (id INTEGER PRIMARY KEY CHECK(id = 1), mode TEXT NOT NULL CHECK(mode IN ('individual','batch'))); PRAGMA user_version = 8;")?;
-        }
+        migrate_review_storage(&transaction, version)?;
         transaction
             .commit()
             .context("failed to commit the session database migration")
@@ -677,6 +671,25 @@ impl SessionStore {
             .context("failed to enable local session database constraints")?;
         Ok(connection)
     }
+}
+
+fn migrate_review_storage(
+    transaction: &rusqlite::Transaction<'_>,
+    version: i64,
+) -> anyhow::Result<()> {
+    if version < 6 {
+        transaction.execute_batch("CREATE TABLE github_draft_queue (id INTEGER PRIMARY KEY CHECK(id = 1), revision INTEGER NOT NULL CHECK(revision > 0), payload TEXT NOT NULL); PRAGMA user_version = 6;")?;
+    }
+    if version < 7 {
+        evaluation_history_store::migrate(transaction)?;
+    }
+    if version < 8 {
+        transaction.execute_batch("CREATE TABLE publication_preference (id INTEGER PRIMARY KEY CHECK(id = 1), mode TEXT NOT NULL CHECK(mode IN ('individual','batch'))); PRAGMA user_version = 8;")?;
+    }
+    if version < 9 {
+        local_review_history_store::migrate(transaction)?;
+    }
+    Ok(())
 }
 
 fn validate_draft(draft: &cururu_core::ReviewCommentDraft) -> anyhow::Result<()> {
@@ -857,7 +870,7 @@ mod tests {
         store.save_evaluation(&record).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE publication_preference; PRAGMA user_version = 7;")
+            .execute_batch("DROP TABLE local_review_history; DROP TABLE publication_preference; PRAGMA user_version = 7;")
             .unwrap();
         let migrated = super::SessionStore::open(&path).unwrap();
         assert_eq!(
@@ -1146,7 +1159,7 @@ mod tests {
             .unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE publication_preference; DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
+            .execute_batch("DROP TABLE local_review_history; DROP TABLE publication_preference; DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(

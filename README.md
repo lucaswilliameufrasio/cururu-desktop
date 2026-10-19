@@ -1,5 +1,17 @@
 # Cururu Desktop
 
+**Local review history** explicitly saves completed findings, policy-suppressed
+findings with reasons, usage and an optional whole-review human assessment.
+Records include revision/diff/provider/context/base fingerprints, not credentials,
+raw inputs or context/shared-base documents. Finding prose may quote code; check
+it before saving. Loading history is read-only: it does not restore live findings,
+approval, apply or publication state. Detailed records are opened individually;
+matching loaded identity is not a fresh filesystem validation. Limits are 200
+local review records, 64,000 bytes each, 20 per page. Assessment changes create
+new immutable records; nothing is silently overwritten/pruned. Delete explicitly.
+This archive is separate from the second-opinion archive and does not enable
+automatic filtering or evaluator calibration.
+
 Pinned GitHub shared configuration is supported via `[config]` (`base =
 "owner/repository"`, full 40-character `base_ref`, repository-relative
 `base_path`). Opening a checkout never fetches it. Explicitly fetch with your
