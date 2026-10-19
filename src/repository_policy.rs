@@ -24,6 +24,7 @@ pub struct RepositoryPolicy {
     pub ignore: Vec<String>,
     pub provider_ignored: bool,
     pub context: crate::local_context::ContextSpec,
+    pub analysis: crate::local_analysis::AnalysisSpec,
     pub shared_base: Option<crate::shared_base::SharedBaseSource>,
     pub base_approval: Option<crate::shared_base::ApprovedBase>,
     pub local_document: Option<crate::shared_base::ConfigDocument>,
@@ -45,6 +46,7 @@ impl Default for RepositoryPolicy {
             ignore: vec![],
             provider_ignored: false,
             context: crate::local_context::ContextSpec::default(),
+            analysis: crate::local_analysis::AnalysisSpec::default(),
             shared_base: None,
             base_approval: None,
             local_document: None,
@@ -135,12 +137,9 @@ impl RepositoryPolicy {
             parsed.evaluator.is_none(),
             "[evaluator] is local-only and cannot be enabled by .cururu.toml"
         );
-        ensure!(
-            parsed.analysis.is_none(),
-            "desktop review does not yet support [analysis]; no analyzer files will be loaded"
-        );
         let profile = Self::selected_profile(&parsed)?;
         let mut policy = Self {
+            analysis: crate::local_analysis::AnalysisSpec::parse(parsed.analysis)?,
             shared_base: parsed
                 .config
                 .map(crate::shared_base::SharedBaseSource::parse)

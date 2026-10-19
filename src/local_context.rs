@@ -167,7 +167,7 @@ pub fn load_manifest(
     })
 }
 
-fn read_worktree(root: &Path, path: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+pub fn read_worktree(root: &Path, path: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
     let mut file =
         open_file(root, path).context("could not safely open a declared context file")?;
     ensure!(

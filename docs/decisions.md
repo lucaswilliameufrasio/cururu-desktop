@@ -1,5 +1,30 @@
 # Desktop architecture decisions
 
+## Explicit revision-bound local static artifacts
+
+Consume the shared SARIF parser from principal ADR 010 (pin f041ed2). A configured
+analysis section never executes tools or reads artifacts by itself. First load a
+bounded manifest to preview exact referenced paths, then explicitly load SARIF
+for local inspection. No AI key is needed and no evidence is sent to a provider.
+Keep command execution as the existing separately confirmed/sandboxed workflow.
+
+Require manifest schema 1, exact current commit_sha and desktop_diff_fingerprint
+matching the displayed desktop snapshot. HEAD alone cannot attest to modified
+worktree contents. Artifacts must be outside the reviewed working-tree diff
+(normally Git-ignored), avoiding self-referential fingerprints. Treat status as
+an untrusted tool claim, not proof an analyzer ran. Reject missing/stale binding,
+check-run fetching, disabled freshness, globs and unsupported locations.
+
+Bound manifest to 64,000 bytes/8 tools, at most 8 exact SARIF artifacts of 128,000
+bytes each, 100 candidates and 64,000 normalized report bytes. Reuse descriptor-
+relative no-symlink/no-hardlink regular reads. Validate the full manifest/scope
+before reading its referenced artifacts, hash all loaded artifacts and validate
+them plus a fresh checkout before diff navigation. Preserve tool/rule provenance;
+discard invalid line anchors with a visible count. Reports remain memory-only,
+without apply/publish controls; no implicit merge/transmission into AI review.
+Standalone unbound SARIF/check runs and structured-report persistence remain
+outside this slice rather than being treated as current evidence silently.
+
 ## Explicit shared profile catalog, host-owned overrides
 
 Accepted principal ADR 009 shares only pure profile values/defaults, as explicitly
