@@ -18,14 +18,31 @@ pub enum HistoryState {
         repository_key: String,
         page: usize,
         rows: Vec<StoredLocalReview>,
-        selected: Option<String>,
+        selected: Inspection,
     },
 }
 
+#[derive(Default, Clone)]
+pub enum Inspection {
+    #[default]
+    None,
+    Record(String),
+    Finding {
+        record_id: String,
+        index: usize,
+    },
+}
+
+#[derive(Clone)]
 enum Action {
     Load,
     Save(Box<LocalReviewRecord>),
     Delete(String),
+    Annotate {
+        record_id: String,
+        index: usize,
+        assessment: HumanAssessment,
+    },
 }
 
 impl ReviewWorkspace {
@@ -129,13 +146,13 @@ impl ReviewWorkspace {
                             "inspect-local-review-{}",
                             row.id
                         )))
-                        .label("Inspect saved result (read only)")
+                        .label("Inspect saved result (no execution)")
                         .on_click(move |_, _, cx| {
                             entity.update(cx, |this, cx| {
                                 if let HistoryState::Loaded { selected, .. } =
                                     &mut this.local_history_state
                                 {
-                                    *selected = Some(id.clone());
+                                    *selected = Inspection::Record(id.clone());
                                 }
                                 cx.notify();
                             });
@@ -150,11 +167,13 @@ impl ReviewWorkspace {
                         "Delete this local history record",
                         busy,
                     ));
-                if selected.as_ref() == Some(&row.id) {
+                if matches!(selected, Inspection::Record(id) | Inspection::Finding { record_id: id, .. } if id == &row.id)
+                {
                     panel = panel.child(render_record(
                         &row.record,
                         self.loaded_identity_matches(&row.record),
                     ));
+                    panel = panel.child(render_finding_decisions(cx, &key, row, selected));
                 }
             }
         }
@@ -211,6 +230,15 @@ fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
     for finding in &record.review.findings {
         panel = panel.child(finding_text(finding));
     }
+    panel = panel.child(format!("Annotation parent: {:?} · {} individual decision(s). Historical annotations do not change live findings or evaluator thresholds.", record.parent, record.finding_decisions.len()));
+    for decision in &record.finding_decisions {
+        panel = panel.child(format!(
+            "Finding #{} · {} · {}",
+            decision.index + 1,
+            decision.fingerprint,
+            decision.assessment.label()
+        ));
+    }
     for suppressed in &record.suppressed {
         panel = panel.child(format!(
             "SUPPRESSED: {}\n{}",
@@ -227,6 +255,85 @@ fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
             "Usage: {} input · {} output · cost {:?}",
             usage.prompt_tokens, usage.completion_tokens, usage.cost
         ));
+    }
+    panel
+}
+
+fn render_finding_decisions(
+    cx: &Context<ReviewWorkspace>,
+    key: &str,
+    row: &StoredLocalReview,
+    inspection: &Inspection,
+) -> gpui::Div {
+    let mut panel = div().flex().flex_col().gap_2().child(
+        "Select an archived finding to save an individual human decision (creates a new record).",
+    );
+    for index in 0..row.record.review.findings.len() + row.record.suppressed.len() {
+        let Some(finding) = row.record.finding(index) else {
+            continue;
+        };
+        let entity = cx.entity();
+        let id = row.id.clone();
+        panel = panel.child(
+            Button::new(gpui::SharedString::from(format!(
+                "select-archive-finding-{}-{index}",
+                row.id
+            )))
+            .label(format!(
+                "Finding #{} · {}:{}{}",
+                index + 1,
+                finding.path,
+                finding.line.unwrap_or_default(),
+                if index >= row.record.review.findings.len() {
+                    " (policy-suppressed)"
+                } else {
+                    ""
+                }
+            ))
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |this, cx| {
+                    if let HistoryState::Loaded { selected, rows, .. } =
+                        &mut this.local_history_state
+                        && rows
+                            .iter()
+                            .any(|row| row.id == id && row.record.finding(index).is_some())
+                    {
+                        *selected = Inspection::Finding {
+                            record_id: id.clone(),
+                            index,
+                        };
+                    }
+                    cx.notify();
+                });
+            }),
+        );
+        if matches!(inspection, Inspection::Finding { record_id, index: selected } if record_id == &row.id && *selected == index)
+        {
+            for assessment in [
+                HumanAssessment::Unreviewed,
+                HumanAssessment::Agree,
+                HumanAssessment::Disagree,
+                HumanAssessment::NeedsMoreEvidence,
+            ] {
+                panel = panel.child(button(
+                    cx.entity(),
+                    key.to_string(),
+                    0,
+                    Action::Annotate {
+                        record_id: row.id.clone(),
+                        index,
+                        assessment,
+                    },
+                    format!("annotate-{}-{index}-{}", row.id, assessment.label()),
+                    &format!(
+                        "Save decision for finding #{} · {}",
+                        index + 1,
+                        assessment.label()
+                    ),
+                    false,
+                ));
+            }
+        }
     }
     panel
 }
@@ -261,12 +368,7 @@ fn button(
         .label(label.to_owned())
         .disabled(disabled)
         .on_click(move |_, _, cx| {
-            let action = match &action {
-                Action::Load => Action::Load,
-                Action::Save(record) => Action::Save(record.clone()),
-                Action::Delete(id) => Action::Delete(id.clone()),
-            };
-            run(&entity, key.clone(), page, action, cx);
+            run(&entity, key.clone(), page, action.clone(), cx);
         })
 }
 
@@ -294,6 +396,16 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
             .as_ref()
             .and_then(|snapshot| local_review_history::repository_key(&snapshot.root).ok())?;
         if current_key != key {
+            return None;
+        }
+        if let Action::Annotate {
+            record_id, index, ..
+        } = &action
+            && !annotation_is_selected(&this.local_history_state, &key, record_id, *index)
+        {
+            this.notice =
+                Some("Select the archived finding again before saving a decision.".into());
+            cx.notify();
             return None;
         }
         let store = this.session_store.clone()?;
@@ -337,6 +449,13 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
                     Action::Delete(id) => {
                         store.delete_local_review(&query_key, &id)?;
                     }
+                    Action::Annotate {
+                        record_id,
+                        index,
+                        assessment,
+                    } => {
+                        store.annotate_local_finding(&query_key, &record_id, index, assessment)?;
+                    }
                 }
                 store.local_review_history(&query_key, page)
             })
@@ -348,7 +467,7 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
                         repository_key: key,
                         page,
                         rows,
-                        selected: None,
+                        selected: Inspection::None,
                     };
                     this.notice = Some(
                         "Local review history updated. No remote action was performed.".into(),
@@ -365,9 +484,49 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
     .detach();
 }
 
+fn annotation_is_selected(state: &HistoryState, key: &str, id: &str, index: usize) -> bool {
+    matches!(state,
+        HistoryState::Loaded { repository_key, selected: Inspection::Finding { record_id, index: selected_index }, rows, .. }
+        if repository_key == key && record_id == id && *selected_index == index
+            && rows.iter().any(|row| row.id == id && row.record.finding(index).is_some()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn individual_decisions_require_the_selected_archived_finding_in_the_current_checkout() {
+        let record = local_review_history::sample_record();
+        let key = record.repository_key.clone();
+        let id = record.id().unwrap();
+        let mut state = HistoryState::Loaded {
+            repository_key: key.clone(),
+            page: 0,
+            rows: vec![StoredLocalReview {
+                id: id.clone(),
+                created_at: 1,
+                record,
+            }],
+            selected: Inspection::Record(id.clone()),
+        };
+        assert!(!annotation_is_selected(&state, &key, &id, 0));
+        if let HistoryState::Loaded { selected, .. } = &mut state {
+            *selected = Inspection::Finding {
+                record_id: id.clone(),
+                index: 1,
+            };
+        }
+        assert!(annotation_is_selected(&state, &key, &id, 1));
+        assert!(!annotation_is_selected(&state, &key, &id, 0));
+        assert!(!annotation_is_selected(&state, &"d".repeat(64), &id, 1));
+        assert!(!annotation_is_selected(&state, &key, &"e".repeat(64), 1));
+        assert!(!annotation_is_selected(&HistoryState::Busy, &key, &id, 1));
+        if let HistoryState::Loaded { rows, .. } = &mut state {
+            rows.clear();
+        }
+        assert!(!annotation_is_selected(&state, &key, &id, 1));
+    }
 
     #[test]
     fn saving_requires_current_provider_diff_and_evidence_and_revalidates_the_filesystem() {

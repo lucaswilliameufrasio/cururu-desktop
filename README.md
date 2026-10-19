@@ -12,6 +12,15 @@ new immutable records; nothing is silently overwritten/pruned. Delete explicitly
 This archive is separate from the second-opinion archive and does not enable
 automatic filtering or evaluator calibration.
 
+Inspect a saved review and select an individual finding (including suppressed
+findings) to save an agreement/disagreement/needs-evidence decision. Each choice
+creates another immutable record linked to the saved parent; it does not edit
+the parent or live analysis. Annotations also work for historical/stale reviews,
+but cannot restore application/publication permissions or enable filtering.
+Concurrent choices branch rather than overwrite. Decisions use the exact finding
+hash and ordinal; deleting a parent does not cascade to its descendants. These
+records share the archive's existing limits and explicit deletion behavior.
+
 Pinned GitHub shared configuration is supported via `[config]` (`base =
 "owner/repository"`, full 40-character `base_ref`, repository-relative
 `base_path`). Opening a checkout never fetches it. Explicitly fetch with your
