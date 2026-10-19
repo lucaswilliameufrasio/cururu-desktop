@@ -37,6 +37,7 @@ pub enum Inspection {
 enum Action {
     Load,
     Save(Box<LocalReviewRecord>),
+    SaveStatic(Box<LocalReviewRecord>),
     Delete(String),
     Annotate {
         record_id: String,
@@ -45,7 +46,34 @@ enum Action {
     },
 }
 
+enum PendingSave {
+    None,
+    Provider(
+        crate::repository::RepositorySnapshot,
+        Box<crate::local_review::LocalReviewResult>,
+    ),
+    Static(
+        crate::repository::RepositorySnapshot,
+        Box<crate::local_analysis::PreparedAnalysis>,
+    ),
+}
+
 impl ReviewWorkspace {
+    fn current_static_history_record(
+        &self,
+        assessment: HumanAssessment,
+    ) -> anyhow::Result<LocalReviewRecord> {
+        let snapshot = self
+            .local_repository_snapshot
+            .as_ref()
+            .context("local checkout is unavailable")?;
+        let crate::local_analysis_ui::AnalysisState::Complete(report) = &self.local_analysis_state
+        else {
+            anyhow::bail!("no loaded static artifact report is available");
+        };
+        LocalReviewRecord::from_static(snapshot, report, assessment)
+    }
+
     fn current_history_record(
         &self,
         assessment: HumanAssessment,
@@ -92,7 +120,7 @@ impl ReviewWorkspace {
             matches!(self.local_history_state, HistoryState::Busy) || self.session_store.is_none();
         let mut panel = div().flex().flex_col().gap_2()
             .child("LOCAL REVIEW HISTORY · explicit saves; records never restore apply/publish permissions")
-            .child("Save results, suppressions and an optional whole-review assessment. Finding prose may quote code. Keys, raw inputs, context files and shared configuration documents are excluded. Assessments are not calibrated labels. Limit: 200 local review records, 64,000 bytes each; delete explicitly.")
+            .child("Save results, suppressions or normalized static evidence with optional human decisions. Findings and tool messages may quote private content: inspect them before saving. Credentials/raw inputs/context/shared-config documents are excluded. Assessments are not calibrated labels. Limit: 200 records, 64,000 bytes each; delete explicitly.")
             .child(button(cx.entity(), key.clone(), 0, Action::Load, "load-local-history".into(), "Load saved local reviews", busy));
         if matches!(self.local_history_state, HistoryState::Busy) {
             panel = panel.child("Loading or updating local history…");
@@ -199,6 +227,17 @@ impl ReviewWorkspace {
                     busy,
                 ));
             }
+            if let Ok(record) = self.current_static_history_record(assessment) {
+                panel = panel.child(button(
+                    cx.entity(),
+                    key.to_string(),
+                    0,
+                    Action::SaveStatic(Box::new(record)),
+                    format!("save-static-report-{}", assessment.label()),
+                    &format!("Save loaded static evidence · {}", assessment.label()),
+                    busy,
+                ));
+            }
         }
         panel
     }
@@ -207,6 +246,12 @@ impl ReviewWorkspace {
         let Some(snapshot) = &self.local_repository_snapshot else {
             return false;
         };
+        if let Some(artifacts) = &record.artifacts {
+            return record.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
+                && record.head_oid == snapshot.head_oid
+                && record.base_fingerprint == crate::shared_base::fingerprint(snapshot)
+                && matches!(&self.local_analysis_state, crate::local_analysis_ui::AnalysisState::Complete(report) if report.fingerprint == artifacts.fingerprint);
+        }
         let config = self
             .local_review_settings
             .as_ref()
@@ -235,8 +280,13 @@ fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
             "Archived quality status (informational): {:?}",
             cururu_core::evaluate_quality(&record.review, threshold)
         ));
+    } else if record.artifacts.is_some() {
+        panel = panel.child("Static evidence is separate from final AI quality policy; no provider tokens or chunks were used.");
     } else {
         panel = panel.child("Legacy record: quality threshold was not recorded.");
+    }
+    if let Some(artifacts) = &record.artifacts {
+        panel = panel.child(format!("STATIC ARTIFACT PROVENANCE · {} · status {} · tool claims {:?}. No source artifact bytes were saved; claims are not proof of execution.", artifacts.fingerprint, artifacts.status, artifacts.tools));
     }
     panel = panel.child(format!("Annotation parent: {:?} · {} individual decision(s). Historical annotations do not change live findings or evaluator thresholds.", record.parent, record.finding_decisions.len()));
     for decision in &record.finding_decisions {
@@ -380,6 +430,64 @@ fn button(
         })
 }
 
+fn pending_save(workspace: &ReviewWorkspace, action: &Action) -> anyhow::Result<PendingSave> {
+    let (record, current) = match action {
+        Action::Save(record) => (record, workspace.current_history_record(record.assessment)?),
+        Action::SaveStatic(record) => (
+            record,
+            workspace.current_static_history_record(record.assessment)?,
+        ),
+        _ => return Ok(PendingSave::None),
+    };
+    ensure!(
+        current.id()? == record.id()?,
+        "selected result identity changed"
+    );
+    let snapshot = workspace
+        .local_repository_snapshot
+        .clone()
+        .context("local checkout is unavailable")?;
+    match action {
+        Action::Save(_) => {
+            let LocalReviewState::Complete(result) = &workspace.local_review_state else {
+                anyhow::bail!("completed provider review is unavailable");
+            };
+            Ok(PendingSave::Provider(snapshot, result.clone()))
+        }
+        Action::SaveStatic(_) => {
+            let crate::local_analysis_ui::AnalysisState::Complete(report) =
+                &workspace.local_analysis_state
+            else {
+                anyhow::bail!("loaded static evidence is unavailable");
+            };
+            Ok(PendingSave::Static(snapshot, report.clone()))
+        }
+        _ => anyhow::bail!("operation does not save a result snapshot"),
+    }
+}
+
+fn validate_pending_save(evidence: &PendingSave, record: &LocalReviewRecord) -> anyhow::Result<()> {
+    match evidence {
+        PendingSave::Provider(snapshot, result) => {
+            ensure!(
+                record.artifacts.is_none(),
+                "provider result cannot claim artifact provenance"
+            );
+            validate_save(snapshot, result)
+        }
+        PendingSave::Static(snapshot, approved) => {
+            ensure!(
+                crate::local_analysis::snapshot_for_save(snapshot, approved, record.assessment)?
+                    .id()?
+                    == record.id()?,
+                "static snapshot data changed before saving"
+            );
+            Ok(())
+        }
+        PendingSave::None => anyhow::bail!("review evidence is unavailable"),
+    }
+}
+
 fn validate_save(
     snapshot: &crate::repository::RepositorySnapshot,
     result: &crate::local_review::LocalReviewResult,
@@ -417,21 +525,14 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
             return None;
         }
         let store = this.session_store.clone()?;
-        let evidence = if let Action::Save(record) = &action {
-            let current = this
-                .current_history_record(record.assessment)
-                .and_then(|current| current.id());
-            if !current.is_ok_and(|id| record.id().is_ok_and(|expected| expected == id)) {
-                this.notice = Some("Local review changed; save cancelled.".into());
+        let evidence = match pending_save(this, &action) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                this.notice =
+                    Some(format!("Local evidence changed; save cancelled: {error}").into());
                 cx.notify();
                 return None;
             }
-            let LocalReviewState::Complete(result) = &this.local_review_state else {
-                return None;
-            };
-            Some((this.local_repository_snapshot.clone()?, result.clone()))
-        } else {
-            None
         };
         this.local_history_state = HistoryState::Busy;
         cx.notify();
@@ -448,10 +549,8 @@ fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Actio
             .spawn(async move {
                 match action {
                     Action::Load => {}
-                    Action::Save(record) => {
-                        let (snapshot, result) =
-                            evidence.context("review evidence is unavailable")?;
-                        validate_save(&snapshot, &result)?;
+                    Action::Save(record) | Action::SaveStatic(record) => {
+                        validate_pending_save(&evidence, &record)?;
                         store.save_local_review(&record)?;
                     }
                     Action::Delete(id) => {

@@ -1,5 +1,22 @@
 # Desktop architecture decisions
 
+## Static evidence snapshots share the immutable local history
+
+Explicitly save the loaded normalized static report, independent of AI settings
+or keys. Archive payload version 3 records artifact fingerprint/tool claims and
+findings, with a static adapter identity, zero provider chunks/tokens, and no raw
+artifact bytes. Before saving, reopen the checkout, reload only the approved
+artifact manifest/paths, compare fingerprints and reconstruct the exact snapshot.
+Changed artifacts cancel the save. Keep the existing 200-record/64,000-byte limit.
+
+Version-1/2 provider hashes remain unchanged by omitting absent provenance.
+Per-finding decisions derive another immutable version-3 record. Inspecting or
+annotating history never restores an active report, navigation/apply permissions
+or provider evidence. Static entries cannot satisfy provider incremental lookup;
+their tool status remains an untrusted claim, not proof an analyzer ran. Static
+evidence remains separately inspectable rather than implicitly sent/merged into
+an AI review. Explicit provider inclusion is a distinct future consent step.
+
 ## Explicit approved presentation preferences and advisory publication hints
 
 Use engine ReviewPreferences (ADR 011, pin 20b17be) for explicit language/tone/

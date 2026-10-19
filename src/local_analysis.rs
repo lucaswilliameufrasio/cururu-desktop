@@ -256,6 +256,20 @@ pub fn validate(snapshot: &RepositorySnapshot, approved: &PreparedAnalysis) -> a
     Ok(())
 }
 
+pub fn snapshot_for_save(
+    snapshot: &RepositorySnapshot,
+    approved: &PreparedAnalysis,
+    assessment: crate::evaluation_history::HumanAssessment,
+) -> anyhow::Result<crate::local_review_history::LocalReviewRecord> {
+    let fresh = snapshot.reopen_with_approved_base()?;
+    let current = load(&fresh, &approved.preview)?;
+    ensure!(
+        current.fingerprint == approved.fingerprint,
+        "static artifacts changed before saving"
+    );
+    crate::local_review_history::LocalReviewRecord::from_static(&fresh, &current, assessment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +414,75 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("different checkout")
+        );
+    }
+
+    #[test]
+    fn explicit_static_archives_preserve_normalized_provenance_without_raw_artifacts() {
+        let (root, snapshot) = fixture();
+        let preview = discover(&snapshot).unwrap();
+        let mut raw: serde_json::Value = serde_json::from_str(&sarif(1)).unwrap();
+        raw["raw_only_secret"] = serde_json::json!("synthetic-raw-artifact-marker");
+        std::fs::write(root.path().join("artifacts/check.sarif"), raw.to_string()).unwrap();
+        let report = load(&snapshot, &preview).unwrap();
+        let record = snapshot_for_save(
+            &snapshot,
+            &report,
+            crate::evaluation_history::HumanAssessment::Unreviewed,
+        )
+        .unwrap();
+        assert_eq!(record.version, 3);
+        assert_eq!(record.chunk_count, 0);
+        assert!(record.usage.is_none());
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("synthetic-raw-artifact-marker")
+        );
+        assert_eq!(
+            record.artifacts.as_ref().unwrap().fingerprint,
+            report.fingerprint
+        );
+        let db = tempfile::tempdir().unwrap();
+        let store =
+            crate::session_store::SessionStore::open(db.path().join("static.sqlite3")).unwrap();
+        let id = store.save_local_review(&record).unwrap();
+        assert_eq!(store.save_local_review(&record).unwrap(), id);
+        let annotation = store
+            .annotate_local_finding(
+                &record.repository_key,
+                &id,
+                0,
+                crate::evaluation_history::HumanAssessment::Agree,
+            )
+            .unwrap();
+        let rows = store
+            .local_review_history(&record.repository_key, 0)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let annotated = rows.iter().find(|row| row.id == annotation).unwrap();
+        assert_eq!(annotated.record.version, 3);
+        assert_eq!(annotated.record.parent.as_ref(), Some(&id));
+        assert_eq!(
+            annotated.record.review.findings[0].source.as_deref(),
+            Some("check")
+        );
+        assert_eq!(annotated.record.finding_decisions.len(), 1);
+        std::fs::write(root.path().join("artifacts/check.sarif"), sarif(999)).unwrap();
+        assert!(
+            snapshot_for_save(
+                &snapshot,
+                &report,
+                crate::evaluation_history::HumanAssessment::Agree
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .local_review_history(&record.repository_key, 0)
+                .unwrap()
+                .len(),
+            2
         );
     }
 

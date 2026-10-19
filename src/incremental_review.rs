@@ -55,7 +55,8 @@ fn matching_record(
         let exhausted = rows.len() < 20;
         for row in rows {
             let record = row.record;
-            if record.head_oid == snapshot.head_oid
+            if record.artifacts.is_none()
+                && record.head_oid == snapshot.head_oid
                 && record.diff_fingerprint == diff
                 && record.config_fingerprint == config
                 && record.context_fingerprint.as_ref() == context

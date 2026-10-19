@@ -48,6 +48,22 @@ pub struct LocalReviewRecord {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_decisions: Vec<FindingDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<ArtifactEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactEvidence {
+    pub fingerprint: String,
+    pub tools: Vec<cururu_core::AnalysisTool>,
+    pub status: String,
+}
+
+pub fn static_config_fingerprint() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(b"cururu-desktop-local-static-archive-v1")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +136,7 @@ impl LocalReviewRecord {
             fail_on: Some(result.fail_on),
             parent: None,
             finding_decisions: Vec::new(),
+            artifacts: None,
         };
         record.validate()?;
         Ok(record)
@@ -127,8 +144,9 @@ impl LocalReviewRecord {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_decisions()?;
+        self.validate_artifacts()?;
         ensure!(
-            matches!(self.version, 1 | 2),
+            matches!(self.version, 1..=3),
             "local history record version is unsupported"
         );
         for hash in [
@@ -159,7 +177,7 @@ impl LocalReviewRecord {
         ensure!(
             self.review.files_reviewed <= 100
                 && self.review.findings.len() + self.suppressed.len() <= 100
-                && self.chunk_count > 0
+                && (self.chunk_count > 0 || self.artifacts.is_some())
                 && self.chunk_count <= 4
                 && self.diff_bytes <= crate::local_review::MAX_LOCAL_DIFF_BYTES,
             "local history review exceeds bounded limits"
@@ -221,8 +239,92 @@ impl LocalReviewRecord {
         }
     }
 
+    pub fn from_static(
+        snapshot: &crate::repository::RepositorySnapshot,
+        report: &crate::local_analysis::PreparedAnalysis,
+        assessment: HumanAssessment,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            crate::local_context::scope(snapshot)? == report.preview.scope,
+            "static evidence belongs to a different checkout/snapshot"
+        );
+        let policy = snapshot
+            .review_policy
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let files = policy.review_files(&snapshot.changed_files)?;
+        let record = Self {
+            version: 3,
+            repository_key: repository_key(&snapshot.root)?,
+            head_oid: snapshot.head_oid.clone(),
+            diff_fingerprint: crate::local_review::snapshot_fingerprint(snapshot),
+            config_fingerprint: static_config_fingerprint(),
+            context_fingerprint: None,
+            base_fingerprint: crate::shared_base::fingerprint(snapshot),
+            review: cururu_core::ReviewResult {
+                model: "static-analysis (local artifacts)".to_string(),
+                files_reviewed: files.len(),
+                summary: format!(
+                    "Local artifact evidence: {}. Tool status is an untrusted claim, not proof of execution; not merged into provider findings.",
+                    report.report.status
+                ),
+                findings: report.report.findings.clone(),
+            },
+            suppressed: Vec::new(),
+            discarded_findings: report.discarded,
+            diff_bytes: files.iter().map(|file| file.patch.len()).sum(),
+            chunk_count: 0,
+            usage: None,
+            assessment,
+            fail_on: None,
+            parent: None,
+            finding_decisions: Vec::new(),
+            artifacts: Some(ArtifactEvidence {
+                fingerprint: report.fingerprint.clone(),
+                tools: report.report.tools.clone(),
+                status: report.report.status.clone(),
+            }),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate_artifacts(&self) -> anyhow::Result<()> {
+        if let Some(artifacts) = &self.artifacts {
+            validate_hash(&artifacts.fingerprint)?;
+            ensure!(
+                self.version == 3
+                    && self.config_fingerprint == static_config_fingerprint()
+                    && self.review.model == "static-analysis (local artifacts)"
+                    && self.chunk_count == 0
+                    && self.head_oid.is_some()
+                    && self.context_fingerprint.is_none()
+                    && self.usage.is_none()
+                    && self.fail_on.is_none()
+                    && self.suppressed.is_empty()
+                    && artifacts.tools.len() <= 8,
+                "static archive provenance is inconsistent"
+            );
+            ensure!(
+                cururu_core::AnalysisReport::from_parts(
+                    artifacts.tools.clone(),
+                    self.review.findings.clone()
+                )
+                .status
+                    == artifacts.status,
+                "static archive status does not match its normalized evidence"
+            );
+        } else {
+            ensure!(
+                self.version != 3,
+                "static archive requires artifact provenance"
+            );
+        }
+        Ok(())
+    }
+
     fn validate_decisions(&self) -> anyhow::Result<()> {
-        if self.version == 1 {
+        if self.version == 1 || (self.version == 3 && self.finding_decisions.is_empty()) {
             ensure!(
                 self.parent.is_none() && self.finding_decisions.is_empty(),
                 "legacy local history cannot contain finding decisions"
@@ -267,7 +369,7 @@ impl LocalReviewRecord {
             assessment,
         };
         let mut record = self.clone();
-        record.version = 2;
+        record.version = if self.artifacts.is_some() { 3 } else { 2 };
         record.parent = Some(parent);
         if let Some(existing) = record
             .finding_decisions
@@ -333,6 +435,7 @@ pub fn sample_record() -> LocalReviewRecord {
         fail_on: None,
         parent: None,
         finding_decisions: Vec::new(),
+        artifacts: None,
     }
 }
 
