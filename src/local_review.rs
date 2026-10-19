@@ -67,6 +67,7 @@ pub struct PolicySuppressedFinding {
 
 #[derive(Debug, Clone)]
 pub struct LocalReviewResult {
+    pub analysis: Option<crate::local_analysis::PreparedAnalysis>,
     pub fail_on: cururu_core::FailOn,
     pub config_fingerprint: String,
     pub base: Option<crate::shared_base::ApprovedBase>,
@@ -175,10 +176,14 @@ pub async fn review_snapshot(
     secrets: &LocalReviewSecrets,
     snapshot: &RepositorySnapshot,
     context: Option<&crate::local_context::PreparedContext>,
+    analysis: Option<&crate::local_analysis::PreparedAnalysis>,
 ) -> anyhow::Result<LocalReviewResult> {
     settings.validate()?;
+    if let Some(analysis) = analysis {
+        crate::local_analysis::validate(snapshot, analysis)?;
+    }
     let chunks = bounded_chunks(snapshot)?;
-    let agent = cururu_engine::OpenAiCompatibleAgent::new(
+    let mut agent = cururu_engine::OpenAiCompatibleAgent::new(
         cururu_engine::OpenAiCompatibleSettings {
             base_url: settings.openai_endpoint.clone(),
             api_key: secrets.as_str().to_string(),
@@ -196,8 +201,11 @@ pub async fn review_snapshot(
         cururu_engine::review_preferences::ReviewPreferences::default,
         |context| context.preferences.clone(),
     ))?;
+    if let Some(analysis) = analysis {
+        agent = agent.with_analysis_evidence(&analysis.report)?;
+    }
     let chunk_results = cururu_engine::review_chunks(&agent, &chunks).await?;
-    let mut result = assemble_review_result(settings, snapshot, chunk_results)?;
+    let mut result = assemble_with_analysis(settings, snapshot, chunk_results, analysis)?;
     result.context = context.cloned();
     Ok(result)
 }
@@ -229,10 +237,20 @@ fn bounded_chunks(snapshot: &RepositorySnapshot) -> anyhow::Result<Vec<cururu_co
     Ok(chunks)
 }
 
+#[cfg(test)]
 fn assemble_review_result(
     settings: &LocalReviewSettings,
     snapshot: &RepositorySnapshot,
     chunk_results: Vec<cururu_engine::ChunkResult>,
+) -> anyhow::Result<LocalReviewResult> {
+    assemble_with_analysis(settings, snapshot, chunk_results, None)
+}
+
+fn assemble_with_analysis(
+    settings: &LocalReviewSettings,
+    snapshot: &RepositorySnapshot,
+    chunk_results: Vec<cururu_engine::ChunkResult>,
+    analysis: Option<&crate::local_analysis::PreparedAnalysis>,
 ) -> anyhow::Result<LocalReviewResult> {
     let chunk_count = chunk_results.len();
     anyhow::ensure!(
@@ -253,7 +271,7 @@ fn assemble_review_result(
         settings.openai_model.clone(),
         reviewed_files.len(),
         reviews,
-        Vec::new(),
+        analysis.map_or_else(Vec::new, |analysis| analysis.report.findings.clone()),
         cururu_core::CandidateOptions {
             include_suggested_changes: true,
             synthesize: policy.synthesis,
@@ -303,6 +321,7 @@ fn assemble_review_result(
     );
 
     Ok(LocalReviewResult {
+        analysis: analysis.cloned(),
         fail_on: policy.fail_on,
         config_fingerprint: config_fingerprint(settings)?,
         base: snapshot
@@ -341,8 +360,8 @@ fn validate_api_key(value: &str) -> anyhow::Result<()> {
 mod tests {
     use super::{
         LocalReviewSecrets, MAX_LOCAL_DIFF_BYTES, MAX_LOCAL_FILE_DIFF_BYTES,
-        assemble_review_result, bounded_chunks, config_fingerprint, diff_byte_count,
-        repository_identity, snapshot_fingerprint, validate_api_key,
+        assemble_review_result, assemble_with_analysis, bounded_chunks, config_fingerprint,
+        diff_byte_count, repository_identity, snapshot_fingerprint, validate_api_key,
     };
     use crate::{repository::RepositorySnapshot, session_store::LocalReviewSettings};
     use cururu_core::{ChangedFile, ReviewFinding, ReviewResult};
@@ -442,6 +461,77 @@ mod tests {
             &[1],
         )]);
         assert!(bounded_chunks(&too_many_bytes).is_err());
+    }
+
+    #[test]
+    fn approved_tool_candidates_keep_provenance_and_policy_suppression_and_archive_identity() {
+        let mut snapshot = snapshot(vec![changed_file("src/lib.rs", "+changed", &[3])]);
+        snapshot.head_oid = Some("a".repeat(40));
+        snapshot.review_policy.as_mut().unwrap().allowed_severities =
+            vec![cururu_core::Severity::Critical];
+        let settings = settings("https://example.test/v1", "model");
+        let tool = cururu_core::sarif_finding(
+            "analyzer",
+            "R1",
+            Some("error"),
+            "src/lib.rs".to_string(),
+            Some(3),
+            "diagnostic".to_string(),
+        );
+        let analysis = crate::local_analysis::PreparedAnalysis {
+            preview: crate::local_analysis::AnalysisPreview {
+                scope: "a".repeat(64),
+                manifest_hash: "b".repeat(64),
+                paths: Vec::new(),
+                tools: Vec::new(),
+            },
+            fingerprint: "c".repeat(64),
+            report: cururu_core::AnalysisReport::from_parts(Vec::new(), vec![tool]),
+            discarded: 0,
+        };
+        let chunks = vec![cururu_engine::ChunkResult {
+            review: ReviewResult {
+                model: "model".to_string(),
+                files_reviewed: 1,
+                summary: String::new(),
+                findings: Vec::new(),
+            },
+            usage: None,
+        }];
+        let combined =
+            assemble_with_analysis(&settings, &snapshot, chunks.clone(), Some(&analysis)).unwrap();
+        assert!(combined.review.findings.is_empty());
+        assert_eq!(combined.policy_suppressed.len(), 1);
+        assert_eq!(
+            combined.policy_suppressed[0].finding.source.as_deref(),
+            Some("analyzer")
+        );
+        assert_eq!(
+            combined.policy_suppressed[0].finding.rule.as_deref(),
+            Some("R1")
+        );
+        let root = tempfile::tempdir().unwrap();
+        let record = crate::local_review_history::LocalReviewRecord::from_result(
+            root.path(),
+            &combined,
+            crate::evaluation_history::HumanAssessment::Unreviewed,
+        )
+        .unwrap();
+        assert_eq!(
+            record.analysis_fingerprint.as_ref(),
+            Some(&analysis.fingerprint)
+        );
+        assert!(record.artifacts.is_none());
+        assert_eq!(record.suppressed.len(), 1);
+        let without = assemble_with_analysis(&settings, &snapshot, chunks, None).unwrap();
+        assert!(without.review.findings.is_empty() && without.policy_suppressed.is_empty());
+        let without = crate::local_review_history::LocalReviewRecord::from_result(
+            root.path(),
+            &without,
+            crate::evaluation_history::HumanAssessment::Unreviewed,
+        )
+        .unwrap();
+        assert_ne!(record.id().unwrap(), without.id().unwrap());
     }
 
     #[test]

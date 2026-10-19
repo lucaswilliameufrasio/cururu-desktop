@@ -1,5 +1,16 @@
 # Cururu Desktop
 
+Loaded static evidence is local-only by default. A separate **Include with the
+next AI review** button approves normalized diagnostics/tool claims (up to 64,000
+bytes repeated across at most four chunks), not raw SARIF. Inspect private content
+first. Diff-only revokes this inclusion; including later is shown as a separate
+choice. Include/exclude clears active results/suggestions, never saved history.
+Provider reviews merge the original anchored tool findings through shared core
+rules and retain provenance/suppression reasons. Request, incremental, history
+and suggestion guards bind the artifact/report hash and revalidate fresh files.
+Changing an artifact blocks sending/saving/applying stale results. Saved history
+never restores inclusion or permissions. Evaluators remain observe-only.
+
 Explicit `review.language`, `tone`, `technical_level` and `suggestion_detail` are
 bounded optional preferences, shown in the context preview and sent only after
 inclusion. They travel as JSON user data, never system instructions, and are

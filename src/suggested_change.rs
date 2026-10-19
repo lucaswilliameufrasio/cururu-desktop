@@ -18,6 +18,7 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Preview {
+    analysis: Option<crate::local_analysis::PreparedAnalysis>,
     pub head_oid: Option<String>,
     context: Option<crate::local_context::PreparedContext>,
     base: Option<crate::shared_base::ApprovedBase>,
@@ -35,6 +36,12 @@ pub struct Preview {
 }
 
 impl Preview {
+    #[must_use]
+    pub fn analysis_fingerprint(&self) -> Option<&str> {
+        self.analysis
+            .as_ref()
+            .map(|analysis| analysis.fingerprint.as_str())
+    }
     #[must_use]
     pub fn repository_root(&self) -> &Path {
         &self.root
@@ -65,6 +72,7 @@ pub fn prepare(
         finding,
         None,
         None,
+        None,
     )
 }
 
@@ -75,6 +83,7 @@ pub fn prepare_with_context(
     finding: &cururu_core::ReviewFinding,
     context: Option<&crate::local_context::PreparedContext>,
     base: Option<&crate::shared_base::ApprovedBase>,
+    analysis: Option<&crate::local_analysis::PreparedAnalysis>,
 ) -> anyhow::Result<Preview> {
     let identity = local_review::repository_identity(repository_root)?;
     ensure!(
@@ -83,6 +92,9 @@ pub fn prepare_with_context(
     );
     let snapshot = RepositorySnapshot::open(repository_root)?.with_shared_base(base)?;
     crate::local_context::validate(&snapshot, context)?;
+    if let Some(analysis) = analysis {
+        crate::local_analysis::validate(&snapshot, analysis)?;
+    }
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == reviewed_diff_fingerprint,
         "working-tree changes differ from the reviewed preview; run local review again"
@@ -110,6 +122,7 @@ pub fn prepare_with_context(
             replacement: &suggested_change.replacement,
         },
         context,
+        analysis,
         None,
     )
 }
@@ -144,6 +157,7 @@ pub fn prepare_remote(
             replacement,
         },
         None,
+        None,
         Some(&source.content),
     )
 }
@@ -153,6 +167,7 @@ fn prepare_file(
     identity: String,
     suggestion: FileSuggestion<'_>,
     context: Option<&crate::local_context::PreparedContext>,
+    analysis: Option<&crate::local_analysis::PreparedAnalysis>,
     expected_source: Option<&str>,
 ) -> anyhow::Result<Preview> {
     let FileSuggestion {
@@ -182,6 +197,7 @@ fn prepare_file(
         .to_string();
 
     Ok(Preview {
+        analysis: analysis.cloned(),
         head_oid: snapshot.head_oid.clone(),
         base: snapshot
             .review_policy
@@ -212,6 +228,9 @@ pub fn apply(preview: &Preview) -> anyhow::Result<()> {
     let snapshot =
         RepositorySnapshot::open(&preview.root)?.with_shared_base(preview.base.as_ref())?;
     crate::local_context::validate(&snapshot, preview.context.as_ref())?;
+    if let Some(analysis) = &preview.analysis {
+        crate::local_analysis::validate(&snapshot, analysis)?;
+    }
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == preview.reviewed_diff_fingerprint,
         "working-tree changes differ from the preview; no file was modified"
@@ -555,6 +574,7 @@ mod tests {
             &finding,
             Some(&evidence),
             None,
+            None,
         )
         .unwrap();
         fs::write(directory.path().join("CONTEXT.md"), "Changed context\n").unwrap();
@@ -565,6 +585,7 @@ mod tests {
                 &fingerprint,
                 &finding,
                 Some(&evidence),
+                None,
                 None
             )
             .is_err()

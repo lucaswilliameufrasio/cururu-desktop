@@ -253,6 +253,12 @@ pub fn validate(snapshot: &RepositorySnapshot, approved: &PreparedAnalysis) -> a
         current.fingerprint == approved.fingerprint,
         "analysis artifacts changed since the local preview"
     );
+    ensure!(
+        crate::action_history::hash(&current.report)?
+            == crate::action_history::hash(&approved.report)?
+            && current.discarded == approved.discarded,
+        "approved normalized analysis data no longer matches its artifacts"
+    );
     Ok(())
 }
 
@@ -352,11 +358,72 @@ mod tests {
         assert_eq!(report.report.findings[0].source.as_deref(), Some("check"));
         assert_eq!(report.report.findings[0].rule.as_deref(), Some("R1"));
         validate(&snapshot, &report).unwrap();
+        let mut tampered = report.clone();
+        tampered.report.findings[0].message = "unapproved substitution".to_string();
+        assert!(validate(&snapshot, &tampered).is_err());
         std::fs::write(root.path().join("artifacts/check.sarif"), sarif(999)).unwrap();
         assert!(validate(&snapshot, &report).is_err());
         let invalid = load(&snapshot, &preview).unwrap();
         assert_eq!(invalid.discarded, 1);
         assert!(invalid.report.findings.is_empty());
+    }
+
+    #[test]
+    fn review_and_suggestion_guards_revalidate_included_artifacts_before_side_effects() {
+        let (root, snapshot) = fixture();
+        std::fs::write(root.path().join("artifacts/check.sarif"), sarif(1)).unwrap();
+        let report = load(&snapshot, &discover(&snapshot).unwrap()).unwrap();
+        let settings = crate::session_store::LocalReviewSettings {
+            openai_endpoint: "https://example.test/v1".to_string(),
+            openai_model: "model".to_string(),
+        };
+        let identity = crate::local_review::repository_identity(root.path()).unwrap();
+        let mut request = crate::LocalReviewRequest {
+            analysis: Some(report.clone()),
+            base: None,
+            evidence: None,
+            force_recheck: false,
+            context: crate::LocalReviewRequestContext {
+                request_id: 1,
+                analysis_fingerprint: Some(report.fingerprint.clone()),
+                base_fingerprint: None,
+                evidence_fingerprint: None,
+                repository_identity: identity.clone(),
+                config_fingerprint: crate::local_review::config_fingerprint(&settings).unwrap(),
+                snapshot_fingerprint: crate::local_review::snapshot_fingerprint(&snapshot),
+            },
+            repository_root: root.path().to_path_buf(),
+            settings,
+        };
+        crate::validate_local_review_snapshot(&request, &snapshot).unwrap();
+        request.context.analysis_fingerprint = None;
+        assert!(crate::validate_local_review_snapshot(&request, &snapshot).is_err());
+        request.context.analysis_fingerprint = Some(report.fingerprint.clone());
+        let mut finding = report.report.findings[0].clone();
+        finding.suggested_change = Some(cururu_core::SuggestedChange {
+            replacement: "corrected".to_string(),
+        });
+        let preview = crate::suggested_change::prepare_with_context(
+            root.path(),
+            &identity,
+            &request.context.snapshot_fingerprint,
+            &finding,
+            None,
+            None,
+            Some(&report),
+        )
+        .unwrap();
+        assert_eq!(
+            preview.analysis_fingerprint(),
+            Some(report.fingerprint.as_str())
+        );
+        std::fs::write(root.path().join("artifacts/check.sarif"), sarif(999)).unwrap();
+        assert!(crate::validate_local_review_snapshot(&request, &snapshot).is_err());
+        assert!(crate::suggested_change::apply(&preview).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("file.rs")).unwrap(),
+            "after\n"
+        );
     }
 
     #[test]

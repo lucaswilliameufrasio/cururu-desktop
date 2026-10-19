@@ -50,6 +50,8 @@ pub struct LocalReviewRecord {
     pub finding_decisions: Vec<FindingDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<ArtifactEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +139,10 @@ impl LocalReviewRecord {
             parent: None,
             finding_decisions: Vec::new(),
             artifacts: None,
+            analysis_fingerprint: result
+                .analysis
+                .as_ref()
+                .map(|analysis| analysis.fingerprint.clone()),
         };
         record.validate()?;
         Ok(record)
@@ -156,9 +162,13 @@ impl LocalReviewRecord {
         ] {
             validate_hash(hash)?;
         }
-        for hash in [&self.context_fingerprint, &self.base_fingerprint]
-            .into_iter()
-            .flatten()
+        for hash in [
+            &self.context_fingerprint,
+            &self.base_fingerprint,
+            &self.analysis_fingerprint,
+        ]
+        .into_iter()
+        .flatten()
         {
             validate_hash(hash)?;
         }
@@ -284,6 +294,7 @@ impl LocalReviewRecord {
                 tools: report.report.tools.clone(),
                 status: report.report.status.clone(),
             }),
+            analysis_fingerprint: None,
         };
         record.validate()?;
         Ok(record)
@@ -299,6 +310,7 @@ impl LocalReviewRecord {
                     && self.chunk_count == 0
                     && self.head_oid.is_some()
                     && self.context_fingerprint.is_none()
+                    && self.analysis_fingerprint.is_none()
                     && self.usage.is_none()
                     && self.fail_on.is_none()
                     && self.suppressed.is_empty()
@@ -436,6 +448,7 @@ pub fn sample_record() -> LocalReviewRecord {
         parent: None,
         finding_decisions: Vec::new(),
         artifacts: None,
+        analysis_fingerprint: None,
     }
 }
 
@@ -489,6 +502,7 @@ mod tests {
         .unwrap();
         let saved = sample_record();
         let result = LocalReviewResult {
+            analysis: None,
             fail_on: cururu_core::FailOn::Off,
             config_fingerprint: saved.config_fingerprint.clone(),
             base: Some(base),

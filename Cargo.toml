@@ -15,8 +15,8 @@ icons = ["assets/cururu-icon.png"]
 [dependencies]
 anyhow = "1"
 base64 = "=0.22.1"
-cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "20b17be" }
-cururu-engine = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "20b17be" }
+cururu-core = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "ba7a259" }
+cururu-engine = { git = "https://github.com/lucaswilliameufrasio/cururu.git", rev = "ba7a259" }
 directories = "6"
 futures = "0.3"
 globset = "0.4"

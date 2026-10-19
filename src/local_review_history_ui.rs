@@ -67,7 +67,8 @@ impl ReviewWorkspace {
             .local_repository_snapshot
             .as_ref()
             .context("local checkout is unavailable")?;
-        let crate::local_analysis_ui::AnalysisState::Complete(report) = &self.local_analysis_state
+        let (crate::local_analysis_ui::AnalysisState::Complete(report)
+        | crate::local_analysis_ui::AnalysisState::Included(report)) = &self.local_analysis_state
         else {
             anyhow::bail!("no loaded static artifact report is available");
         };
@@ -87,6 +88,13 @@ impl ReviewWorkspace {
         };
         ensure!(
             result.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
+                && result
+                    .analysis
+                    .as_ref()
+                    .map(|analysis| &analysis.fingerprint)
+                    == self
+                        .approved_analysis()
+                        .map(|analysis| &analysis.fingerprint)
                 && result.base.as_ref().map(|base| &base.fingerprint)
                     == crate::shared_base::fingerprint(snapshot).as_ref(),
             "local review identity changed"
@@ -250,7 +258,7 @@ impl ReviewWorkspace {
             return record.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
                 && record.head_oid == snapshot.head_oid
                 && record.base_fingerprint == crate::shared_base::fingerprint(snapshot)
-                && matches!(&self.local_analysis_state, crate::local_analysis_ui::AnalysisState::Complete(report) if report.fingerprint == artifacts.fingerprint);
+                && matches!(&self.local_analysis_state, crate::local_analysis_ui::AnalysisState::Complete(report) | crate::local_analysis_ui::AnalysisState::Included(report) if report.fingerprint == artifacts.fingerprint);
         }
         let config = self
             .local_review_settings
@@ -258,6 +266,10 @@ impl ReviewWorkspace {
             .and_then(|settings| crate::local_review::config_fingerprint(settings).ok());
         let context = self.local_context_state.resolve(snapshot);
         record.diff_fingerprint == crate::local_review::snapshot_fingerprint(snapshot)
+            && record.analysis_fingerprint.as_ref()
+                == self
+                    .approved_analysis()
+                    .map(|analysis| &analysis.fingerprint)
             && record.head_oid == snapshot.head_oid
             && config.as_ref() == Some(&record.config_fingerprint)
             && record.base_fingerprint == crate::shared_base::fingerprint(snapshot)
@@ -455,7 +467,8 @@ fn pending_save(workspace: &ReviewWorkspace, action: &Action) -> anyhow::Result<
             Ok(PendingSave::Provider(snapshot, result.clone()))
         }
         Action::SaveStatic(_) => {
-            let crate::local_analysis_ui::AnalysisState::Complete(report) =
+            let (crate::local_analysis_ui::AnalysisState::Complete(report)
+            | crate::local_analysis_ui::AnalysisState::Included(report)) =
                 &workspace.local_analysis_state
             else {
                 anyhow::bail!("loaded static evidence is unavailable");
@@ -499,7 +512,11 @@ fn validate_save(
                 == result.base.as_ref().map(|base| &base.fingerprint),
         "checkout or base approval changed before saving local review"
     );
-    crate::local_context::validate(&fresh, result.context.as_ref())
+    crate::local_context::validate(&fresh, result.context.as_ref())?;
+    if let Some(analysis) = &result.analysis {
+        crate::local_analysis::validate(&fresh, analysis)?;
+    }
+    Ok(())
 }
 
 fn run(entity: &Entity<ReviewWorkspace>, key: String, page: usize, action: Action, cx: &mut App) {
@@ -649,6 +666,7 @@ mod tests {
         let mut review = saved.review;
         review.findings[0].path = "source.rs".to_string();
         let result = crate::local_review::LocalReviewResult {
+            analysis: None,
             fail_on: cururu_core::FailOn::Off,
             config_fingerprint: crate::local_review::config_fingerprint(&settings).unwrap(),
             base: None,

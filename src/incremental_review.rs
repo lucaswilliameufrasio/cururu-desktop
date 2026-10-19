@@ -32,6 +32,7 @@ pub fn preflight(
             &snapshot,
             &request.settings,
             request.evidence.as_ref(),
+            request.analysis.as_ref(),
         )?
     } else {
         None
@@ -44,12 +45,14 @@ fn matching_record(
     snapshot: &RepositorySnapshot,
     settings: &LocalReviewSettings,
     evidence: Option<&crate::local_context::PreparedContext>,
+    analysis: Option<&crate::local_analysis::PreparedAnalysis>,
 ) -> anyhow::Result<Option<String>> {
     let key = crate::local_review_history::repository_key(&snapshot.root)?;
     let config = crate::local_review::config_fingerprint(settings)?;
     let diff = crate::local_review::snapshot_fingerprint(snapshot);
     let context = evidence.map(|context| &context.fingerprint);
     let base = crate::shared_base::fingerprint(snapshot);
+    let analysis = analysis.map(|analysis| &analysis.fingerprint);
     for page in 0..10 {
         let rows = store.local_review_history(&key, page)?;
         let exhausted = rows.len() < 20;
@@ -61,6 +64,7 @@ fn matching_record(
                 && record.config_fingerprint == config
                 && record.context_fingerprint.as_ref() == context
                 && record.base_fingerprint == base
+                && record.analysis_fingerprint.as_ref() == analysis
             {
                 return Ok(Some(row.id));
             }
@@ -98,10 +102,12 @@ mod tests {
         let identity = crate::local_review::repository_identity(root.path()).unwrap();
         store.authorize_local_review(&identity, &config).unwrap();
         let mut request = LocalReviewRequest {
+            analysis: None,
             force_recheck: false,
             base: None,
             evidence: None,
             context: crate::LocalReviewRequestContext {
+                analysis_fingerprint: None,
                 base_fingerprint: None,
                 evidence_fingerprint: None,
                 request_id: 1,
@@ -127,7 +133,7 @@ mod tests {
         let mut other_settings = settings;
         other_settings.openai_model = "other-model".to_string();
         assert!(
-            matching_record(&store, &snapshot, &other_settings, None)
+            matching_record(&store, &snapshot, &other_settings, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -137,7 +143,7 @@ mod tests {
         record.context_fingerprint = Some("e".repeat(64));
         store.save_local_review(&record).unwrap();
         assert!(
-            matching_record(&store, &snapshot, &request.settings, None)
+            matching_record(&store, &snapshot, &request.settings, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -145,7 +151,15 @@ mod tests {
         record.base_fingerprint = Some("f".repeat(64));
         store.save_local_review(&record).unwrap();
         assert!(
-            matching_record(&store, &snapshot, &request.settings, None)
+            matching_record(&store, &snapshot, &request.settings, None, None)
+                .unwrap()
+                .is_none()
+        );
+        record.base_fingerprint = None;
+        record.analysis_fingerprint = Some("d".repeat(64));
+        store.save_local_review(&record).unwrap();
+        assert!(
+            matching_record(&store, &snapshot, &request.settings, None, None)
                 .unwrap()
                 .is_none()
         );
