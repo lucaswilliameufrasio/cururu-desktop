@@ -1,5 +1,28 @@
 # Desktop architecture decisions
 
+## Explicit saves of observed action receipts
+
+SQLite schema 10 adds bounded, immutable metadata receipts for local suggestions,
+GitHub imports/reviews/replies and completed command observations. Capture only
+typed kind/outcome, time, revision, scoped checkout/PR hash, input/result hashes,
+target count and an optional confirmed remote identifier. Never persist command
+arguments/output, paths, comment bodies, replacement code, credentials or URLs.
+
+Receipts first remain in memory (maximum 20 pending) and require explicit Save.
+Saving/deleting/inspecting never replays an action. Retain unsaved receipts after
+database errors; reject overflow with a warning rather than silently evicting.
+This is an observed-action journal, not an atomic audit log: process termination,
+stale completions or a full pending buffer may leave no receipt. An unconfirmed
+network/write outcome is never reported as success, proof of no effect, or an
+invitation to retry. Metadata capture/storage failures do not turn an already
+performed action into a claimed failure or initiate another external action.
+
+Cap durable receipts independently at 500 records, 4096 bytes each, 20 per page.
+Validate payload identity against scope/time indices; reject corruption/excess.
+Migration preserves other history, annotations, preferences and drafts. Explicit
+deletion is not secure erasure. Revisit durable pre-action journaling only with
+an explicit recovery design for ambiguous filesystem and remote side effects.
+
 ## Per-finding human decisions in immutable saved reviews
 
 Extend the explicit local archive with decisions for visible and suppressed

@@ -8,12 +8,14 @@ use anyhow::Context as _;
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[path = "action_history_store.rs"]
+mod action_history_store;
 #[path = "evaluation_history_store.rs"]
 mod evaluation_history_store;
 #[path = "local_review_history_store.rs"]
 mod local_review_history_store;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_DRAFT_BODY_BYTES: usize = 64_000;
 const MAX_EVALUATOR_SETTING_BYTES: usize = 2_048;
 const MAX_LOCAL_REVIEW_REPOSITORY_IDENTITY_BYTES: usize = 4_096;
@@ -689,6 +691,9 @@ fn migrate_review_storage(
     if version < 9 {
         local_review_history_store::migrate(transaction)?;
     }
+    if version < 10 {
+        action_history_store::migrate(transaction)?;
+    }
     Ok(())
 }
 
@@ -870,7 +875,7 @@ mod tests {
         store.save_evaluation(&record).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE local_review_history; DROP TABLE publication_preference; PRAGMA user_version = 7;")
+            .execute_batch("DROP TABLE action_history; DROP TABLE local_review_history; DROP TABLE publication_preference; PRAGMA user_version = 7;")
             .unwrap();
         let migrated = super::SessionStore::open(&path).unwrap();
         assert_eq!(
@@ -1159,7 +1164,7 @@ mod tests {
             .unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE local_review_history; DROP TABLE publication_preference; DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
+            .execute_batch("DROP TABLE action_history; DROP TABLE local_review_history; DROP TABLE publication_preference; DROP TABLE evaluation_history; DROP TABLE github_draft_queue; PRAGMA user_version = 5;")
             .unwrap();
         let migrated = SessionStore::open(&path).unwrap();
         assert_eq!(

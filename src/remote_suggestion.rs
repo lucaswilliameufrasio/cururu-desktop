@@ -332,16 +332,24 @@ fn apply(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
     let http = cx.http_client();
     let entity = entity.clone();
     cx.spawn(async move |cx| {
+        let receipt = crate::action_history::suggestion(&pending.preview, true);
         let result = crate::with_network_timeout(revalidate_remote(http, token, &pending), cx.background_executor()).await;
         let result = match result {
             Ok(()) => cx.background_executor().spawn(async move { suggested_change::apply(&pending.preview) }).await,
             Err(error) => Err(error),
         };
         let _ = entity.update(cx, |this, cx| {
+            let confirmed = result.is_ok();
             this.remote_suggestion_state = match result {
                 Ok(()) => RemoteSuggestionState::Applied("Suggestion applied locally. No stage, commit, push or GitHub write was performed. Inspect your checkout before any separate commit/push.".to_string()),
                 Err(error) => RemoteSuggestionState::Failed(format!("Suggestion application blocked: {error}")),
             };
+            this.capture_action(receipt.map(|mut record| {
+                if confirmed {
+                    record.outcome = crate::action_history::ActionOutcome::Confirmed;
+                }
+                record
+            }));
             cx.notify();
         });
     }).detach();

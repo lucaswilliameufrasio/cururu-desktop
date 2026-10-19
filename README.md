@@ -1,5 +1,19 @@
 # Cururu Desktop
 
+**Action receipts** keep observed suggestion applications/imports, GitHub reviews
+and replies, and command completions in memory until you explicitly save them.
+SQLite schema 10 stores only typed kind/outcome, time/revision, scope/input/result
+hashes, target count and an optional remote ID. No command arguments/output,
+comment bodies, file paths, replacement code, tokens or URLs are saved. Inspect,
+save, discard and delete never repeat an action. Unknown write outcomes remain
+**unconfirmed**, not proof that nothing happened or permission to retry.
+At most 20 unsaved receipts and 500 durable receipts (4096 bytes each, 20/page)
+are retained; excess is rejected with a warning, never silently evicted. This is
+not a crash-safe or complete audit log. Database errors keep pending receipts in
+memory; an already-performed action is not retried because saving failed. Import
+receipts are scoped to the selected local checkout, not the remote PR. Deleting
+records is explicit and does not guarantee secure erasure from SQLite/backups.
+
 **Local review history** explicitly saves completed findings, policy-suppressed
 findings with reasons, usage and an optional whole-review human assessment.
 Records include revision/diff/provider/context/base fingerprints, not credentials,
