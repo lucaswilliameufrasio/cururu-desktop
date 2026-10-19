@@ -5,6 +5,31 @@ use crate::local_review_history::{LocalReviewRecord, StoredLocalReview, validate
 use anyhow::ensure;
 use rusqlite::params;
 
+fn insert_record(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &LocalReviewRecord,
+) -> anyhow::Result<String> {
+    let id = record.id()?;
+    let payload = serde_json::to_string(record)?;
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_review_history WHERE id = ?1)",
+        [&id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        let count: i64 =
+            transaction.query_row("SELECT count(*) FROM local_review_history", [], |row| {
+                row.get(0)
+            })?;
+        ensure!(
+            count < 200,
+            "local review history is full (200 records); explicitly delete records before saving more"
+        );
+        transaction.execute("INSERT INTO local_review_history(id,repository_key,created_at,payload) VALUES(?1,?2,?3,?4)", params![id, record.repository_key, super::unix_timestamp_millis()?, payload])?;
+    }
+    Ok(id)
+}
+
 pub(super) fn migrate(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
     transaction.execute_batch("CREATE TABLE local_review_history(id TEXT PRIMARY KEY NOT NULL, repository_key TEXT NOT NULL, created_at INTEGER NOT NULL, payload TEXT NOT NULL); CREATE INDEX local_review_history_by_repo ON local_review_history(repository_key,created_at DESC,id); PRAGMA user_version = 9;")?;
     Ok(())
@@ -12,27 +37,15 @@ pub(super) fn migrate(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result
 
 impl SessionStore {
     pub fn save_local_review(&self, record: &LocalReviewRecord) -> anyhow::Result<String> {
-        let id = record.id()?;
-        let payload = serde_json::to_string(record)?;
+        record.validate()?;
+        ensure!(
+            record.version == 1,
+            "annotate saved findings through the scoped archive operation"
+        );
         let mut connection = self.connect()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_review_history WHERE id = ?1)",
-            [&id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            let count: i64 =
-                transaction.query_row("SELECT count(*) FROM local_review_history", [], |row| {
-                    row.get(0)
-                })?;
-            ensure!(
-                count < 200,
-                "local review history is full (200 records); explicitly delete records before saving more"
-            );
-            transaction.execute("INSERT INTO local_review_history(id,repository_key,created_at,payload) VALUES(?1,?2,?3,?4)", params![id, record.repository_key, super::unix_timestamp_millis()?, payload])?;
-        }
+        let id = insert_record(&transaction, record)?;
         transaction.commit()?;
         Ok(id)
     }
@@ -72,6 +85,31 @@ impl SessionStore {
         Ok(records)
     }
 
+    pub fn annotate_local_finding(
+        &self,
+        repository_key: &str,
+        parent_id: &str,
+        index: usize,
+        assessment: crate::evaluation_history::HumanAssessment,
+    ) -> anyhow::Result<String> {
+        validate_hash(repository_key)?;
+        validate_hash(parent_id)?;
+        let mut connection = self.connect()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB)) <= 64000 THEN payload ELSE '' END FROM local_review_history WHERE repository_key = ?1 AND id = ?2", params![repository_key, parent_id], |row| row.get(0))?;
+        let parent: LocalReviewRecord = serde_json::from_str(&payload)
+            .map_err(|_| anyhow::anyhow!("saved local review format is invalid"))?;
+        ensure!(
+            parent.id()? == parent_id && parent.repository_key == repository_key,
+            "saved local review parent identity is invalid"
+        );
+        let record = parent.with_decision(index, assessment)?;
+        let id = insert_record(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
     pub fn delete_local_review(&self, repository_key: &str, id: &str) -> anyhow::Result<bool> {
         validate_hash(repository_key)?;
         validate_hash(id)?;
@@ -85,6 +123,67 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_annotations_preserve_parent_and_branch_across_reopened_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("annotations.sqlite3");
+        let store = SessionStore::open(&path).unwrap();
+        let record = crate::local_review_history::sample_record();
+        let parent = store.save_local_review(&record).unwrap();
+        let agree = crate::evaluation_history::HumanAssessment::Agree;
+        let disagree = crate::evaluation_history::HumanAssessment::Disagree;
+        assert!(
+            store
+                .annotate_local_finding(&"d".repeat(64), &parent, 0, agree)
+                .is_err()
+        );
+        assert!(
+            store
+                .annotate_local_finding(&record.repository_key, &parent, 2, agree)
+                .is_err()
+        );
+        let first = store
+            .annotate_local_finding(&record.repository_key, &parent, 0, agree)
+            .unwrap();
+        assert_eq!(
+            store
+                .annotate_local_finding(&record.repository_key, &parent, 0, agree)
+                .unwrap(),
+            first
+        );
+        let reopened = SessionStore::open(&path).unwrap();
+        let other = reopened
+            .annotate_local_finding(&record.repository_key, &parent, 1, disagree)
+            .unwrap();
+        assert_ne!(first, other);
+        let rows = reopened
+            .local_review_history(&record.repository_key, 0)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.id == parent
+            && row.record.version == 1
+            && row.record.finding_decisions.is_empty()));
+        for row in rows.iter().filter(|row| row.id != parent) {
+            assert_eq!(row.record.parent.as_ref(), Some(&parent));
+            assert_eq!(row.record.finding_decisions.len(), 1);
+        }
+        store
+            .delete_local_review(&record.repository_key, &parent)
+            .unwrap();
+        assert_eq!(
+            store
+                .local_review_history(&record.repository_key, 0)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .annotate_local_finding(&record.repository_key, &parent, 0, agree)
+                .is_err()
+        );
+    }
 
     #[test]
     fn real_sqlite_local_history_is_immutable_scoped_idempotent_and_survives_reopening() {

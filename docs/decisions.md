@@ -1,5 +1,21 @@
 # Desktop architecture decisions
 
+## Per-finding human decisions in immutable saved reviews
+
+Extend the explicit local archive with decisions for visible and suppressed
+findings. Annotate an already-saved record, not the live review. Each decision
+targets an ordinal plus the complete finding hash and creates a new immutable
+record linked to its parent. Concurrent annotations branch rather than overwrite.
+Repeated annotation of the same parent/choice is idempotent. Stale findings can
+be annotated as historical evidence, but annotations never restore apply/publish
+permissions, suppress live findings or calibrate evaluators. No free-text notes.
+
+Keep SQLite schema 9 and legacy payload hashes by omitting empty optional fields.
+Version 2 carries validated parent/decisions; the parent must exist in the same
+checkout archive at annotation time. Deleting a parent later does not delete its
+descendants. Existing 200-record/64,000-byte limits apply to annotations too;
+overflow rejects without replacing history.
+
 ## Automatic HEAD context remains an explicit proposal
 
 Following accepted principal ADR 008 and the user's confirmed pure-rule scope,

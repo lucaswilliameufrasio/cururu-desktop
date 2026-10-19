@@ -42,6 +42,24 @@ pub struct LocalReviewRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SavedUsage>,
     pub assessment: HumanAssessment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_decisions: Vec<FindingDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingDecision {
+    pub index: usize,
+    pub fingerprint: String,
+    pub assessment: HumanAssessment,
+}
+
+pub fn finding_fingerprint(finding: &cururu_core::ReviewFinding) -> anyhow::Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(finding)?)
+    ))
 }
 
 pub fn repository_key(root: &std::path::Path) -> anyhow::Result<String> {
@@ -97,14 +115,17 @@ impl LocalReviewRecord {
                 cost: usage.cost,
             }),
             assessment,
+            parent: None,
+            finding_decisions: Vec::new(),
         };
         record.validate()?;
         Ok(record)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_decisions()?;
         ensure!(
-            self.version == 1,
+            matches!(self.version, 1 | 2),
             "local history record version is unsupported"
         );
         for hash in [
@@ -186,6 +207,80 @@ impl LocalReviewRecord {
         self.validate()?;
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
+
+    pub fn finding(&self, index: usize) -> Option<&cururu_core::ReviewFinding> {
+        if index < self.review.findings.len() {
+            self.review.findings.get(index)
+        } else {
+            self.suppressed
+                .get(index.checked_sub(self.review.findings.len())?)
+                .map(|entry| &entry.finding)
+        }
+    }
+
+    fn validate_decisions(&self) -> anyhow::Result<()> {
+        if self.version == 1 {
+            ensure!(
+                self.parent.is_none() && self.finding_decisions.is_empty(),
+                "legacy local history cannot contain finding decisions"
+            );
+        } else {
+            validate_hash(
+                self.parent
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("annotated local history requires a parent"))?,
+            )?;
+            ensure!(
+                !self.finding_decisions.is_empty() && self.finding_decisions.len() <= 100,
+                "local finding decision count is invalid"
+            );
+        }
+        let mut prior = None;
+        for decision in &self.finding_decisions {
+            let finding = self
+                .finding(decision.index)
+                .ok_or_else(|| anyhow::anyhow!("local finding decision target is absent"))?;
+            ensure!(
+                prior.is_none_or(|index| index < decision.index),
+                "local finding decisions must be unique and sorted"
+            );
+            ensure!(
+                finding_fingerprint(finding)? == decision.fingerprint,
+                "local finding decision fingerprint does not match its target"
+            );
+            prior = Some(decision.index);
+        }
+        Ok(())
+    }
+
+    pub fn with_decision(&self, index: usize, assessment: HumanAssessment) -> anyhow::Result<Self> {
+        let parent = self.id()?;
+        let finding = self
+            .finding(index)
+            .ok_or_else(|| anyhow::anyhow!("local finding decision target is absent"))?;
+        let decision = FindingDecision {
+            index,
+            fingerprint: finding_fingerprint(finding)?,
+            assessment,
+        };
+        let mut record = self.clone();
+        record.version = 2;
+        record.parent = Some(parent);
+        if let Some(existing) = record
+            .finding_decisions
+            .iter_mut()
+            .find(|existing| existing.index == index)
+        {
+            *existing = decision;
+        } else {
+            record.finding_decisions.push(decision);
+            record
+                .finding_decisions
+                .sort_by_key(|decision| decision.index);
+        }
+        record.validate()?;
+        Ok(record)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -232,12 +327,47 @@ pub fn sample_record() -> LocalReviewRecord {
         chunk_count: 1,
         usage: None,
         assessment: HumanAssessment::Unreviewed,
+        parent: None,
+        finding_decisions: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_decisions_bind_visible_and_suppressed_targets_without_mutating_the_parent() {
+        let parent = sample_record();
+        let legacy = serde_json::to_string(&parent).unwrap();
+        assert!(!legacy.contains("finding_decisions"));
+        assert!(!legacy.contains("parent"));
+        let id = parent.id().unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(legacy.as_bytes())), id);
+        let visible = parent.with_decision(0, HumanAssessment::Agree).unwrap();
+        let suppressed = visible
+            .with_decision(1, HumanAssessment::NeedsMoreEvidence)
+            .unwrap();
+        assert_eq!(visible.parent.as_ref(), Some(&id));
+        assert_eq!(suppressed.parent.as_ref(), Some(&visible.id().unwrap()));
+        assert_eq!(suppressed.finding_decisions.len(), 2);
+        assert_eq!(parent.id().unwrap(), id);
+        assert!(parent.finding_decisions.is_empty());
+        assert!(parent.with_decision(2, HumanAssessment::Disagree).is_err());
+        let changed = suppressed
+            .with_decision(0, HumanAssessment::Disagree)
+            .unwrap();
+        assert_eq!(changed.finding_decisions.len(), 2);
+        let mut corrupt = changed;
+        corrupt.finding_decisions[0].fingerprint = "f".repeat(64);
+        assert!(corrupt.validate().is_err());
+        let mut corrupt = suppressed.clone();
+        corrupt.finding_decisions.reverse();
+        assert!(corrupt.validate().is_err());
+        let mut corrupt = suppressed;
+        corrupt.version = 1;
+        assert!(corrupt.validate().is_err());
+    }
 
     #[test]
     fn saved_result_excludes_context_and_shared_documents_and_preserves_suppression_audit() {
