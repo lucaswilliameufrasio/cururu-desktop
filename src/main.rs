@@ -3404,7 +3404,7 @@ fn render_local_review_limits() -> gpui::Div {
     div()
         .text_color(rgb(0x009b_aaba))
         .child(format!(
-            "Outbound limit: {} files, {} bytes total, {} bytes per file. Only changed-file paths and unified diffs are sent; no repository snapshot.",
+            "Diff budget: {} files, {} bytes total, {} bytes per file. Additional context is sent only after its separate preview/inclusion choice; no complete repository snapshot is sent.",
             local_review::MAX_LOCAL_REVIEW_FILES,
             local_review::MAX_LOCAL_DIFF_BYTES,
             local_review::MAX_LOCAL_FILE_DIFF_BYTES
@@ -3418,12 +3418,29 @@ fn local_review_validation_message(
     match validation {
         Ok(chunks) => match local_review::outbound_stats(snapshot) {
             Ok((files, bytes)) => format!(
-                "{files} eligible changed files · {bytes} bytes · {chunks} bounded chunk(s) · repository policy applied; provider section ignored"
+                "{files} eligible changed files · {bytes} bytes · {chunks} bounded chunk(s) · {} · provider section ignored",
+                local_policy_summary(snapshot)
             ),
             Err(error) => format!("Local review unavailable: {error}"),
         },
         Err(error) => format!("Local review unavailable: {error}"),
     }
+}
+
+fn local_policy_summary(snapshot: &repository::RepositorySnapshot) -> String {
+    let Ok(policy) = &snapshot.review_policy else {
+        return "repository policy unavailable".to_string();
+    };
+    format!(
+        "profile {:?}; minimum confidence {}; max findings {}; severities {:?}; suggestions {}; synthesis {}; informational quality threshold {:?}",
+        policy.profile,
+        policy.minimum_confidence,
+        policy.max_findings,
+        policy.allowed_severities,
+        policy.suggested_changes,
+        policy.synthesis,
+        policy.fail_on
+    )
 }
 
 const fn local_review_authorization_message(is_authorized: bool) -> &'static str {
