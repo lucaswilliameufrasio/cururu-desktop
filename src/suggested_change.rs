@@ -19,6 +19,7 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone)]
 pub struct Preview {
     context: Option<crate::local_context::PreparedContext>,
+    base: Option<crate::shared_base::ApprovedBase>,
     pub path: String,
     pub line: u32,
     pub title: String,
@@ -62,6 +63,7 @@ pub fn prepare(
         reviewed_diff_fingerprint,
         finding,
         None,
+        None,
     )
 }
 
@@ -71,13 +73,14 @@ pub fn prepare_with_context(
     reviewed_diff_fingerprint: &str,
     finding: &cururu_core::ReviewFinding,
     context: Option<&crate::local_context::PreparedContext>,
+    base: Option<&crate::shared_base::ApprovedBase>,
 ) -> anyhow::Result<Preview> {
     let identity = local_review::repository_identity(repository_root)?;
     ensure!(
         identity == repository_identity,
         "the selected repository changed; reopen it before previewing this suggestion"
     );
-    let snapshot = RepositorySnapshot::open(repository_root)?;
+    let snapshot = RepositorySnapshot::open(repository_root)?.with_shared_base(base)?;
     crate::local_context::validate(&snapshot, context)?;
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == reviewed_diff_fingerprint,
@@ -178,6 +181,11 @@ fn prepare_file(
         .to_string();
 
     Ok(Preview {
+        base: snapshot
+            .review_policy
+            .as_ref()
+            .ok()
+            .and_then(|policy| policy.base_approval.clone()),
         context: context.cloned(),
         path: path.to_string(),
         line,
@@ -199,7 +207,8 @@ pub fn apply(preview: &Preview) -> anyhow::Result<()> {
         identity == preview.repository_identity,
         "the selected repository changed after the preview; no file was modified"
     );
-    let snapshot = RepositorySnapshot::open(&preview.root)?;
+    let snapshot =
+        RepositorySnapshot::open(&preview.root)?.with_shared_base(preview.base.as_ref())?;
     crate::local_context::validate(&snapshot, preview.context.as_ref())?;
     ensure!(
         local_review::snapshot_fingerprint(&snapshot) == preview.reviewed_diff_fingerprint,
@@ -543,6 +552,7 @@ mod tests {
             &fingerprint,
             &finding,
             Some(&evidence),
+            None,
         )
         .unwrap();
         fs::write(directory.path().join("CONTEXT.md"), "Changed context\n").unwrap();
@@ -552,7 +562,8 @@ mod tests {
                 &identity,
                 &fingerprint,
                 &finding,
-                Some(&evidence)
+                Some(&evidence),
+                None
             )
             .is_err()
         );

@@ -1,5 +1,20 @@
 # Cururu Desktop
 
+Pinned GitHub shared configuration is supported via `[config]` (`base =
+"owner/repository"`, full 40-character `base_ref`, repository-relative
+`base_path`). Opening a checkout never fetches it. Explicitly fetch with your
+GitHub session, inspect the effective policy, then approve it in memory. Sources
+are limited to 64 KiB, composed configuration to 128 KiB; nested bases are
+rejected. Base/local composition uses the same engine function as the CLI.
+Local overrides and cumulative arrays are preserved, then desktop ceilings and
+unsupported-field checks apply. Provider settings never change your local
+destination/model/key/consent. Referenced context is not fetched or read by base
+approval: its own preview/inclusion step remains separate. Raw base documents
+are redacted from debug output and are not stored in SQLite. Review pre/postflight
+and suggestion guards reuse the approved pinned bytes, checking the exact local
+configuration without an automatic remote fetch. Clearing approval blocks AI
+review again. Changing a pointer or local document requires fresh approval.
+
 A plain single-line GitHub `suggestion` block on a current-head right-side inline
 comment can be imported into an explicitly chosen checkout. Load its source,
 choose a checkout already at the exact PR head, inspect the local diff, then
@@ -92,7 +107,7 @@ and consent remain local. The config file's patch is not sent for review.
 Configuration changes invalidate an in-flight review even when Git ignores the
 file. Unsupported or invalid configuration blocks AI review; manual diff/drafts
 remain available subject to the worktree reader's existing file limits and
-non-symlink-file support. Shared-base/analyzer sections and unsupported review/policy
+non-symlink-file support. Analyzer sections and unsupported review/policy
 fields are not implemented in the desktop yet and block AI sends rather than
 being silently ignored. `[summary]` is not applied; `[evaluator]` is local-only.
 

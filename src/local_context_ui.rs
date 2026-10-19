@@ -46,10 +46,22 @@ impl ContextState {
 }
 
 impl ReviewWorkspace {
+    pub fn validate_review_evidence(&self, snapshot: &RepositorySnapshot) -> anyhow::Result<usize> {
+        let count = crate::local_review::validate_snapshot(snapshot)?;
+        self.local_context_state.resolve(snapshot)?;
+        Ok(count)
+    }
+
     pub fn context_matches_request(&self, request: &crate::LocalReviewRequest) -> bool {
         self.local_repository_snapshot
             .as_ref()
             .is_some_and(|snapshot| {
+                if crate::shared_base::fingerprint(snapshot) != request.context.base_fingerprint
+                    || request.base.as_ref().map(|base| &base.fingerprint)
+                        != request.context.base_fingerprint.as_ref()
+                {
+                    return false;
+                }
                 self.local_context_state
                     .resolve(snapshot)
                     .is_ok_and(|context| {
@@ -269,7 +281,9 @@ mod tests {
         workspace.local_context_state = included;
         let evidence = workspace.local_context_state.resolve(&snapshot).unwrap();
         let mut request = crate::LocalReviewRequest {
+            base: None,
             context: crate::LocalReviewRequestContext {
+                base_fingerprint: None,
                 request_id: 0,
                 repository_identity: String::new(),
                 config_fingerprint: String::new(),
@@ -284,6 +298,9 @@ mod tests {
             },
         };
         assert!(workspace.context_matches_request(&request));
+        request.context.base_fingerprint = Some("unapproved-base".to_string());
+        assert!(!workspace.context_matches_request(&request));
+        request.context.base_fingerprint = None;
         request.evidence = None;
         assert!(!workspace.context_matches_request(&request));
         request.context.evidence_fingerprint = None;

@@ -39,6 +39,8 @@ pub mod repository;
 mod repository_policy;
 mod review_publication;
 pub mod session_store;
+mod shared_base;
+mod shared_base_ui;
 pub mod suggested_change;
 
 const DIFF_LINE_COUNT: usize = 10_000;
@@ -130,6 +132,7 @@ struct ReviewWorkspace {
     evaluator_result_anchor: Option<evaluation_history::EvaluationAnchor>,
     local_context_state: local_context_ui::ContextState,
     remote_suggestion_state: remote_suggestion::RemoteSuggestionState,
+    shared_base_state: shared_base_ui::SharedBaseState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -178,6 +181,7 @@ struct EvaluatorAnalysisRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalReviewRequestContext {
+    base_fingerprint: Option<String>,
     evidence_fingerprint: Option<String>,
     request_id: u64,
     repository_identity: String,
@@ -187,6 +191,7 @@ struct LocalReviewRequestContext {
 
 #[derive(Clone)]
 struct LocalReviewRequest {
+    base: Option<shared_base::ApprovedBase>,
     evidence: Option<local_context::PreparedContext>,
     context: LocalReviewRequestContext,
     repository_root: PathBuf,
@@ -201,6 +206,7 @@ struct PendingLocalCommand {
 
 #[derive(Clone)]
 struct SuggestedChangeRequest {
+    base: Option<shared_base::ApprovedBase>,
     context: Option<local_context::PreparedContext>,
     request_id: u64,
     repository_root: PathBuf,
@@ -452,6 +458,7 @@ impl ReviewWorkspace {
             evaluator_result_anchor: None,
             local_context_state: local_context_ui::ContextState::default(),
             remote_suggestion_state: remote_suggestion::RemoteSuggestionState::default(),
+            shared_base_state: shared_base_ui::SharedBaseState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -2217,14 +2224,13 @@ impl ReviewWorkspace {
             is_authorized,
             store.is_some() && !is_authorization_busy,
         );
-        let validation = local_review::validate_snapshot(snapshot).and_then(|count| {
-            self.local_context_state.resolve(snapshot)?;
-            Ok(count)
-        });
+        let validation = self.validate_review_evidence(snapshot);
         let evidence = self.local_context_state.resolve(snapshot).ok().flatten();
         let request = validation.as_ref().ok().map(|_| LocalReviewRequest {
+            base: shared_base::approval(snapshot),
             evidence: evidence.clone(),
             context: LocalReviewRequestContext {
+                base_fingerprint: shared_base::fingerprint(snapshot),
                 evidence_fingerprint: evidence.as_ref().map(|context| context.fingerprint.clone()),
                 request_id: 0,
                 repository_identity: identity.to_string(),
@@ -2265,6 +2271,7 @@ impl ReviewWorkspace {
             .child("Repository .cururu.toml may restrict review limits/files/findings and declare optional context/focus; provider destinations and consent remain local.")
             .child(authorization_message)
             .child(authorization_button)
+            .child(self.render_shared_base(cx, snapshot))
             .child(self.render_local_context(cx, snapshot))
             .child(send_button)
             .children(
@@ -3973,6 +3980,7 @@ fn start_local_review(
                 .as_ref()
                 .map(local_review::snapshot_fingerprint);
             let still_matches = current_identity == Some(request_context.repository_identity.as_str())
+                && this.local_repository_snapshot.as_ref().and_then(shared_base::fingerprint) == request_context.base_fingerprint
                 && current_fingerprint.as_deref()
                     == Some(request_context.config_fingerprint.as_str())
                 && current_snapshot_fingerprint.as_deref()
@@ -4015,7 +4023,8 @@ async fn run_local_review(
         .spawn(async move {
             validate_local_review_request(&preflight_store, &preflight_request)?;
             let snapshot =
-                repository::RepositorySnapshot::open(&preflight_request.repository_root)?;
+                repository::RepositorySnapshot::open(&preflight_request.repository_root)?
+                    .with_shared_base(preflight_request.base.as_ref())?;
             validate_local_review_snapshot(&preflight_request, &snapshot)?;
             let secrets = local_review::LocalReviewSecrets::load()?
                 .context("local review API key is unavailable in the OS keyring")?;
@@ -4037,7 +4046,8 @@ async fn run_local_review(
         .spawn(async move {
             validate_local_review_request(&postflight_store, &postflight_request)?;
             let current_snapshot =
-                repository::RepositorySnapshot::open(&postflight_request.repository_root)?;
+                repository::RepositorySnapshot::open(&postflight_request.repository_root)?
+                    .with_shared_base(postflight_request.base.as_ref())?;
             validate_local_review_snapshot(&postflight_request, &current_snapshot)?;
             Ok::<_, anyhow::Error>(())
         })
@@ -4087,6 +4097,10 @@ fn validate_local_review_snapshot(
         "working-tree changes differ from the reviewed preview; reopen the repository and try again"
     );
     local_review::validate_snapshot(snapshot)?;
+    anyhow::ensure!(
+        shared_base::fingerprint(snapshot) == request.context.base_fingerprint,
+        "shared base approval changed after the review preview"
+    );
     local_context::validate(snapshot, request.evidence.as_ref())?;
     Ok(())
 }
@@ -4114,6 +4128,7 @@ fn render_local_review_result(
             let finding_for_display = finding.clone();
             let entity = entity.clone();
             let request = SuggestedChangeRequest {
+                base: result.base.clone(),
                 context: result.context.clone(),
                 request_id: 0,
                 repository_root: repository_root.to_path_buf(),
@@ -4374,6 +4389,7 @@ fn begin_suggested_change_preview(
                     &request.reviewed_diff_fingerprint,
                     &request.finding,
                     request.context.as_ref(),
+                    request.base.as_ref(),
                 )
             })
             .await;
@@ -6275,8 +6291,10 @@ mod tests {
         let config_fingerprint = super::local_review::config_fingerprint(&settings).unwrap();
         let snapshot_fingerprint = super::local_review::snapshot_fingerprint(&snapshot);
         let request = LocalReviewRequest {
+            base: None,
             evidence: None,
             context: LocalReviewRequestContext {
+                base_fingerprint: None,
                 evidence_fingerprint: None,
                 request_id: 1,
                 repository_identity: identity.clone(),

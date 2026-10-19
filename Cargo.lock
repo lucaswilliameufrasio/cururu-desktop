@@ -1388,7 +1388,7 @@ dependencies = [
 [[package]]
 name = "cururu-core"
 version = "0.1.0"
-source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=dc7a270#dc7a270d7f110d8d203f9139108ad89e998ec3c1"
+source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=af32737#af327379541a9caec4e82f31a499dfc202c35b55"
 dependencies = [
  "globset",
  "schemars",
@@ -1425,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "cururu-engine"
 version = "0.1.0"
-source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=dc7a270#dc7a270d7f110d8d203f9139108ad89e998ec3c1"
+source = "git+https://github.com/lucaswilliameufrasio/cururu.git?rev=af32737#af327379541a9caec4e82f31a499dfc202c35b55"
 dependencies = [
  "anyhow",
  "async-trait",

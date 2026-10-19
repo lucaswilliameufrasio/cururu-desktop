@@ -67,6 +67,7 @@ pub struct PolicySuppressedFinding {
 
 #[derive(Debug, Clone)]
 pub struct LocalReviewResult {
+    pub base: Option<crate::shared_base::ApprovedBase>,
     pub context: Option<crate::local_context::PreparedContext>,
     pub review: cururu_core::ReviewResult,
     pub usage: Option<cururu_engine::ReviewUsage>,
@@ -95,7 +96,7 @@ pub fn repository_identity(root: &Path) -> anyhow::Result<String> {
 pub fn config_fingerprint(settings: &LocalReviewSettings) -> anyhow::Result<String> {
     settings.validate()?;
     let mut digest = Sha256::new();
-    digest.update(b"cururu-desktop-local-review-v2-explicit-context\0");
+    digest.update(b"cururu-desktop-local-review-v3-approved-base\0");
     digest.update(settings.openai_endpoint.as_bytes());
     digest.update([0]);
     digest.update(settings.openai_model.as_bytes());
@@ -296,6 +297,11 @@ fn assemble_review_result(
     );
 
     Ok(LocalReviewResult {
+        base: snapshot
+            .review_policy
+            .as_ref()
+            .ok()
+            .and_then(|policy| policy.base_approval.clone()),
         context: None,
         review,
         usage,

@@ -21,6 +21,9 @@ pub struct RepositoryPolicy {
     pub ignore: Vec<String>,
     pub provider_ignored: bool,
     pub context: crate::local_context::ContextSpec,
+    pub shared_base: Option<crate::shared_base::SharedBaseSource>,
+    pub base_approval: Option<crate::shared_base::ApprovedBase>,
+    pub local_document: Option<crate::shared_base::ConfigDocument>,
 }
 
 impl Default for RepositoryPolicy {
@@ -36,6 +39,9 @@ impl Default for RepositoryPolicy {
             ignore: vec![],
             provider_ignored: false,
             context: crate::local_context::ContextSpec::default(),
+            shared_base: None,
+            base_approval: None,
+            local_document: None,
         }
     }
 }
@@ -88,10 +94,14 @@ impl RepositoryPolicy {
             "[evaluator] is local-only and cannot be enabled by .cururu.toml"
         );
         ensure!(
-            parsed.config.is_none() && parsed.analysis.is_none(),
-            "desktop review does not yet support [config] or [analysis]; no shared configuration or analysis files will be loaded"
+            parsed.analysis.is_none(),
+            "desktop review does not yet support [analysis]; no analyzer files will be loaded"
         );
         let mut policy = Self {
+            shared_base: parsed
+                .config
+                .map(crate::shared_base::SharedBaseSource::parse)
+                .transpose()?,
             fingerprint: format!("{:x}", Sha256::digest(raw.as_bytes())),
             provider_ignored: parsed.provider.is_some(),
             context: crate::local_context::ContextSpec::parse(
@@ -104,6 +114,9 @@ impl RepositoryPolicy {
             )?,
             ..Self::default()
         };
+        if policy.shared_base.is_some() {
+            policy.local_document = Some(crate::shared_base::ConfigDocument::new(raw));
+        }
         if let Some(review) = parsed.review {
             ensure!(
                 review.profile.is_none()
@@ -178,12 +191,21 @@ impl RepositoryPolicy {
         &self,
         files: &[cururu_core::ChangedFile],
     ) -> anyhow::Result<Vec<cururu_core::ChangedFile>> {
+        self.require_ready()?;
         let ignored = self.ignore_set()?;
         Ok(files
             .iter()
             .filter(|file| file.path != ".cururu.toml" && !ignored.is_match(&file.path))
             .cloned()
             .collect())
+    }
+
+    pub fn require_ready(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.shared_base.is_none() || self.base_approval.is_some(),
+            "shared base requires explicit fetch, preview and approval before AI review"
+        );
+        Ok(())
     }
 }
 

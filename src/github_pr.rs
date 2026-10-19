@@ -356,6 +356,41 @@ impl GitHubPullRequestClient {
         commit_sha: &str,
     ) -> anyhow::Result<PullRequestSourceFile> {
         validate_pull_request_reference(reference)?;
+        self.load_repository_file(
+            &reference.owner,
+            &reference.repository,
+            path,
+            commit_sha,
+            MAX_SOURCE_FILE_BYTES,
+        )
+        .await
+    }
+
+    pub async fn load_shared_config(
+        &self,
+        source: &crate::shared_base::SharedBaseSource,
+    ) -> anyhow::Result<String> {
+        source.validate()?;
+        let file = self
+            .load_repository_file(
+                &source.owner,
+                &source.repository,
+                &source.path,
+                &source.commit,
+                crate::shared_base::MAX_BASE_BYTES,
+            )
+            .await?;
+        Ok(file.content)
+    }
+
+    async fn load_repository_file(
+        &self,
+        owner: &str,
+        repository: &str,
+        path: &str,
+        commit_sha: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<PullRequestSourceFile> {
         validate_relative_path(path)?;
         ensure!(
             valid_commit_sha(commit_sha),
@@ -368,8 +403,8 @@ impl GitHubPullRequestClient {
                 .map_err(|()| anyhow::anyhow!("could not build GitHub contents API path"))?;
             segments
                 .push("repos")
-                .push(&reference.owner)
-                .push(&reference.repository)
+                .push(owner)
+                .push(repository)
                 .push("contents");
             for segment in path.split('/') {
                 segments.push(segment);
@@ -386,7 +421,7 @@ impl GitHubPullRequestClient {
             "GitHub returned source for a different repository path"
         );
         ensure!(
-            response.size <= MAX_SOURCE_FILE_BYTES,
+            response.size <= max_bytes,
             "Reviewed source file exceeds the desktop context limit"
         );
         let decoded = STANDARD
@@ -1459,6 +1494,49 @@ mod tests {
         assert!(PullRequestRef::parse("octo-org/review_repo/other#42").is_err());
         assert!(PullRequestRef::parse("octo-org/review_repo#0").is_err());
         assert!(PullRequestRef::parse("octo-org/review_repo#4%2Fpulls").is_err());
+    }
+
+    #[test]
+    fn shared_config_fetch_is_pinned_bounded_and_read_only_without_a_pull_request() {
+        futures::executor::block_on(async {
+            let (client, http) = api_client(&[
+                r#"{"type":"file","encoding":"base64","size":12,"path":".cururu.toml","content":"dmVyc2lvbiA9IDEK"}"#,
+            ]);
+            let source = crate::shared_base::SharedBaseSource {
+                owner: "org".to_string(),
+                repository: "policy".to_string(),
+                commit: "a".repeat(40),
+                path: ".cururu.toml".to_string(),
+            };
+            assert_eq!(
+                client.load_shared_config(&source).await.unwrap(),
+                "version = 1\n"
+            );
+            {
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].method, "GET");
+                assert_eq!(
+                    requests[0].uri,
+                    format!(
+                        "https://api.github.com/repos/org/policy/contents/.cururu.toml?ref={}",
+                        "a".repeat(40)
+                    )
+                );
+            }
+            let (client, _) = api_client(&[
+                r#"{"type":"file","encoding":"base64","size":65537,"path":".cururu.toml","content":""}"#,
+            ]);
+            assert!(client.load_shared_config(&source).await.is_err());
+            let (client, _) = api_client(&[
+                r#"{"type":"symlink","encoding":"base64","size":12,"path":".cururu.toml","content":"dmVyc2lvbiA9IDEK"}"#,
+            ]);
+            assert!(client.load_shared_config(&source).await.is_err());
+            let (client, _) = api_client(&[
+                r#"{"type":"file","encoding":"base64","size":12,"path":"other.toml","content":"dmVyc2lvbiA9IDEK"}"#,
+            ]);
+            assert!(client.load_shared_config(&source).await.is_err());
+        });
     }
 
     #[test]

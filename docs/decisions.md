@@ -1,5 +1,32 @@
 # Desktop architecture decisions
 
+## Pinned shared-base configuration with explicit approval
+
+Use shared schema and pure TOML composition from engine pin af32737 (ADR 007 in
+Cururu). Runtime interpretation, fetch, filesystem, credentials and permissions
+remain desktop-owned. A declaration is not authorization: pending bases block
+AI review until an explicit authenticated github.com GET, effective-policy
+preview and memory-only approval. Fetch exactly one file at a full pinned SHA;
+reject nested bases, non-file responses, invalid paths/identity, unsupported
+settings or size excess. Cap source files at 64 KiB and composed text at 128 KiB.
+
+Apply canonical base/local precedence first, then local desktop ceilings and
+permission boundaries. Never adopt provider destinations/model/key, evaluator
+permissions, or execute/fetch context declarations from the base. Context paths
+refer to the consumer checkout and still require separate local preview and
+inclusion. Show the effective supported fields and provenance, not raw TOML
+which may contain credentials. Opaque documents have redacted Debug and no
+serialization/persistence contract; approval and pinned bytes are memory-only.
+
+Bind approval to canonical checkout, exact local document, pinned source and
+base content fingerprint. Review identity records the independent base hash;
+manual diff/command identity retains the raw local config hash, so approving a
+base never authorizes or changes an approved command. Pre/postflight and local
+suggestions reconstruct effective policy using cached approved bytes after
+rechecking local config/root; no automatic network access. A changed/revoked
+approval invalidates analysis/context choices, not manual diff/drafts. Revisit
+multi-level bases or caching only with explicit provenance/consent semantics.
+
 ## Import GitHub suggestions without implicit commit/push
 
 Support exactly one plain single-line suggestion block on a current-head,
