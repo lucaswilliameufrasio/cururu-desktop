@@ -202,7 +202,8 @@ impl ReviewWorkspace {
             OpinionState::Preview(pending) => {
                 let fingerprint = pending.fingerprint.clone();
                 panel = panel.child(format!("Checkout {} · HEAD {:?}\nOpenAI destination {} / {} · Jev https://api.typesafe.ai/v1/systemone / {}\nInput {} · rubric {}\nBoth providers will receive this exact JSON (no extra files/context are read or sent):\n{}", pending.snapshot.root.display(), pending.snapshot.head_oid, pending.settings.openai_endpoint, pending.settings.openai_model, pending.settings.jev_model, pending.input_fingerprint, pending.rubric_fingerprint, serde_json::to_string_pretty(&pending.input).unwrap_or_default()))
-                    .child(Button::new("confirm-local-opinion").label("Confirm one-shot consent and send this finding to BOTH evaluators").disabled(!self.opinion_is_current(pending) || self.evidence_edits_busy())
+                    .child("Confirming grants one-shot permission to send this exact input to both evaluators. It does not authorize filtering, commands, apply or publication.")
+                    .child(Button::new("confirm-local-opinion").label("Confirm send to both").disabled(!self.opinion_is_current(pending) || self.evidence_edits_busy())
                         .on_click(move |_, _, cx| send(&entity, &fingerprint, cx)));
             }
             OpinionState::Complete { pending, result } => {
@@ -210,7 +211,7 @@ impl ReviewWorkspace {
                     .child(crate::render_evaluator_result(result));
                 let fingerprint = pending.fingerprint.clone();
                 panel = panel.child("Provider prose may quote code. Save creates a source snapshot plus an immutable linked opinion record; raw evaluator inputs/context are excluded. Existing archive limits apply.")
-                    .child(Button::new("save-local-opinion").label("Save this opinion and its source finding snapshot locally").disabled(!self.opinion_is_current(pending) || self.session_store.is_none() || self.evidence_edits_busy())
+                    .child(Button::new("save-local-opinion").label("Save opinion snapshot").disabled(!self.opinion_is_current(pending) || self.session_store.is_none() || self.evidence_edits_busy())
                         .on_click(move |_, _, cx| save(&entity, &fingerprint, cx)));
             }
         }
@@ -220,7 +221,7 @@ impl ReviewWorkspace {
             let entity = cx.entity();
             panel = panel.child(
                 Button::new("discard-local-opinion")
-                    .label("Discard this preview/opinion from memory (no action)")
+                    .label("Discard preview / result")
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |this, cx| {
                             if !this.local_opinion_state.busy() {
@@ -242,7 +243,7 @@ pub fn preview_button(
     disabled: bool,
 ) -> Button {
     Button::new(gpui::SharedString::from(id))
-        .label("Preview second opinion for this finding (no send)")
+        .label("Preview second opinion")
         .disabled(disabled)
         .on_click(move |_, _, cx| preview(&entity, target, cx))
 }
