@@ -4,7 +4,7 @@
 (including policy-suppressed findings) and loaded static findings, in Review
 changes or Understand a review. Configure both evaluators in Understand a review,
 select **Preview second opinion**, inspect the exact finding JSON/full selected
-file diff and both destinations, then explicitly confirm sending to BOTH.
+file diff and both destinations, then choose **Confirm send to both**.
 This is one-shot consent for that checkout/finding/configuration, separate from
 GitHub and local-review authorization. Preview never reads the keyring or sends.
 No extra source/context files are collected; the full selected diff must fit the
