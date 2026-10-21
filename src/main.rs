@@ -39,6 +39,8 @@ mod local_analysis_ui;
 pub mod local_command;
 mod local_context;
 mod local_context_ui;
+mod local_finding_opinion;
+mod local_finding_opinion_ui;
 pub mod local_review;
 mod local_review_history;
 mod local_review_history_ui;
@@ -145,6 +147,7 @@ struct ReviewWorkspace {
     local_history_state: local_review_history_ui::HistoryState,
     action_history: action_history_ui::ActionHistory,
     local_analysis_state: local_analysis_ui::AnalysisState,
+    local_opinion_state: local_finding_opinion_ui::OpinionState,
     evaluator_result_comment_id: Option<u64>,
     is_evaluator_running: bool,
     evaluator_authorized_repository: Option<String>,
@@ -479,6 +482,7 @@ impl ReviewWorkspace {
             local_history_state: local_review_history_ui::HistoryState::default(),
             action_history: action_history_ui::ActionHistory::default(),
             local_analysis_state: local_analysis_ui::AnalysisState::default(),
+            local_opinion_state: local_finding_opinion_ui::OpinionState::default(),
             evaluator_result_comment_id: None,
             is_evaluator_running: false,
             evaluator_authorized_repository: None,
@@ -1991,6 +1995,7 @@ impl ReviewWorkspace {
                 .p_4()
                 .child(self.render_local_history(cx))
                 .child(self.render_local_analysis(cx))
+                .child(self.render_local_finding_opinion(cx))
                 .child(self.render_action_history(cx));
         };
         let file = &self.files[selected_file];
@@ -2117,7 +2122,7 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child("Load a GitHub pull request to inspect its reviews and discussion threads.")
+                .child(self.render_local_understanding(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
             (ReviewMode::ReviewChanges, _) => div()
                 .flex()
@@ -2126,6 +2131,7 @@ impl ReviewWorkspace {
                 .child(self.render_local_review_action(cx))
                 .child(self.render_local_history(cx))
                 .child(self.render_local_analysis(cx))
+                .child(self.render_local_finding_opinion(cx))
                 .child(self.render_local_command_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
@@ -2154,7 +2160,8 @@ impl ReviewWorkspace {
             self.local_command_state,
             LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
         );
-        let is_other_work_running = matches!(self.local_review_state, LocalReviewState::Running(_))
+        let is_other_work_running = self.local_opinion_state.busy()
+            || matches!(self.local_review_state, LocalReviewState::Running(_))
             || matches!(
                 self.suggested_change_state,
                 SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
@@ -3791,7 +3798,7 @@ fn begin_local_command_preflight(
         if matches!(
             this.local_command_state,
             LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
-        ) || matches!(this.local_review_state, LocalReviewState::Running(_))
+        ) || this.local_opinion_state.busy() || matches!(this.local_review_state, LocalReviewState::Running(_))
             || matches!(
                 this.suggested_change_state,
                 SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
@@ -3903,6 +3910,12 @@ fn accept_local_command_confirmation(
     cx: &mut App,
 ) -> bool {
     entity.update(cx, |this, cx| {
+        if this.local_opinion_state.busy() {
+            this.notice =
+                Some("Finish the local second-opinion operation before running a command.".into());
+            cx.notify();
+            return false;
+        }
         let was_confirmed = match (&this.local_command_state, mode) {
             (LocalCommandState::Confirming(active), local_command::ExecutionMode::Sandboxed) => {
                 active.request_id == pending.request_id && active.plan.sandbox.is_available()
@@ -4290,6 +4303,12 @@ fn render_local_review_result(
                         .child(finding_for_display.suggestion)
                 }))
                 .children(apply_button)
+                .child(local_finding_opinion_ui::preview_button(
+                    entity.clone(),
+                    local_finding_opinion::Target::Provider(index),
+                    format!("opinion-provider-{index}"),
+                    is_suggestion_busy,
+                ))
                 .on_click(move |_event, _window, cx| {
                     entity.update(cx, |this, cx| {
                         navigate_local_finding(this, &path, line);
@@ -4311,7 +4330,7 @@ fn render_local_review_result(
         ))
         .child(result.review.summary.clone())
         .child(format!("Quality status (informational only): {:?}. No apply/publish action is authorized by this status.", cururu_core::evaluate_quality(&result.review, result.fail_on)))
-        .child(render_policy_suppressions(result))
+        .child(render_policy_suppressions(result, &entity))
         .children(rows)
 }
 
@@ -4335,7 +4354,10 @@ fn navigate_local_finding(workspace: &mut ReviewWorkspace, path: &str, line: Opt
     }
 }
 
-fn render_policy_suppressions(result: &local_review::LocalReviewResult) -> gpui::Div {
+fn render_policy_suppressions(
+    result: &local_review::LocalReviewResult,
+    entity: &Entity<ReviewWorkspace>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -4344,17 +4366,33 @@ fn render_policy_suppressions(result: &local_review::LocalReviewResult) -> gpui:
             "{} valid finding(s) retained for repository-policy audit (not evaluator filtering)",
             result.policy_suppressed.len()
         ))
-        .children(result.policy_suppressed.iter().map(|suppressed| {
-            div().p_2().child(format!(
-                "{} · {}:{} · {}\n{}\n{}",
-                suppressed.reason,
-                suppressed.finding.path,
-                suppressed.finding.line.unwrap_or_default(),
-                suppressed.finding.severity,
-                suppressed.finding.title,
-                suppressed.finding.message
-            ))
-        }))
+        .children(
+            result
+                .policy_suppressed
+                .iter()
+                .enumerate()
+                .map(|(index, suppressed)| {
+                    div()
+                        .p_2()
+                        .child(format!(
+                            "{} · {}:{} · {}\n{}\n{}",
+                            suppressed.reason,
+                            suppressed.finding.path,
+                            suppressed.finding.line.unwrap_or_default(),
+                            suppressed.finding.severity,
+                            suppressed.finding.title,
+                            suppressed.finding.message
+                        ))
+                        .child(local_finding_opinion_ui::preview_button(
+                            entity.clone(),
+                            local_finding_opinion::Target::Provider(
+                                result.review.findings.len() + index,
+                            ),
+                            format!("opinion-suppressed-{index}"),
+                            false,
+                        ))
+                }),
+        )
 }
 
 fn render_suggested_change_state(
@@ -4458,7 +4496,7 @@ fn begin_suggested_change_preview(
     cx: &mut App,
 ) {
     let request_id = entity.update(cx, |this, cx| {
-        let already_busy = matches!(
+        let already_busy = this.local_opinion_state.busy() || matches!(
             &this.suggested_change_state,
             SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
         ) || matches!(
@@ -4573,10 +4611,12 @@ fn start_suggested_change_application(
 ) {
     let store = entity.read(cx).session_store.clone();
     let can_apply = entity.update(cx, |this, cx| {
-        if matches!(
-            this.local_command_state,
-            LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
-        ) {
+        if this.local_opinion_state.busy()
+            || matches!(
+                this.local_command_state,
+                LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
+            )
+        {
             this.notice =
                 Some("Finish or cancel the local command before applying a suggestion.".into());
             cx.notify();
@@ -4876,6 +4916,7 @@ fn build_review_analysis_input(
         }
     }
     Ok(evaluator::ReviewAnalysisInput {
+        origin: evaluator::AnalysisOrigin::GitHub,
         repository_identity: format!(
             "{}/{}",
             snapshot.reference.owner, snapshot.reference.repository
@@ -4934,6 +4975,7 @@ fn save_evaluator_configuration(
     };
     entity.update(cx, |this, cx| {
         this.evaluator_notice = Some("Saving both evaluator configurations…".into());
+        this.local_opinion_state = local_finding_opinion_ui::OpinionState::Idle;
         cx.notify();
     });
     let entity_for_task = entity.clone();

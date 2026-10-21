@@ -36,6 +36,25 @@ pub(super) fn migrate(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result
 }
 
 impl SessionStore {
+    pub fn save_local_finding_opinion(
+        &self,
+        source: &LocalReviewRecord,
+        opinion: crate::local_review_history::FindingOpinion,
+    ) -> anyhow::Result<String> {
+        ensure!(
+            source.parent.is_none(),
+            "opinion source must be a live root snapshot"
+        );
+        let record = source.with_opinion(opinion)?;
+        let mut connection = self.connect()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        insert_record(&transaction, source)?;
+        let id = insert_record(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
     pub fn save_local_review(&self, record: &LocalReviewRecord) -> anyhow::Result<String> {
         record.validate()?;
         ensure!(
@@ -123,6 +142,102 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_opinions_branch_idempotently_and_reopen_without_raw_inputs_or_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("opinions.sqlite3");
+        let store = SessionStore::open(&path).unwrap();
+        let source = crate::local_review_history::sample_record();
+        let opinion = crate::local_review_history::FindingOpinion {
+            index: 0,
+            finding_fingerprint: crate::local_review_history::finding_fingerprint(
+                source.finding(0).unwrap(),
+            )
+            .unwrap(),
+            input_fingerprint: "a".repeat(64),
+            config_fingerprint: "b".repeat(64),
+            rubric_fingerprint: "c".repeat(64),
+            analysis: crate::evaluation_history::sample_record().analysis,
+        };
+        let id = store
+            .save_local_finding_opinion(&source, opinion.clone())
+            .unwrap();
+        assert_eq!(
+            store
+                .save_local_finding_opinion(&source, opinion.clone())
+                .unwrap(),
+            id
+        );
+        let mut other = opinion.clone();
+        other.analysis.explanation.explanation = "Another opinion".to_string();
+        assert_ne!(
+            store.save_local_finding_opinion(&source, other).unwrap(),
+            id
+        );
+        let reopened = SessionStore::open(&path).unwrap();
+        let rows = reopened
+            .local_review_history(&source.repository_key, 0)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let stored = &rows.iter().find(|row| row.id == id).unwrap().record;
+        assert_eq!(stored.parent.as_ref(), Some(&source.id().unwrap()));
+        assert_eq!(stored.finding_opinions.len(), 1);
+        let mut corrupt = stored.clone();
+        corrupt.finding_opinions[0].finding_fingerprint = "f".repeat(64);
+        assert!(corrupt.validate().is_err());
+        let mut corrupt = source;
+        corrupt.finding_opinions.push(opinion);
+        assert!(corrupt.validate().is_err());
+        assert!(
+            reopened
+                .local_review_history(&"f".repeat(64), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn opinion_source_and_derivation_roll_back_together_at_archive_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(root.path().join("capacity.sqlite3")).unwrap();
+        let mut filler = crate::local_review_history::sample_record();
+        for index in 0..199 {
+            filler.config_fingerprint = format!("{index:064x}");
+            store.save_local_review(&filler).unwrap();
+        }
+        let source = crate::local_review_history::sample_record();
+        let opinion = crate::local_review_history::FindingOpinion {
+            index: 0,
+            finding_fingerprint: crate::local_review_history::finding_fingerprint(
+                source.finding(0).unwrap(),
+            )
+            .unwrap(),
+            input_fingerprint: "a".repeat(64),
+            config_fingerprint: "b".repeat(64),
+            rubric_fingerprint: "c".repeat(64),
+            analysis: crate::evaluation_history::sample_record().analysis,
+        };
+        assert!(store.save_local_finding_opinion(&source, opinion).is_err());
+        let count: i64 = store
+            .connect()
+            .unwrap()
+            .query_row("SELECT count(*) FROM local_review_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 199);
+        let exists: bool = store
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_review_history WHERE id = ?1)",
+                [source.id().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
 
     #[test]
     fn scoped_annotations_preserve_parent_and_branch_across_reopened_connections() {

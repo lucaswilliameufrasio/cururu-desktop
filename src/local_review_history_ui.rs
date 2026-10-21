@@ -309,6 +309,10 @@ fn render_record(record: &LocalReviewRecord, matches: bool) -> gpui::Div {
             decision.assessment.label()
         ));
     }
+    for opinion in &record.finding_opinions {
+        panel = panel.child(format!("ARCHIVED SECOND OPINION · finding #{} · finding {} · input {} · config {} · rubric {}. Historical only; never restores consent or filtering.", opinion.index + 1, opinion.finding_fingerprint, opinion.input_fingerprint, opinion.config_fingerprint, opinion.rubric_fingerprint))
+            .child(crate::render_evaluator_result(&opinion.analysis));
+    }
     for suppressed in &record.suppressed {
         panel = panel.child(format!(
             "SUPPRESSED: {}\n{}",

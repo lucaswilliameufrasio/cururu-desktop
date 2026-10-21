@@ -109,28 +109,7 @@ pub struct EvaluationRecord {
 impl EvaluationRecord {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.anchor.validate()?;
-        for model in [&self.analysis.openai_model, &self.analysis.jev.model] {
-            ensure!(
-                !model.is_empty() && model.len() <= 2_048 && !model.chars().any(char::is_control),
-                "archive model identifier is invalid"
-            );
-        }
-        ensure!(
-            self.analysis.jev.defect_probability.is_finite()
-                && (0.0..=1.0).contains(&self.analysis.jev.defect_probability),
-            "archive probability is invalid"
-        );
-        if let Some(value) = self.analysis.jev.severity_confidence {
-            ensure!(
-                value.is_finite() && (0.0..=1.0).contains(&value),
-                "archive severity confidence is invalid"
-            );
-        }
-        ensure!(
-            self.analysis.jev.severity == "ignore"
-                || cururu_core::Severity::from_name(&self.analysis.jev.severity).is_some(),
-            "archive severity is invalid"
-        );
+        validate_analysis(&self.analysis)?;
         ensure!(
             serde_json::to_vec(self)?.len() <= 64_000,
             "archive record exceeds 64,000 bytes; no text was truncated"
@@ -142,6 +121,36 @@ impl EvaluationRecord {
         self.validate()?;
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
+}
+
+pub fn validate_analysis(analysis: &evaluator::CombinedReviewAnalysis) -> anyhow::Result<()> {
+    for model in [&analysis.openai_model, &analysis.jev.model] {
+        ensure!(
+            !model.is_empty() && model.len() <= 2_048 && !model.chars().any(char::is_control),
+            "archive model identifier is invalid"
+        );
+    }
+    ensure!(
+        analysis.jev.defect_probability.is_finite()
+            && (0.0..=1.0).contains(&analysis.jev.defect_probability),
+        "archive probability is invalid"
+    );
+    if let Some(value) = analysis.jev.severity_confidence {
+        ensure!(
+            value.is_finite() && (0.0..=1.0).contains(&value),
+            "archive severity confidence is invalid"
+        );
+    }
+    ensure!(
+        analysis.jev.severity == "ignore"
+            || cururu_core::Severity::from_name(&analysis.jev.severity).is_some(),
+        "archive severity is invalid"
+    );
+    ensure!(
+        serde_json::to_vec(analysis)?.len() <= 64_000,
+        "archive record exceeds 64,000 bytes; no text was truncated"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

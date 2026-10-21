@@ -67,6 +67,8 @@ impl EvaluatorSecrets {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(Deserialize))]
 pub struct ReviewAnalysisInput {
+    #[serde(default, skip_serializing_if = "AnalysisOrigin::is_github")]
+    pub origin: AnalysisOrigin,
     pub repository_identity: String,
     pub path: String,
     pub line: Option<u32>,
@@ -74,6 +76,19 @@ pub struct ReviewAnalysisInput {
     pub thread_context: Vec<String>,
     pub source_at_comment: String,
     pub current_diff: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnalysisOrigin {
+    #[default]
+    GitHub,
+    LocalCheckout,
+}
+
+impl AnalysisOrigin {
+    const fn is_github(&self) -> bool {
+        matches!(self, Self::GitHub)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -392,6 +407,8 @@ fn jev_questions() -> serde_json::Value {
 
 #[derive(Serialize)]
 struct BoundedInput {
+    #[serde(skip_serializing_if = "AnalysisOrigin::is_github")]
+    origin: AnalysisOrigin,
     repository_identity: String,
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -403,10 +420,19 @@ struct BoundedInput {
 
 impl BoundedInput {
     fn new(input: &ReviewAnalysisInput) -> anyhow::Result<Self> {
-        ensure!(
-            safe_repository_identity(&input.repository_identity),
-            "review analysis requires a GitHub owner/repository"
-        );
+        match input.origin {
+            AnalysisOrigin::GitHub => ensure!(
+                safe_repository_identity(&input.repository_identity),
+                "review analysis requires a GitHub owner/repository"
+            ),
+            AnalysisOrigin::LocalCheckout => {
+                let key = input
+                    .repository_identity
+                    .strip_prefix("local/")
+                    .context("local analysis requires a checkout scope hash")?;
+                crate::local_review_history::validate_hash(key)?;
+            }
+        }
         ensure!(
             safe_repository_path(&input.path),
             "review analysis requires a safe repository-relative path"
@@ -427,12 +453,19 @@ impl BoundedInput {
             );
             thread_context.push(bounded);
         }
-        let evidence_input = format!(
-            "Source at comment commit:\n{}\n\nCurrent pull request diff:\n{}",
-            input.source_at_comment, input.current_diff
-        );
+        let evidence_input = match input.origin {
+            AnalysisOrigin::GitHub => format!(
+                "Source at comment commit:\n{}\n\nCurrent pull request diff:\n{}",
+                input.source_at_comment, input.current_diff
+            ),
+            AnalysisOrigin::LocalCheckout => format!(
+                "Local finding evidence; no source snapshot or thread was collected:\n{}\n\nCurrent local worktree diff:\n{}",
+                input.source_at_comment, input.current_diff
+            ),
+        };
         let evidence = bounded_text(&evidence_input, MAX_EVIDENCE_CHARS)?;
         Ok(Self {
+            origin: input.origin.clone(),
             repository_identity: input.repository_identity.to_ascii_lowercase(),
             path: input.path.clone(),
             line: input.line,
@@ -819,6 +852,7 @@ mod tests {
 
     fn analysis_input() -> ReviewAnalysisInput {
         ReviewAnalysisInput {
+            origin: super::AnalysisOrigin::GitHub,
             repository_identity: "octo/repo".to_string(),
             path: "src/lib.rs".to_string(),
             line: Some(7),
@@ -892,6 +926,14 @@ mod tests {
 
     #[test]
     fn dual_evaluator_sends_bounded_context_to_both_and_returns_second_opinions() {
+        exercise_successful_dual_evaluation(&analysis_input());
+        let mut local = analysis_input();
+        local.origin = super::AnalysisOrigin::LocalCheckout;
+        local.repository_identity = format!("local/{}", "a".repeat(64));
+        exercise_successful_dual_evaluation(&local);
+    }
+
+    fn exercise_successful_dual_evaluation(input: &ReviewAnalysisInput) {
         futures::executor::block_on(async {
             let explanation = Explanation {
                 claims: vec!["Malformed input may be accepted.".to_string()],
@@ -942,7 +984,7 @@ mod tests {
                 secrets(),
             )
             .unwrap();
-            let analysis = evaluator.analyze(&analysis_input()).await.unwrap();
+            let analysis = evaluator.analyze(input).await.unwrap();
             assert_eq!(analysis.openai_model, "openai-effective-model");
             assert_eq!(analysis.jev.model, "jev-effective-model");
             assert_eq!(analysis.jev.severity, "medium");
@@ -986,6 +1028,38 @@ mod tests {
             }));
             drop(requests);
         });
+    }
+
+    #[test]
+    fn local_origin_keeps_checkout_identity_typed_and_limits_before_either_provider() {
+        let remote = analysis_input();
+        let remote_json = serde_json::to_string(&remote).unwrap();
+        assert!(!remote_json.contains("origin"));
+        let mut local = remote;
+        local.origin = super::AnalysisOrigin::LocalCheckout;
+        local.repository_identity = format!("local/{}", "a".repeat(64));
+        local.source_at_comment.clear();
+        local.thread_context.clear();
+        let bounded = super::BoundedInput::new(&local).unwrap();
+        let data = serde_json::to_string(&bounded).unwrap();
+        assert!(data.contains("LocalCheckout") && data.contains("Current local worktree diff"));
+        assert!(!data.contains("Current pull request diff"));
+        let mut invalid = local.clone();
+        invalid.repository_identity = "octo/repo".to_string();
+        assert!(super::BoundedInput::new(&invalid).is_err());
+        local.current_diff = "x".repeat(8_001);
+        let http = Arc::new(FakeHttpClient {
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let evaluator = DualReviewEvaluator::new(
+            http.clone(),
+            configured_settings("https://openai.example.test/v1/chat/completions"),
+            secrets(),
+        )
+        .unwrap();
+        assert!(futures::executor::block_on(evaluator.analyze(&local)).is_err());
+        assert!(http.requests.lock().unwrap().is_empty());
     }
 
     #[test]
