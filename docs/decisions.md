@@ -1,5 +1,31 @@
 # Desktop architecture decisions
 
+## Local finding second opinions with per-preview consent
+
+Extend the existing dual evaluator to explicitly typed local-checkout inputs,
+without inventing a GitHub repository or changing the remote-thread wire shape.
+The human selects a live provider/static finding (including suppressed provider
+findings), previews the exact serialized finding and bounded changed-file diff,
+then confirms sending to both configured destinations. This confirmation is
+one-shot consent for that checkout, input, rubric and provider configuration;
+it is never inherited from remote authorization or local review consent.
+
+Use no new source-file reads or implicit context transmission. The full selected
+file diff must fit the evaluator's existing evidence budget, otherwise fail
+without silently truncating it. Static/tool prose is an untrusted claim. Reopen
+and validate the live evidence before preview, before keyring/network access,
+after evaluation and before explicit save. Changed selection/settings/revision/
+artifacts discard completion; network failure yields no partial result or retry.
+UI uses a single state enum and no result enables apply, publish or filtering.
+
+Save only on request, deriving an immutable local history snapshot linked to its
+source snapshot. Persist finding ordinal/hash, input/config/rubric fingerprints
+and opinions/usage, never raw evaluator inputs or restored consent. Source and
+derived snapshot insert atomically under existing limits; concurrent choices
+branch and repetition is idempotent. Reuse the remote opinion validator and local
+archive instead of adding a competing database or calibration mechanism. Review
+this boundary if richer context evidence or calibrated filtering is adopted.
+
 ## Explicit inclusion of normalized static evidence in a provider review
 
 Pin principal ba7a259 (ADR 012). A loaded local artifact report is not consent:

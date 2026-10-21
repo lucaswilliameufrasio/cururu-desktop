@@ -277,11 +277,19 @@ pub fn snapshot_for_save(
 }
 
 #[cfg(test)]
+pub fn sample_loaded_report() -> (tempfile::TempDir, RepositorySnapshot, PreparedAnalysis) {
+    let (root, snapshot) = tests::fixture();
+    std::fs::write(root.path().join("artifacts/check.sarif"), tests::sarif(1)).unwrap();
+    let report = load(&snapshot, &discover(&snapshot).unwrap()).unwrap();
+    (root, snapshot, report)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gix::bstr::ByteSlice as _;
 
-    fn fixture() -> (tempfile::TempDir, RepositorySnapshot) {
+    pub(super) fn fixture() -> (tempfile::TempDir, RepositorySnapshot) {
         let root = tempfile::tempdir().unwrap();
         let repo = gix::init(root.path()).unwrap();
         let blob = repo.write_blob(b"before\n").unwrap().detach();
@@ -337,7 +345,7 @@ mod tests {
         .unwrap();
     }
 
-    fn sarif(line: u32) -> String {
+    pub(super) fn sarif(line: u32) -> String {
         serde_json::json!({"runs":[{"tool":{"driver":{"name":"check"}},"results":[{
             "ruleId":"R1","level":"error","message":{"text":"Check boundary"},
             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"file.rs"},"region":{"startLine":line}}}]

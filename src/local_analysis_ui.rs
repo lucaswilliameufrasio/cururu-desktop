@@ -35,6 +35,7 @@ impl ReviewWorkspace {
 
     pub const fn evidence_edits_busy(&self) -> bool {
         self.is_opening_repository
+            || self.local_opinion_state.busy()
             || matches!(self.local_analysis_state, AnalysisState::Loading(_))
             || matches!(
                 self.local_review_state,
@@ -188,6 +189,12 @@ impl ReviewWorkspace {
             let entity = cx.entity();
             let fingerprint = report.fingerprint.clone();
             panel = panel
+                .child(crate::local_finding_opinion_ui::preview_button(
+                    entity.clone(),
+                    crate::local_finding_opinion::Target::Static(index),
+                    format!("opinion-static-{index}"),
+                    busy,
+                ))
                 .child(format!(
                     "{:?} / {:?} · {} · {}:{}\n{}\n{}",
                     finding.source,

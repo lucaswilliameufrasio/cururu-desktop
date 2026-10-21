@@ -1,5 +1,26 @@
 # Cururu Desktop
 
+**Second opinion for a local finding** is available for live provider findings
+(including policy-suppressed findings) and loaded static findings, in Review
+changes or Understand a review. Configure both evaluators in Understand a review,
+select **Preview second opinion**, inspect the exact finding JSON/full selected
+file diff and both destinations, then explicitly confirm sending to BOTH.
+This is one-shot consent for that checkout/finding/configuration, separate from
+GitHub and local-review authorization. Preview never reads the keyring or sends.
+No extra source/context files are collected; the full selected diff must fit the
+existing 8,000-character evidence budget, otherwise the preview fails without
+truncation. Local checkout identity is a typed scope hash, not a fabricated PR.
+
+Both evaluators must succeed within the existing two-minute deadline. Fresh
+checkout/artifact/settings checks bracket the call; stale completions and partial
+failures are discarded without automatic retry. Results are observe-only: no
+filtering, commands, apply or publication. Save explicitly to create an immutable
+local-history source snapshot and linked per-finding opinion, atomically under
+the existing 200-record/64,000-byte limits. Opinion prose may quote private code;
+inspect before saving. Only normalized findings/opinions, usage and fingerprints
+are archived, not full evaluator inputs/context or credentials. Loading history
+never restores a live opinion or consent. Manual assessments are not calibration.
+
 Loaded static evidence is local-only by default. A separate **Include with the
 next AI review** button approves normalized diagnostics/tool claims (up to 64,000
 bytes repeated across at most four chunks), not raw SARIF. Inspect private content

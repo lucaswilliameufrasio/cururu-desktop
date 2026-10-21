@@ -52,6 +52,18 @@ pub struct LocalReviewRecord {
     pub artifacts: Option<ArtifactEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_opinions: Vec<FindingOpinion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingOpinion {
+    pub index: usize,
+    pub finding_fingerprint: String,
+    pub input_fingerprint: String,
+    pub config_fingerprint: String,
+    pub rubric_fingerprint: String,
+    pub analysis: crate::evaluator::CombinedReviewAnalysis,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +150,7 @@ impl LocalReviewRecord {
             fail_on: Some(result.fail_on),
             parent: None,
             finding_decisions: Vec::new(),
+            finding_opinions: Vec::new(),
             artifacts: None,
             analysis_fingerprint: result
                 .analysis
@@ -150,6 +163,7 @@ impl LocalReviewRecord {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_decisions()?;
+        self.validate_opinions()?;
         self.validate_artifacts()?;
         ensure!(
             matches!(self.version, 1..=3),
@@ -295,6 +309,7 @@ impl LocalReviewRecord {
                 status: report.report.status.clone(),
             }),
             analysis_fingerprint: None,
+            finding_opinions: Vec::new(),
         };
         record.validate()?;
         Ok(record)
@@ -336,9 +351,15 @@ impl LocalReviewRecord {
     }
 
     fn validate_decisions(&self) -> anyhow::Result<()> {
-        if self.version == 1 || (self.version == 3 && self.finding_decisions.is_empty()) {
+        if self.version == 1
+            || (self.version == 3
+                && self.finding_decisions.is_empty()
+                && self.finding_opinions.is_empty())
+        {
             ensure!(
-                self.parent.is_none() && self.finding_decisions.is_empty(),
+                self.parent.is_none()
+                    && self.finding_decisions.is_empty()
+                    && self.finding_opinions.is_empty(),
                 "legacy local history cannot contain finding decisions"
             );
         } else {
@@ -348,7 +369,8 @@ impl LocalReviewRecord {
                     .ok_or_else(|| anyhow::anyhow!("annotated local history requires a parent"))?,
             )?;
             ensure!(
-                !self.finding_decisions.is_empty() && self.finding_decisions.len() <= 100,
+                (!self.finding_decisions.is_empty() || !self.finding_opinions.is_empty())
+                    && self.finding_decisions.len() <= 100,
                 "local finding decision count is invalid"
             );
         }
@@ -368,6 +390,55 @@ impl LocalReviewRecord {
             prior = Some(decision.index);
         }
         Ok(())
+    }
+
+    fn validate_opinions(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.finding_opinions.len() <= 100,
+            "too many saved finding opinions"
+        );
+        let mut prior = None;
+        for opinion in &self.finding_opinions {
+            let finding = self
+                .finding(opinion.index)
+                .ok_or_else(|| anyhow::anyhow!("opinion target is absent"))?;
+            ensure!(
+                prior.is_none_or(|index| index < opinion.index),
+                "finding opinions must be unique and sorted"
+            );
+            ensure!(
+                finding_fingerprint(finding)? == opinion.finding_fingerprint,
+                "opinion target fingerprint changed"
+            );
+            for hash in [
+                &opinion.input_fingerprint,
+                &opinion.config_fingerprint,
+                &opinion.rubric_fingerprint,
+            ] {
+                validate_hash(hash)?;
+            }
+            crate::evaluation_history::validate_analysis(&opinion.analysis)?;
+            prior = Some(opinion.index);
+        }
+        Ok(())
+    }
+
+    pub fn with_opinion(&self, opinion: FindingOpinion) -> anyhow::Result<Self> {
+        let mut record = self.clone();
+        record.version = if self.artifacts.is_some() { 3 } else { 2 };
+        record.parent = Some(self.id()?);
+        if let Some(existing) = record
+            .finding_opinions
+            .iter_mut()
+            .find(|existing| existing.index == opinion.index)
+        {
+            *existing = opinion;
+        } else {
+            record.finding_opinions.push(opinion);
+            record.finding_opinions.sort_by_key(|opinion| opinion.index);
+        }
+        record.validate()?;
+        Ok(record)
     }
 
     pub fn with_decision(&self, index: usize, assessment: HumanAssessment) -> anyhow::Result<Self> {
@@ -449,6 +520,7 @@ pub fn sample_record() -> LocalReviewRecord {
         finding_decisions: Vec::new(),
         artifacts: None,
         analysis_fingerprint: None,
+        finding_opinions: Vec::new(),
     }
 }
 
