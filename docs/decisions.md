@@ -803,6 +803,28 @@ Windows, macOS Intel, and Linux packages beyond AppImage remain out of this
 initial matrix. CI packaging is validation-only: no signing, artifact upload,
 release, deployment, or publication is configured or authorized.
 
+## Local Linux ARM64 cross-build with Zig
+
+- **Status:** Accepted
+- **Date:** 2026-10-21
+
+Provide an opt-in local x86_64 Linux cross-build of the ARM64 executable using
+the pinned `cargo-zigbuild` and Zig versions. Use a Debian 12 ARM64 sysroot for
+the GPUI system dependencies and a glibc 2.36 target. The sysroot may be prepared
+by a verified local rootless Docker daemon running an amd64 container; that
+container only downloads/extracts foreign-architecture development packages.
+The Rust application is compiled on the host by `cargo zigbuild`; no Buildx,
+QEMU, or execution of target binaries is involved. Keep the CI architecture
+matrix native as the independent packaging/runtime validation path.
+
+The local helper produces only the cross-compiled ELF executable. The selected
+`cargo-packager` AppImage implementation invokes architecture-specific
+linuxdeploy tools and documents that cross-platform AppImage packaging is not
+supported, so do not add QEMU to make local packaging appear successful. Build
+ARM64 AppImages on the native ARM64 runner. Revisit if the packager gains a
+supported off-target AppImage workflow or the desktop's system-library set
+changes.
+
 ## Rust toolchain
 
 - **Status:** Accepted

@@ -60,6 +60,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check local cross-build helper syntax
+        run: bash -n scripts/build-linux-arm64.sh
+
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
