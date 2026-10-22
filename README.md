@@ -359,3 +359,22 @@ packages. Packaging is validation-only: CI does not sign, upload, or publish
 these files. Native CI validated all three packaging targets in run
 `38737417983`, including the macOS Seatbelt tests; runtime and visual validation
 remain separate proof items.
+
+### Local Linux ARM64 cross-build
+
+On an x86_64 Linux host, install the pinned Rust/Zig tools with `mise install`,
+then run:
+
+```sh
+bash scripts/build-linux-arm64.sh
+```
+
+This uses `cargo zigbuild` to produce the ARM64 executable at
+`target/aarch64-unknown-linux-gnu/release/cururu-desktop`. A verified local
+rootless Docker daemon runs a pinned native x86_64 Debian container only to
+assemble the ARM64 development-library sysroot; the application is never built
+in a container. The helper never invokes Buildx and refuses remote daemons or
+emulation.
+This local path builds the executable, not an ARM64 AppImage: `cargo-packager`
+uses target-architecture linuxdeploy tools that cannot be run cross-platform.
+AppImage packaging therefore remains on the native ARM64 CI runner.
