@@ -606,12 +606,13 @@ that store is unavailable, fail closed rather than writing credentials to
 SQLite or plaintext. The public GitHub App client ID is runtime/build
 configuration and is not a secret.
 
-Request only `Contents: read` and `Pull requests: read/write` for the approved
-remote review capabilities; users still need the corresponding repository
-access. Publishing remains a separate, explicit confirmation and is never
-triggered by login or switching review modes. An optional `gh` fallback may be
-used only after the user chooses it; do not copy its token into Cururu storage
-or expose it in logs/output.
+Request only repository `Contents: read/write` and `Pull requests: read/write`
+for the approved desktop capabilities, including remote commit creation and
+confirmed publication; users still need the corresponding repository access.
+Publishing and each commit/ref update remain separate, explicit confirmations
+and are never triggered by login or switching review modes. An optional `gh`
+fallback may be used only after the user chooses it; do not copy its token into
+Cururu storage or expose it in logs/output.
 
 GitHub's current documentation states that device flow can be used by desktop
 applications; GitHub App user tokens can be bounded by app permissions and
@@ -832,3 +833,75 @@ changes.
 
 Set the desktop's minimum supported Rust version to 1.99 and pin CI to Rust
 1.99.0, matching the toolchain used for ongoing Cururu desktop development.
+
+## Request-changes reviews, locally consented recommendations, and native remote commits
+
+- **Status:** Accepted for implementation
+- **Date:** 2026-10-21
+- **Source:** User-confirmed continuation of the original Cururu Desktop plan
+
+This decision supersedes the earlier exclusions of `REQUEST_CHANGES`, locally
+consented recommendations, and native remote commit creation where they
+conflict. It does not authorize live GitHub writes during implementation or
+tests, and does not authorize PRs, issues, releases, deployments, or artifact or
+crate publication.
+
+### GitHub `REQUEST_CHANGES`
+
+Add `REQUEST_CHANGES` as an explicit review event alongside the existing
+`COMMENT` event. A request-changes review may stand alone or include zero or
+more queued inline comments. Require a non-empty user-authored summary, display
+the exact event, PR/base/head identities, summary, and selected comments in a
+preview, and require a separate confirmation. Revalidate the open PR, exact
+base/head SHAs, and every selected inline anchor immediately before one
+non-retried request. Preserve queued comments on errors and require refresh
+after an uncertain outcome. Do not infer vote intent from repository content,
+preferences, or comment text.
+
+### Repository recommendation hint and local consent
+
+Accept `review.recommendations = true` as a repository hint that makes the
+recommendation capability available, but never as authorization to make an
+additional provider request. An additional recommendation request is allowed
+only after the user explicitly previews and confirms that individual operation
+locally. Consent is one-shot, bound to the exact eligible truncation condition,
+provider configuration, and displayed request; it is not stored, inherited
+from GitHub authorization, or restored from history. No automatic request is
+made after a review failure. Keep provider credentials, runtime choices, and
+consent host-owned; `cururu-core` remains domain-only.
+
+### Native remote commit and branch update
+
+Support explicit per-file selection from either a validated local checkout diff
+or validated GitHub suggestion data. Preview the exact parent SHA, branch/PR
+identity, selected paths, and resulting file changes. Never modify the local
+checkout, stage files, or create a local commit as part of this flow. First,
+after a distinct confirmation, create GitHub Git Database blob/tree/commit
+objects against the exact reviewed parent; this leaves the branch reference
+unchanged. Then require a separate preview and confirmation before updating the
+branch reference, revalidating the expected parent and refusing non-fast-forward
+or changed-ref updates. Do not automatically retry an uncertain mutation.
+Apply existing safe path/content bounds and fail closed for unsupported file
+types or ambiguous patch composition. Tests use a local HTTP fixture and assert
+that no request reaches GitHub; the application flow is not exercised against a
+live repository without further explicit authorization.
+
+The desktop repository does not contain or manage a GitHub App registration.
+Any App used for native remote commits must be registered with Device Flow,
+repository `Contents: read/write`, and `Pull requests: read/write`, then installed
+and approved for the intended repositories. The client sends the
+`offline_access` Device Flow scope; that scope does not grant repository
+permissions. App registration, installation approval, and real OAuth validation
+remain external prerequisites. Do not change the GitHub Actions workflow's
+separate `contents: read` token permission to configure the desktop App.
+
+### Evaluation evidence and rollout
+
+Create an initial versioned, labeled, reproducible benchmark from repository
+fixtures and clearly marked synthetic cases. Keep those results distinct from
+real-world evidence and report dataset composition and limitations. This
+benchmark is preparation for calibration, not proof of production quality:
+evaluator filtering remains disabled until representative real examples,
+approved metrics/thresholds, and rollout criteria have been reviewed. Visual and
+runtime interaction checks and real GitHub OAuth remain user-owned external
+validation.

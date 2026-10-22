@@ -19,6 +19,9 @@ const MAX_REMOTE_DIFF_BYTES: usize = 180_000;
 const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024;
 const MAX_THREAD_REPLY_BYTES: usize = 10_000;
 const MAX_MUTATION_RESPONSE_BYTES: usize = 64_000;
+pub(crate) const MAX_REMOTE_COMMIT_FILES: usize = 100;
+pub(crate) const MAX_REMOTE_COMMIT_FILE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_REMOTE_COMMIT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PullRequestRef {
@@ -111,11 +114,38 @@ pub struct NewReviewComment {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewEvent {
+    #[default]
+    Comment,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    const fn api_value(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     pub reference: PullRequestRef,
     pub base_sha: String,
     pub head_sha: String,
+    #[serde(default)]
+    pub event: ReviewEvent,
     pub body: String,
     pub comments: Vec<NewReviewComment>,
 }
@@ -129,6 +159,10 @@ pub fn validate_saved_review(review: &PendingReview) -> anyhow::Result<()> {
     ensure!(
         valid_commit_sha(&review.base_sha) && valid_commit_sha(&review.head_sha),
         "saved review has invalid commit identifiers"
+    );
+    ensure!(
+        review.event == ReviewEvent::Comment,
+        "saved comment drafts cannot persist a review vote"
     );
     if !review.body.is_empty() {
         validate_thread_reply_body(&review.body)?;
@@ -180,6 +214,46 @@ pub fn validate_review_comments(
     Ok(())
 }
 
+fn validate_review_metadata(
+    event: ReviewEvent,
+    body: &str,
+    comments: &[NewReviewComment],
+) -> anyhow::Result<()> {
+    validate_thread_reply_body(body)?;
+    ensure!(
+        comments.len() <= 50,
+        "a review supports at most 50 inline comments"
+    );
+    ensure!(
+        event == ReviewEvent::RequestChanges || !comments.is_empty(),
+        "a COMMENT review requires at least one inline comment"
+    );
+    let mut total_bytes = 0_usize;
+    for comment in comments {
+        validate_relative_path(&comment.path)?;
+        validate_thread_reply_body(&comment.body)?;
+        total_bytes = total_bytes.saturating_add(comment.body.len());
+    }
+    ensure!(
+        total_bytes <= 64_000,
+        "review comments exceed the aggregate limit"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_review_submission(
+    event: ReviewEvent,
+    files: &[cururu_core::ChangedFile],
+    body: &str,
+    comments: &[NewReviewComment],
+) -> anyhow::Result<()> {
+    validate_review_metadata(event, body, comments)?;
+    if !comments.is_empty() {
+        validate_review_comments(files, comments)?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct CreateReviewRequest<'a> {
     commit_id: &'a str,
@@ -196,6 +270,50 @@ struct CreateReviewComment<'a> {
     body: &'a str,
 }
 
+#[derive(Serialize)]
+struct CreateGitTreeRequest<'a> {
+    base_tree: &'a str,
+    tree: Vec<CreateGitTreeEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct CreateGitTreeEntry<'a> {
+    path: &'a str,
+    mode: &'a str,
+    #[serde(rename = "type")]
+    object_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "GitTreeEntrySha::is_omitted")]
+    sha: GitTreeEntrySha<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum GitTreeEntrySha<'a> {
+    Omitted,
+    Null(Option<&'a str>),
+}
+
+impl GitTreeEntrySha<'_> {
+    const fn is_omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+}
+
+#[derive(Serialize)]
+struct CreateGitCommitRequest<'a> {
+    message: &'a str,
+    tree: &'a str,
+    parents: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct UpdateGitReferenceRequest<'a> {
+    sha: &'a str,
+    force: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestSnapshot {
     pub reference: PullRequestRef,
@@ -205,10 +323,83 @@ pub struct PullRequestSnapshot {
     pub html_url: String,
     pub base_sha: String,
     pub head_sha: String,
+    pub head_repository: Option<GitHubRepositoryRef>,
+    pub head_branch: Option<String>,
     pub files: Vec<cururu_core::ChangedFile>,
     pub reviews: Vec<PullRequestReview>,
     pub review_threads: Vec<PullRequestReviewThread>,
     pub conversation_comments: Vec<PullRequestConversationComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRepositoryRef {
+    pub owner: String,
+    pub repository: String,
+}
+
+impl GitHubRepositoryRef {
+    pub fn parse_full_name(value: &str) -> anyhow::Result<Self> {
+        let (owner, repository) = value
+            .split_once('/')
+            .context("GitHub repository identity must be owner/repository")?;
+        ensure!(
+            valid_segment(owner) && valid_segment(repository) && !repository.contains('/'),
+            "GitHub repository identity is invalid"
+        );
+        Ok(Self {
+            owner: owner.to_string(),
+            repository: repository.to_string(),
+        })
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            valid_segment(&self.owner) && valid_segment(&self.repository),
+            "GitHub repository identity is invalid"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubCommitFile {
+    pub path: String,
+    pub mode: String,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCommitRequest {
+    pub reference: PullRequestRef,
+    pub repository: GitHubRepositoryRef,
+    pub branch: String,
+    pub base_sha: String,
+    pub parent_sha: String,
+    pub message: String,
+    pub files: Vec<GitHubCommitFile>,
+    pub expected_suggestions: Vec<PullRequestComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubCommitObject {
+    pub reference: PullRequestRef,
+    pub repository: GitHubRepositoryRef,
+    pub branch: String,
+    pub base_sha: String,
+    pub parent_sha: String,
+    pub commit_sha: String,
+    pub message: String,
+    pub html_url: String,
+    pub files: Vec<GitHubCommitFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubBranchUpdate {
+    pub reference: PullRequestRef,
+    pub repository: GitHubRepositoryRef,
+    pub branch: String,
+    pub previous_sha: String,
+    pub commit_sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +522,12 @@ impl GitHubPullRequestClient {
         let remote_conversation: Vec<PullRequestConversationResponse> =
             self.get_all_pages(&conversation_path).await?;
         let conversation_comments = parse_pull_request_conversation(remote_conversation)?;
+        let head_repository = pull_request
+            .head
+            .repository
+            .as_ref()
+            .map(|repository| GitHubRepositoryRef::parse_full_name(&repository.full_name))
+            .transpose()?;
 
         Ok(PullRequestSnapshot {
             reference,
@@ -342,6 +539,8 @@ impl GitHubPullRequestClient {
             html_url: pull_request.html_url,
             base_sha: pull_request.base.sha,
             head_sha: pull_request.head.sha,
+            head_repository,
+            head_branch: pull_request.head.reference,
             files,
             reviews,
             review_threads: group_review_threads(comments),
@@ -478,27 +677,31 @@ impl GitHubPullRequestClient {
         body: &str,
         comments: &[NewReviewComment],
     ) -> anyhow::Result<PullRequestReview> {
+        self.publish_review(
+            reference,
+            expected_base_sha,
+            expected_head_sha,
+            ReviewEvent::Comment,
+            body,
+            comments,
+        )
+        .await
+    }
+
+    pub async fn publish_review(
+        &self,
+        reference: &PullRequestRef,
+        expected_base_sha: &str,
+        expected_head_sha: &str,
+        event: ReviewEvent,
+        body: &str,
+        comments: &[NewReviewComment],
+    ) -> anyhow::Result<PullRequestReview> {
         validate_pull_request_reference(reference)?;
-        validate_thread_reply_body(body)?;
+        validate_review_metadata(event, body, comments)?;
         ensure!(
             valid_commit_sha(expected_base_sha) && valid_commit_sha(expected_head_sha),
             "the confirmed review has invalid commit identifiers"
-        );
-        // Validate sizes and paths before making any remote request. Anchors are
-        // checked against freshly loaded files, never against user input alone.
-        ensure!(
-            !comments.is_empty() && comments.len() <= 50,
-            "a review requires 1 to 50 inline comments"
-        );
-        let mut total_bytes = 0_usize;
-        for comment in comments {
-            validate_relative_path(&comment.path)?;
-            validate_thread_reply_body(&comment.body)?;
-            total_bytes = total_bytes.saturating_add(comment.body.len());
-        }
-        ensure!(
-            total_bytes <= 64_000,
-            "review comments exceed the aggregate limit"
         );
         let current = self.load_pull_request(reference.clone()).await?;
         ensure!(
@@ -509,7 +712,7 @@ impl GitHubPullRequestClient {
             current.head_sha == expected_head_sha && current.base_sha == expected_base_sha,
             "the pull request base or head changed; refresh and preview again"
         );
-        validate_review_comments(&current.files, comments)?;
+        validate_review_submission(event, &current.files, body, comments)?;
         for comment in comments {
             ensure!(
                 !current.review_threads.iter().any(|thread| {
@@ -523,21 +726,22 @@ impl GitHubPullRequestClient {
                 "an identical comment already exists at this anchor; refresh before publishing"
             );
         }
-        self.send_comment_review(reference, expected_head_sha, body, comments)
+        self.send_review(reference, expected_head_sha, event, body, comments)
             .await
     }
 
-    async fn send_comment_review(
+    async fn send_review(
         &self,
         reference: &PullRequestRef,
         head_sha: &str,
+        event: ReviewEvent,
         summary: &str,
         comments: &[NewReviewComment],
     ) -> anyhow::Result<PullRequestReview> {
         let body = serde_json::to_string(&CreateReviewRequest {
             commit_id: head_sha,
             body: summary,
-            event: "COMMENT",
+            event: event.api_value(),
             comments: comments
                 .iter()
                 .map(|comment| CreateReviewComment {
@@ -588,11 +792,297 @@ impl GitHubPullRequestClient {
         ensure!(
             review.id > 0
                 && review.body == summary
-                && review.state == "COMMENTED"
+                && review.state
+                    == match event {
+                        ReviewEvent::Comment => "COMMENTED",
+                        ReviewEvent::RequestChanges => "CHANGES_REQUESTED",
+                    }
                 && review.commit_id.as_deref() == Some(head_sha),
             "GitHub returned a different review; refresh before retrying"
         );
         Ok(review)
+    }
+
+    pub async fn create_remote_commit_object(
+        &self,
+        request: &RemoteCommitRequest,
+    ) -> anyhow::Result<GitHubCommitObject> {
+        let RemoteCommitRequest {
+            reference,
+            repository,
+            branch,
+            base_sha,
+            parent_sha,
+            message,
+            files,
+            expected_suggestions,
+        } = request;
+        validate_remote_commit_target(reference, repository, branch, base_sha, parent_sha)?;
+        validate_commit_message(message)?;
+        validate_commit_files(files)?;
+
+        let current = self.load_pull_request(reference.clone()).await?;
+        ensure!(
+            current.state == "open"
+                && current.base_sha == *base_sha
+                && current.head_sha == *parent_sha,
+            "pull request base/head changed; refresh and preview the commit again"
+        );
+        ensure!(
+            current.head_repository.as_ref() == Some(repository)
+                && current.head_branch.as_deref() == Some(branch.as_str()),
+            "pull request source repository or branch changed; refresh and preview again"
+        );
+        for expected_suggestion in expected_suggestions {
+            let line = crate::remote_suggestion::validate_comment(&current, expected_suggestion)?;
+            let source = self
+                .load_repository_file(
+                    &repository.owner,
+                    &repository.repository,
+                    &expected_suggestion.path,
+                    parent_sha,
+                    MAX_SOURCE_FILE_BYTES,
+                )
+                .await
+                .context("could not revalidate GitHub suggestion source at the reviewed head")?;
+            let replacement =
+                crate::remote_suggestion::parse_suggestion(&expected_suggestion.body)?;
+            let expected_content = crate::suggested_change::remote_suggestion_content(
+                &source.content,
+                line,
+                &replacement,
+            )?;
+            let selected_file = files
+                .iter()
+                .find(|file| file.path == expected_suggestion.path)
+                .context("selected suggestion file is missing from the remote commit preview")?;
+            ensure!(
+                selected_file.content.as_deref() == Some(expected_content.as_str()),
+                "selected suggestion content differs from the exact suggestion at the reviewed head"
+            );
+        }
+
+        let (parent_tree_sha, parent_tree) =
+            self.load_remote_parent_tree(repository, parent_sha).await?;
+        validate_commit_files_against_tree(files, &parent_tree)?;
+        let mut sorted_files = files.clone();
+        sorted_files.sort_by(|left, right| left.path.cmp(&right.path));
+        let tree_sha = self
+            .create_remote_tree(repository, &parent_tree_sha, &sorted_files)
+            .await?;
+        let commit_response = self
+            .create_remote_git_commit(repository, message, &tree_sha, parent_sha)
+            .await?;
+        ensure!(
+            valid_commit_sha(&commit_response.sha)
+                && commit_response.parents.len() == 1
+                && commit_response.parents[0].sha == *parent_sha
+                && safe_web_url(&commit_response.html_url),
+            "GitHub returned a commit that does not match the confirmed parent"
+        );
+        Ok(GitHubCommitObject {
+            reference: reference.clone(),
+            repository: repository.clone(),
+            branch: branch.clone(),
+            base_sha: base_sha.clone(),
+            parent_sha: parent_sha.clone(),
+            commit_sha: commit_response.sha,
+            message: message.clone(),
+            html_url: commit_response.html_url,
+            files: sorted_files,
+        })
+    }
+
+    async fn load_remote_parent_tree(
+        &self,
+        repository: &GitHubRepositoryRef,
+        parent_sha: &str,
+    ) -> anyhow::Result<(String, Vec<GitHubTreeEntryResponse>)> {
+        let parent_commit: GitHubCommitDetailsResponse = self
+            .get_json(&format!(
+                "{API_ROOT}/repos/{}/{}/git/commits/{parent_sha}",
+                repository.owner, repository.repository
+            ))
+            .await
+            .context("could not load the reviewed GitHub commit tree")?;
+        ensure!(
+            parent_commit.sha == parent_sha && valid_commit_sha(&parent_commit.tree.sha),
+            "GitHub returned a different reviewed commit or an invalid tree"
+        );
+        let parent_tree: GitHubTreeDetailsResponse = self
+            .get_json(&format!(
+                "{API_ROOT}/repos/{}/{}/git/trees/{}?recursive=1",
+                repository.owner, repository.repository, parent_commit.tree.sha
+            ))
+            .await
+            .context("could not inspect the reviewed GitHub tree")?;
+        ensure!(
+            parent_tree.sha == parent_commit.tree.sha && !parent_tree.truncated,
+            "reviewed GitHub tree is truncated or does not match the parent"
+        );
+        Ok((parent_commit.tree.sha, parent_tree.tree))
+    }
+
+    async fn create_remote_tree(
+        &self,
+        repository: &GitHubRepositoryRef,
+        base_tree: &str,
+        files: &[GitHubCommitFile],
+    ) -> anyhow::Result<String> {
+        let tree = CreateGitTreeRequest {
+            base_tree,
+            tree: files
+                .iter()
+                .map(|file| CreateGitTreeEntry {
+                    path: &file.path,
+                    mode: &file.mode,
+                    object_type: "blob",
+                    content: file.content.as_deref(),
+                    sha: if file.content.is_none() {
+                        GitTreeEntrySha::Null(None)
+                    } else {
+                        GitTreeEntrySha::Omitted
+                    },
+                })
+                .collect(),
+        };
+        let body = serde_json::to_vec(&tree)?;
+        ensure!(
+            body.len() <= MAX_REMOTE_COMMIT_BYTES + 128 * 1024,
+            "remote commit tree request exceeds the size limit"
+        );
+        let response: GitHubTreeResponse = self
+            .send_mutation_json(
+                Method::POST,
+                &format!(
+                    "{API_ROOT}/repos/{}/{}/git/trees",
+                    repository.owner, repository.repository
+                ),
+                body,
+                StatusCode::CREATED,
+                "GitHub did not confirm tree creation; refresh before deciding whether to retry",
+            )
+            .await?;
+        ensure!(
+            valid_commit_sha(&response.sha),
+            "GitHub returned an invalid created tree identifier"
+        );
+        Ok(response.sha)
+    }
+
+    async fn create_remote_git_commit(
+        &self,
+        repository: &GitHubRepositoryRef,
+        message: &str,
+        tree_sha: &str,
+        parent_sha: &str,
+    ) -> anyhow::Result<GitHubCommitResponse> {
+        let request = CreateGitCommitRequest {
+            message,
+            tree: tree_sha,
+            parents: vec![parent_sha],
+        };
+        self.send_mutation_json(
+            Method::POST,
+            &format!(
+                "{API_ROOT}/repos/{}/{}/git/commits",
+                repository.owner, repository.repository
+            ),
+            serde_json::to_vec(&request)?,
+            StatusCode::CREATED,
+            "GitHub did not confirm commit creation; refresh before deciding whether to retry",
+        )
+        .await
+    }
+
+    pub async fn update_remote_branch(
+        &self,
+        commit: &GitHubCommitObject,
+    ) -> anyhow::Result<GitHubBranchUpdate> {
+        validate_remote_commit_target(
+            &commit.reference,
+            &commit.repository,
+            &commit.branch,
+            &commit.base_sha,
+            &commit.parent_sha,
+        )?;
+        validate_commit_message(&commit.message)?;
+        validate_commit_files(&commit.files)?;
+        ensure!(
+            valid_commit_sha(&commit.commit_sha) && safe_web_url(&commit.html_url),
+            "created remote commit identity is invalid"
+        );
+
+        let current = self.load_pull_request(commit.reference.clone()).await?;
+        ensure!(
+            current.state == "open"
+                && current.base_sha == commit.base_sha
+                && current.head_sha == commit.parent_sha
+                && current.head_repository.as_ref() == Some(&commit.repository)
+                && current.head_branch.as_deref() == Some(commit.branch.as_str()),
+            "pull request changed after commit creation; refresh before updating its branch"
+        );
+
+        let created_commit: GitHubCommitDetailsResponse = self
+            .get_json(&format!(
+                "{API_ROOT}/repos/{}/{}/git/commits/{}",
+                commit.repository.owner, commit.repository.repository, commit.commit_sha
+            ))
+            .await
+            .context("could not revalidate the created commit object")?;
+        ensure!(
+            created_commit.sha == commit.commit_sha
+                && created_commit.parents.len() == 1
+                && created_commit.parents[0].sha == commit.parent_sha,
+            "created commit no longer has the confirmed parent; branch was not updated"
+        );
+
+        let reference_url = format!(
+            "{API_ROOT}/repos/{}/{}/git/ref/heads/{}",
+            commit.repository.owner, commit.repository.repository, commit.branch
+        );
+        let reference_response: GitHubReferenceResponse = self
+            .get_json(&reference_url)
+            .await
+            .context("could not revalidate the remote branch before update")?;
+        ensure!(
+            reference_response.reference == format!("refs/heads/{}", commit.branch)
+                && reference_response.object.object_type == "commit"
+                && reference_response.object.sha == commit.parent_sha,
+            "remote branch no longer points to the reviewed parent; refresh before updating"
+        );
+
+        let update_request = UpdateGitReferenceRequest {
+            sha: &commit.commit_sha,
+            force: false,
+        };
+        let update_body = serde_json::to_vec(&update_request)?;
+        let update_url = format!(
+            "{API_ROOT}/repos/{}/{}/git/refs/heads/{}",
+            commit.repository.owner, commit.repository.repository, commit.branch
+        );
+        let updated: GitHubReferenceResponse = self
+            .send_mutation_json(
+                Method::PATCH,
+                &update_url,
+                update_body,
+                StatusCode::OK,
+                "GitHub did not confirm the branch update; refresh before deciding whether to retry",
+            )
+            .await?;
+        ensure!(
+            updated.reference == format!("refs/heads/{}", commit.branch)
+                && updated.object.object_type == "commit"
+                && updated.object.sha == commit.commit_sha,
+            "GitHub returned a different branch update; refresh before retrying"
+        );
+        Ok(GitHubBranchUpdate {
+            reference: commit.reference.clone(),
+            repository: commit.repository.clone(),
+            branch: commit.branch.clone(),
+            previous_sha: commit.parent_sha.clone(),
+            commit_sha: commit.commit_sha.clone(),
+        })
     }
 
     async fn revalidate_thread_reply_target(
@@ -762,6 +1252,60 @@ impl GitHubPullRequestClient {
         serde_json::from_slice(&body).context("GitHub returned an invalid pull request response")
     }
 
+    async fn send_mutation_json<T>(
+        &self,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+        expected_status: StatusCode,
+        uncertain_context: &'static str,
+    ) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let parsed = Url::parse(url).context("invalid GitHub mutation URL")?;
+        ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("api.github.com")
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.port().is_none(),
+            "GitHub mutation URL is outside the allowed API host"
+        );
+        let request = Request::builder()
+            .method(method)
+            .uri(url)
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header("User-Agent", "Cururu-Desktop")
+            .body(AsyncBody::from(body))
+            .context("could not build GitHub mutation request")?;
+        let response = self.http.send(request).await.context(uncertain_context)?;
+        let (parts, mut response_body) = response.into_parts();
+        ensure!(
+            parts.status == expected_status,
+            "GitHub returned HTTP {} for a mutation; refresh before deciding whether to retry",
+            parts.status
+        );
+        let mut response_bytes = Vec::new();
+        while let Some(frame) = response_body.frame().await {
+            let frame = frame.context("could not read GitHub mutation response")?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            ensure!(
+                response_bytes.len().saturating_add(data.len()) <= MAX_MUTATION_RESPONSE_BYTES,
+                "GitHub mutation response exceeded the size limit; refresh before retrying"
+            );
+            response_bytes.extend_from_slice(&data);
+        }
+        serde_json::from_slice(&response_bytes)
+            .context("GitHub returned an invalid mutation response; refresh before retrying")
+    }
+
     async fn get_page(&self, url: &str) -> anyhow::Result<(Vec<u8>, Option<String>, usize)> {
         let parsed = Url::parse(url).context("invalid GitHub API URL")?;
         ensure!(
@@ -921,12 +1465,171 @@ fn parse_pull_request_files(
 fn validate_relative_path(value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
+            && value.len() <= 4_096
             && !value.chars().any(char::is_control)
+            && !value.contains('\\')
+            && value
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
             && Path::new(value)
                 .components()
                 .all(|component| matches!(component, std::path::Component::Normal(_))),
         "GitHub returned an unsafe changed-file path"
     );
+    Ok(())
+}
+
+fn validate_branch_name(value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 255
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && !value.ends_with('.')
+            && !value.contains("..")
+            && !value.contains("@{")
+            && value.split('/').all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && !part.starts_with('.')
+                    && !Path::new(part)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"))
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            }),
+        "GitHub branch name is invalid or unsupported"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_remote_commit_target(
+    reference: &PullRequestRef,
+    repository: &GitHubRepositoryRef,
+    branch: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> anyhow::Result<()> {
+    validate_pull_request_reference(reference)?;
+    repository.validate()?;
+    validate_branch_name(branch)?;
+    ensure!(
+        valid_commit_sha(base_sha) && valid_commit_sha(head_sha),
+        "remote commit target has invalid base/head identifiers"
+    );
+    Ok(())
+}
+
+fn validate_commit_message(value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.trim().is_empty() && value.len() <= 1_000,
+        "remote commit message must contain 1 to 1,000 bytes"
+    );
+    ensure!(
+        !value.chars().any(|character| {
+            character == '\0'
+                || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        }),
+        "remote commit message contains unsupported control characters"
+    );
+    Ok(())
+}
+
+fn validate_commit_files(files: &[GitHubCommitFile]) -> anyhow::Result<()> {
+    ensure!(
+        !files.is_empty() && files.len() <= MAX_REMOTE_COMMIT_FILES,
+        "remote commit must contain 1 to 100 selected files"
+    );
+    let mut total_bytes = 0_usize;
+    for (index, file) in files.iter().enumerate() {
+        validate_relative_path(&file.path)?;
+        ensure!(
+            matches!(file.mode.as_str(), "100644" | "100755"),
+            "remote commits support only regular, non-symlink files"
+        );
+        if let Some(content) = &file.content {
+            ensure!(
+                !content.contains('\0'),
+                "remote commits do not support binary file content"
+            );
+            ensure!(
+                content.len() <= MAX_REMOTE_COMMIT_FILE_BYTES,
+                "a selected file exceeds the 2 MiB remote commit limit"
+            );
+            total_bytes = total_bytes.saturating_add(content.len());
+            ensure!(
+                total_bytes <= MAX_REMOTE_COMMIT_BYTES,
+                "selected files exceed the 4 MiB remote commit limit"
+            );
+        }
+        ensure!(
+            !files[..index]
+                .iter()
+                .any(|previous| previous.path == file.path),
+            "remote commit contains a duplicate file path"
+        );
+        ensure!(
+            !files[..index].iter().any(|previous| {
+                previous.path.starts_with(&format!("{}/", file.path))
+                    || file.path.starts_with(&format!("{}/", previous.path))
+            }),
+            "remote commit contains conflicting file and directory paths"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_remote_commit_preview(
+    message: &str,
+    files: &[GitHubCommitFile],
+) -> anyhow::Result<()> {
+    validate_commit_message(message)?;
+    validate_commit_files(files)
+}
+
+fn validate_commit_files_against_tree(
+    files: &[GitHubCommitFile],
+    tree: &[GitHubTreeEntryResponse],
+) -> anyhow::Result<()> {
+    for file in files {
+        for entry in tree {
+            let entry_prefix = format!("{}/", entry.path);
+            if file.path.starts_with(&entry_prefix) {
+                ensure!(
+                    entry.kind == "tree" && entry.mode == "040000",
+                    "selected path is nested under a non-directory at the reviewed head"
+                );
+            }
+        }
+        let existing = tree.iter().find(|entry| entry.path == file.path);
+        match (file.content.as_ref(), existing) {
+            (Some(_), Some(entry)) => {
+                ensure!(
+                    entry.kind == "blob"
+                        && matches!(entry.mode.as_str(), "100644" | "100755")
+                        && entry.mode == file.mode
+                        && valid_commit_sha(&entry.sha),
+                    "selected file type or mode changed; refresh before committing"
+                );
+            }
+            (Some(_), None) => {}
+            (None, Some(entry)) => {
+                ensure!(
+                    entry.kind == "blob"
+                        && matches!(entry.mode.as_str(), "100644" | "100755")
+                        && entry.mode == file.mode
+                        && valid_commit_sha(&entry.sha),
+                    "selected deletion no longer matches a regular file at the reviewed head"
+                );
+            }
+            (None, None) => {
+                anyhow::bail!(
+                    "selected deletion no longer exists at the reviewed head; refresh before committing"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1068,6 +1771,75 @@ struct PullRequestResponse {
 #[derive(Deserialize)]
 struct PullRequestCommit {
     sha: String,
+    #[serde(rename = "ref", default)]
+    reference: Option<String>,
+    #[serde(rename = "repo", default)]
+    repository: Option<PullRequestRepository>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestRepository {
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubCommitDetailsResponse {
+    sha: String,
+    tree: GitHubTreeObjectResponse,
+    #[serde(default)]
+    parents: Vec<GitHubCommitParentResponse>,
+}
+
+#[derive(Deserialize)]
+struct GitHubTreeObjectResponse {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubTreeDetailsResponse {
+    sha: String,
+    truncated: bool,
+    tree: Vec<GitHubTreeEntryResponse>,
+}
+
+#[derive(Deserialize)]
+struct GitHubTreeEntryResponse {
+    path: String,
+    mode: String,
+    #[serde(rename = "type")]
+    kind: String,
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubTreeResponse {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubCommitResponse {
+    sha: String,
+    html_url: String,
+    parents: Vec<GitHubCommitParentResponse>,
+}
+
+#[derive(Deserialize)]
+struct GitHubCommitParentResponse {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubReferenceResponse {
+    #[serde(rename = "ref")]
+    reference: String,
+    object: GitHubReferenceObjectResponse,
+}
+
+#[derive(Deserialize)]
+struct GitHubReferenceObjectResponse {
+    sha: String,
+    #[serde(rename = "type")]
+    object_type: String,
 }
 
 #[derive(Deserialize)]
@@ -1141,7 +1913,7 @@ mod tests {
     use http_body_util::BodyExt as _;
 
     use super::{
-        GitHubPullRequestClient, PullRequestRef, group_review_threads, next_page_url,
+        GitHubPullRequestClient, PullRequestRef, ReviewEvent, group_review_threads, next_page_url,
         parse_pull_request_comments, parse_pull_request_files, validate_thread_reply_body,
     };
 
@@ -1255,8 +2027,19 @@ mod tests {
     }
 
     const REVIEW_PR: &str = r#"{"number":42,"title":"Parser review","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"author"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+    const REMOTE_COMMIT_PR: &str = r#"{"number":42,"title":"Parser review","state":"open","html_url":"https://github.com/octo-org/review_repo/pull/42","user":{"login":"author"},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/topic","repo":{"full_name":"octo-org/review_repo"}}}"#;
     const REVIEW_FILES: &str = r#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-before\n+after"}]"#;
     const CREATED_REVIEW: &str = r#"{"id":91,"state":"COMMENTED","body":"Review notes","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/octo-org/review_repo/pull/42#pullrequestreview-91","user":{"login":"reviewer"}}"#;
+    const CREATED_REQUEST_CHANGES_REVIEW: &str = r#"{"id":92,"state":"CHANGES_REQUESTED","body":"Please fix this before merge.","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/octo-org/review_repo/pull/42#pullrequestreview-92","user":{"login":"reviewer"}}"#;
+    const REVIEWED_PARENT_COMMIT: &str = r#"{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tree":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}"#;
+    const REVIEWED_PARENT_TREE: &str = r#"{"sha":"cccccccccccccccccccccccccccccccccccccccc","truncated":false,"tree":[{"path":"src/lib.rs","mode":"100644","type":"blob","sha":"dddddddddddddddddddddddddddddddddddddddd"}]}"#;
+    const CREATED_REMOTE_TREE: &str = r#"{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}"#;
+    const CREATED_REMOTE_COMMIT: &str = r#"{"sha":"ffffffffffffffffffffffffffffffffffffffff","html_url":"https://github.com/octo-org/review_repo/commit/ffffffffffffffffffffffffffffffffffffffff","parents":[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+    const CREATED_REMOTE_COMMIT_DETAILS: &str = r#"{"sha":"ffffffffffffffffffffffffffffffffffffffff","tree":{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"parents":[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+    const REVIEWED_BRANCH_REF: &str = r#"{"ref":"refs/heads/feature/topic","object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"commit"}}"#;
+    const UPDATED_BRANCH_REF: &str = r#"{"ref":"refs/heads/feature/topic","object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}"#;
+    const REMOTE_SUGGESTION_COMMENT: &str = r#"[{"id":7,"path":"src/lib.rs","line":1,"original_line":1,"body":"Please use the checked call.\n```suggestion\nchecked_call()\n```","html_url":"https://github.com/octo-org/review_repo/pull/42#discussion_r7","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","in_reply_to_id":null,"subject_type":"line","side":"RIGHT","user":{"login":"reviewer"}}]"#;
+    const REMOTE_SUGGESTION_SOURCE: &str = r#"{"type":"file","encoding":"base64","size":14,"path":"src/lib.rs","content":"dW5zYWZlX2NhbGwoKQo="}"#;
 
     fn review_comment() -> super::NewReviewComment {
         super::NewReviewComment {
@@ -1270,6 +2053,14 @@ mod tests {
         comments: &'static str,
         post_status: StatusCode,
     ) -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
+        review_client_with_response(comments, post_status, CREATED_REVIEW)
+    }
+
+    fn review_client_with_response(
+        comments: &'static str,
+        post_status: StatusCode,
+        created_review: &'static str,
+    ) -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
         let http = Arc::new(FakeHttpClient {
             responses: Mutex::new(VecDeque::from([
                 response(REVIEW_PR),
@@ -1277,8 +2068,133 @@ mod tests {
                 response(comments),
                 response("[]"),
                 response("[]"),
-                response_with_status(post_status, CREATED_REVIEW),
+                response_with_status(post_status, created_review),
             ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        (
+            GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string()).unwrap(),
+            http,
+        )
+    }
+
+    fn remote_commit_create_client() -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
+        let http = Arc::new(FakeHttpClient {
+            responses: Mutex::new(VecDeque::from([
+                response(REMOTE_COMMIT_PR),
+                response(REVIEW_FILES),
+                response("[]"),
+                response("[]"),
+                response("[]"),
+                response(REVIEWED_PARENT_COMMIT),
+                response(REVIEWED_PARENT_TREE),
+                response_with_status(StatusCode::CREATED, CREATED_REMOTE_TREE),
+                response_with_status(StatusCode::CREATED, CREATED_REMOTE_COMMIT),
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        (
+            GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string()).unwrap(),
+            http,
+        )
+    }
+
+    fn remote_commit_suggestion_client() -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
+        let http = Arc::new(FakeHttpClient {
+            responses: Mutex::new(VecDeque::from([
+                response(REMOTE_COMMIT_PR),
+                response(REVIEW_FILES),
+                response(REMOTE_SUGGESTION_COMMENT),
+                response("[]"),
+                response("[]"),
+                response(REMOTE_SUGGESTION_SOURCE),
+                response(REVIEWED_PARENT_COMMIT),
+                response(REVIEWED_PARENT_TREE),
+                response_with_status(StatusCode::CREATED, CREATED_REMOTE_TREE),
+                response_with_status(StatusCode::CREATED, CREATED_REMOTE_COMMIT),
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        (
+            GitHubPullRequestClient::new(http.clone(), "test-token-not-real".to_string()).unwrap(),
+            http,
+        )
+    }
+
+    fn expected_suggestion() -> super::PullRequestComment {
+        super::PullRequestComment {
+            id: 7,
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: Some(1),
+            body: "Please use the checked call.\n```suggestion\nchecked_call()\n```".to_string(),
+            author: "reviewer".to_string(),
+            html_url: "https://github.com/octo-org/review_repo/pull/42#discussion_r7".to_string(),
+            commit_id: "a".repeat(40),
+            original_commit_id: "a".repeat(40),
+            in_reply_to_id: None,
+            is_outdated: false,
+            subject_type: Some("line".to_string()),
+            side: Some("RIGHT".to_string()),
+        }
+    }
+
+    fn remote_commit_request(
+        base_sha: String,
+        parent_sha: String,
+        files: Vec<super::GitHubCommitFile>,
+        expected_suggestions: Vec<super::PullRequestComment>,
+    ) -> super::RemoteCommitRequest {
+        super::RemoteCommitRequest {
+            reference: PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+            repository: super::GitHubRepositoryRef::parse_full_name("octo-org/review_repo")
+                .unwrap(),
+            branch: "feature/topic".to_string(),
+            base_sha,
+            parent_sha,
+            message: "Apply reviewed changes".to_string(),
+            files,
+            expected_suggestions,
+        }
+    }
+
+    fn remote_commit_object() -> super::GitHubCommitObject {
+        super::GitHubCommitObject {
+            reference: PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+            repository: super::GitHubRepositoryRef::parse_full_name("octo-org/review_repo")
+                .unwrap(),
+            branch: "feature/topic".to_string(),
+            base_sha: "b".repeat(40),
+            parent_sha: "a".repeat(40),
+            commit_sha: "f".repeat(40),
+            message: "Apply reviewed changes".to_string(),
+            html_url: "https://github.com/octo-org/review_repo/commit/ffffffffffffffffffffffffffffffffffffffff".to_string(),
+            files: vec![super::GitHubCommitFile {
+                path: "src/lib.rs".to_string(),
+                mode: "100644".to_string(),
+                content: Some("after\n".to_string()),
+            }],
+        }
+    }
+
+    fn remote_branch_update_client(
+        branch_ref: &'static str,
+        update_ref: Option<&'static str>,
+    ) -> (GitHubPullRequestClient, Arc<FakeHttpClient>) {
+        let mut responses = VecDeque::from([
+            response(REMOTE_COMMIT_PR),
+            response(REVIEW_FILES),
+            response("[]"),
+            response("[]"),
+            response("[]"),
+            response(CREATED_REMOTE_COMMIT_DETAILS),
+            response(branch_ref),
+        ]);
+        if let Some(updated) = update_ref {
+            responses.push_back(response(updated));
+        }
+        let http = Arc::new(FakeHttpClient {
+            responses: Mutex::new(responses),
             requests: Arc::new(Mutex::new(Vec::new())),
         });
         (
@@ -1317,6 +2233,381 @@ mod tests {
             );
             drop(requests);
         });
+    }
+
+    #[test]
+    fn request_changes_can_be_standalone_with_a_required_summary() {
+        futures::executor::block_on(async {
+            let (client, http) =
+                review_client_with_response("[]", StatusCode::OK, CREATED_REQUEST_CHANGES_REVIEW);
+            let reference = PullRequestRef::parse("octo-org/review_repo#42").unwrap();
+            assert!(
+                client
+                    .publish_review(
+                        &reference,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        ReviewEvent::RequestChanges,
+                        "  \n",
+                        &[],
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(http.requests.lock().unwrap().is_empty());
+
+            let review = client
+                .publish_review(
+                    &reference,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ReviewEvent::RequestChanges,
+                    "Please fix this before merge.",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(review.state, "CHANGES_REQUESTED");
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            let post = &requests[5];
+            assert_eq!(post.method, "POST");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&post.body).unwrap(),
+                serde_json::json!({
+                    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "event": "REQUEST_CHANGES",
+                    "body": "Please fix this before merge.",
+                    "comments": []
+                })
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn request_changes_can_include_a_revalidated_inline_comment() {
+        futures::executor::block_on(async {
+            let (client, http) =
+                review_client_with_response("[]", StatusCode::OK, CREATED_REQUEST_CHANGES_REVIEW);
+            client
+                .publish_review(
+                    &PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ReviewEvent::RequestChanges,
+                    "Please fix this before merge.",
+                    &[review_comment()],
+                )
+                .await
+                .unwrap();
+
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[5].body).unwrap(),
+                serde_json::json!({
+                    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "event": "REQUEST_CHANGES",
+                    "body": "Please fix this before merge.",
+                    "comments": [{
+                        "path": "src/lib.rs",
+                        "line": 1,
+                        "side": "RIGHT",
+                        "body": "Please preserve this check."
+                    }]
+                })
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn creating_remote_commit_objects_does_not_update_the_branch_reference() {
+        futures::executor::block_on(async {
+            let (client, http) = remote_commit_create_client();
+            let commit = client
+                .create_remote_commit_object(&remote_commit_request(
+                    "b".repeat(40),
+                    "a".repeat(40),
+                    vec![super::GitHubCommitFile {
+                        path: "src/lib.rs".to_string(),
+                        mode: "100644".to_string(),
+                        content: Some("after\n".to_string()),
+                    }],
+                    Vec::new(),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(commit.commit_sha, "f".repeat(40));
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 9);
+            assert_eq!(requests[5].method, "GET");
+            assert!(
+                requests[5]
+                    .uri
+                    .ends_with("/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            );
+            assert_eq!(requests[6].method, "GET");
+            assert!(
+                requests[6]
+                    .uri
+                    .ends_with("/git/trees/cccccccccccccccccccccccccccccccccccccccc?recursive=1")
+            );
+            assert_eq!(requests[7].method, "POST");
+            assert!(requests[7].uri.ends_with("/git/trees"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[7].body).unwrap(),
+                serde_json::json!({
+                    "base_tree": "cccccccccccccccccccccccccccccccccccccccc",
+                    "tree": [{
+                        "path": "src/lib.rs",
+                        "mode": "100644",
+                        "type": "blob",
+                        "content": "after\n"
+                    }]
+                })
+            );
+            assert_eq!(requests[8].method, "POST");
+            assert!(requests[8].uri.ends_with("/git/commits"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[8].body).unwrap(),
+                serde_json::json!({
+                    "message": "Apply reviewed changes",
+                    "tree": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "parents": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                })
+            );
+            assert!(requests.iter().all(|request| request.method != "PATCH"));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn remote_commit_rejects_stale_parent_before_object_creation() {
+        futures::executor::block_on(async {
+            let (client, http) = remote_commit_create_client();
+            let error = client
+                .create_remote_commit_object(&remote_commit_request(
+                    "b".repeat(40),
+                    "c".repeat(40),
+                    vec![super::GitHubCommitFile {
+                        path: "src/lib.rs".to_string(),
+                        mode: "100644".to_string(),
+                        content: Some("after\n".to_string()),
+                    }],
+                    Vec::new(),
+                ))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("base/head changed"));
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert!(requests.iter().all(|request| request.method == "GET"));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn remote_commit_revalidates_the_exact_github_suggestion_before_creation() {
+        futures::executor::block_on(async {
+            let (client, http) = remote_commit_suggestion_client();
+            client
+                .create_remote_commit_object(&super::RemoteCommitRequest {
+                    reference: PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                    repository: super::GitHubRepositoryRef::parse_full_name("octo-org/review_repo")
+                        .unwrap(),
+                    branch: "feature/topic".to_string(),
+                    base_sha: "b".repeat(40),
+                    parent_sha: "a".repeat(40),
+                    message: "Apply reviewed suggestion".to_string(),
+                    files: vec![super::GitHubCommitFile {
+                        path: "src/lib.rs".to_string(),
+                        mode: "100644".to_string(),
+                        content: Some("checked_call()\n".to_string()),
+                    }],
+                    expected_suggestions: vec![expected_suggestion()],
+                })
+                .await
+                .unwrap();
+
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 10);
+            assert_eq!(requests[5].method, "GET");
+            assert!(requests[5].uri.contains("/contents/src/lib.rs?ref="));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn remote_commit_refuses_a_suggestion_missing_during_fresh_revalidation() {
+        futures::executor::block_on(async {
+            let (client, http) = remote_commit_create_client();
+            assert!(
+                client
+                    .create_remote_commit_object(&remote_commit_request(
+                        "b".repeat(40),
+                        "a".repeat(40),
+                        vec![super::GitHubCommitFile {
+                            path: "src/lib.rs".to_string(),
+                            mode: "100644".to_string(),
+                            content: Some("checked_call()\n".to_string()),
+                        }],
+                        vec![expected_suggestion()],
+                    ),)
+                    .await
+                    .is_err()
+            );
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert!(requests.iter().all(|request| request.method == "GET"));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn remote_commit_refuses_content_that_does_not_match_the_revalidated_suggestion() {
+        futures::executor::block_on(async {
+            let (client, http) = remote_commit_suggestion_client();
+            let request = super::RemoteCommitRequest {
+                reference: PullRequestRef::parse("octo-org/review_repo#42").unwrap(),
+                repository: super::GitHubRepositoryRef::parse_full_name("octo-org/review_repo")
+                    .unwrap(),
+                branch: "feature/topic".to_string(),
+                base_sha: "b".repeat(40),
+                parent_sha: "a".repeat(40),
+                message: "Apply reviewed suggestion".to_string(),
+                files: vec![super::GitHubCommitFile {
+                    path: "src/lib.rs".to_string(),
+                    mode: "100644".to_string(),
+                    content: Some("different_call()\n".to_string()),
+                }],
+                expected_suggestions: vec![expected_suggestion()],
+            };
+
+            assert!(client.create_remote_commit_object(&request).await.is_err());
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            assert!(requests.iter().all(|request| request.method == "GET"));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn branch_update_requires_the_exact_parent_and_uses_non_force_patch() {
+        futures::executor::block_on(async {
+            let (client, http) =
+                remote_branch_update_client(REVIEWED_BRANCH_REF, Some(UPDATED_BRANCH_REF));
+            let result = client
+                .update_remote_branch(&remote_commit_object())
+                .await
+                .unwrap();
+            assert_eq!(result.previous_sha, "a".repeat(40));
+            assert_eq!(result.commit_sha, "f".repeat(40));
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 8);
+            assert_eq!(requests[5].method, "GET");
+            assert!(
+                requests[5]
+                    .uri
+                    .ends_with("/git/commits/ffffffffffffffffffffffffffffffffffffffff")
+            );
+            assert_eq!(requests[6].method, "GET");
+            assert!(requests[6].uri.ends_with("/git/ref/heads/feature/topic"));
+            assert_eq!(requests[7].method, "PATCH");
+            assert!(requests[7].uri.ends_with("/git/refs/heads/feature/topic"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[7].body).unwrap(),
+                serde_json::json!({
+                    "sha": "ffffffffffffffffffffffffffffffffffffffff",
+                    "force": false
+                })
+            );
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn branch_update_rejects_stale_ref_without_patch() {
+        futures::executor::block_on(async {
+            let stale_ref = r#"{"ref":"refs/heads/feature/topic","object":{"sha":"9999999999999999999999999999999999999999","type":"commit"}}"#;
+            let (client, http) = remote_branch_update_client(stale_ref, None);
+            assert!(
+                client
+                    .update_remote_branch(&remote_commit_object())
+                    .await
+                    .is_err()
+            );
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 7);
+            assert!(requests.iter().all(|request| request.method == "GET"));
+            drop(requests);
+        });
+    }
+
+    #[test]
+    fn remote_commit_input_rejects_unsafe_paths_modes_and_messages() {
+        assert!(super::validate_branch_name("feature/topic").is_ok());
+        assert!(super::validate_branch_name("feature/../main").is_err());
+        assert!(super::validate_branch_name("feature/name.lock").is_err());
+        assert!(super::validate_commit_message("  ").is_err());
+        assert!(
+            super::validate_commit_files(&[super::GitHubCommitFile {
+                path: "../outside.rs".to_string(),
+                mode: "100644".to_string(),
+                content: Some("safe".to_string()),
+            }])
+            .is_err()
+        );
+        assert!(
+            super::validate_commit_files(&[super::GitHubCommitFile {
+                path: "link".to_string(),
+                mode: "120000".to_string(),
+                content: Some("target".to_string()),
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_commit_rejects_a_file_nested_under_a_remote_blob() {
+        let files = [super::GitHubCommitFile {
+            path: "occupied/child.rs".to_string(),
+            mode: "100644".to_string(),
+            content: Some("content\n".to_string()),
+        }];
+        let tree = [super::GitHubTreeEntryResponse {
+            path: "occupied".to_string(),
+            mode: "100644".to_string(),
+            kind: "blob".to_string(),
+            sha: "d".repeat(40),
+        }];
+
+        assert!(super::validate_commit_files_against_tree(&files, &tree).is_err());
+    }
+
+    #[test]
+    fn remote_commit_serializes_file_deletions_as_a_null_blob_sha() {
+        let entry = super::CreateGitTreeEntry {
+            path: "removed.rs",
+            mode: "100644",
+            object_type: "blob",
+            content: None,
+            sha: super::GitTreeEntrySha::Null(None),
+        };
+
+        assert_eq!(
+            serde_json::to_value(entry).unwrap(),
+            serde_json::json!({
+                "path": "removed.rs",
+                "mode": "100644",
+                "type": "blob",
+                "sha": null
+            })
+        );
     }
 
     #[test]

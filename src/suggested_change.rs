@@ -186,7 +186,7 @@ fn prepare_file(
         "local target differs from the reviewed GitHub source; no file was modified"
     );
     let original_line = source_line(&original_source, line)?;
-    let replacement_source = replace_line(&original_source, line, replacement)?;
+    let replacement_source = remote_suggestion_content(&original_source, line, replacement)?;
     ensure!(
         replacement_source != original_source,
         "the suggestion does not change the selected source line"
@@ -317,6 +317,24 @@ fn replace_line(source: &str, line: u32, replacement: &str) -> anyhow::Result<St
     ensure!(
         updated.len() <= MAX_SUGGESTED_FILE_BYTES,
         "the suggested file would exceed the local text-file size limit"
+    );
+    Ok(updated)
+}
+
+pub fn remote_suggestion_content(
+    source: &str,
+    line: u32,
+    replacement: &str,
+) -> anyhow::Result<String> {
+    validate_replacement(replacement)?;
+    ensure!(
+        !source.contains('\0') && source.len() <= MAX_SUGGESTED_FILE_BYTES,
+        "GitHub suggestion source is not a supported bounded text file"
+    );
+    let updated = replace_line(source, line, replacement)?;
+    ensure!(
+        updated != source,
+        "the suggestion does not change the selected source line"
     );
     Ok(updated)
 }
@@ -466,7 +484,7 @@ impl Drop for TemporaryPath {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{Preview, apply, prepare, replace_line};
+    use super::{Preview, apply, prepare, remote_suggestion_content, replace_line};
     use crate::repository::RepositorySnapshot;
 
     fn repository_with_file(source: &str) -> tempfile::TempDir {
@@ -511,6 +529,17 @@ mod tests {
             replace_line("first\r\nunsafe_call()\r\nlast\r\n", 2, "checked_call()").unwrap();
 
         assert_eq!(updated, "first\r\nchecked_call()\r\nlast\r\n");
+    }
+
+    #[test]
+    fn remote_suggestion_content_uses_the_exact_current_line_and_preserves_newlines() {
+        let updated =
+            remote_suggestion_content("first\r\nunsafe_call()\r\nlast\r\n", 2, "checked_call()")
+                .unwrap();
+
+        assert_eq!(updated, "first\r\nchecked_call()\r\nlast\r\n");
+        assert!(remote_suggestion_content("first\n", 2, "replacement").is_err());
+        assert!(remote_suggestion_content("same\n", 1, "same").is_err());
     }
 
     #[test]

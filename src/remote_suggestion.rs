@@ -79,7 +79,7 @@ pub fn parse_suggestion(body: &str) -> anyhow::Result<String> {
     Ok((*replacement).to_string())
 }
 
-fn validate_comment(
+pub fn validate_comment(
     snapshot: &PullRequestSnapshot,
     comment: &PullRequestComment,
 ) -> anyhow::Result<u32> {
@@ -132,7 +132,7 @@ impl ReviewWorkspace {
         snapshot: &PullRequestSnapshot,
     ) -> gpui::Div {
         let mut panel = div().flex().flex_col().gap_2();
-        let busy = self.remote_suggestion_state.is_busy();
+        let busy = self.remote_suggestion_state.is_busy() || self.remote_commit_state.is_busy();
         if let Some(comment) = &self.selected_remote_comment
             && parse_suggestion(&comment.body).is_ok()
         {
@@ -211,7 +211,10 @@ impl ReviewWorkspace {
 
 fn prepare(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
     let request = entity.update(cx, |this, cx| {
-        if this.remote_suggestion_state.is_busy() || this.is_opening_repository {
+        if this.remote_suggestion_state.is_busy()
+            || this.remote_commit_state.is_busy()
+            || this.is_opening_repository
+        {
             return None;
         }
         let RemoteReviewState::Loaded(snapshot) = &this.remote_review_state else {
@@ -314,6 +317,7 @@ fn apply(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
         };
         if pending.revalidate(snapshot).is_err()
             || this.selected_remote_comment.as_ref() != Some(&pending.comment)
+            || this.remote_commit_state.is_busy()
         {
             return None;
         }
@@ -424,6 +428,8 @@ mod tests {
             html_url: "https://github.com/octo/repo/pull/1".to_string(),
             base_sha: "b".repeat(40),
             head_sha: head.clone(),
+            head_repository: None,
+            head_branch: None,
             files: vec![cururu_core::ChangedFile {
                 path: "file.rs".to_string(),
                 patch: "@@ -1 +1 @@\n-old\n+unsafe_call()".to_string(),

@@ -1102,6 +1102,7 @@ mod tests {
                 reference: crate::github_pr::PullRequestRef::parse("octo/repo#42").unwrap(),
                 base_sha: "b".repeat(40),
                 head_sha: "a".repeat(40),
+                event: crate::github_pr::ReviewEvent::Comment,
                 body: String::new(),
                 comments: vec![crate::github_pr::NewReviewComment {
                     path: "src/lib.rs".to_string(),

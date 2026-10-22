@@ -288,6 +288,8 @@ mod tests {
             html_url: String::new(),
             base_sha: "b".repeat(40),
             head_sha: "a".repeat(40),
+            head_repository: None,
+            head_branch: None,
             files: vec![cururu_core::ChangedFile {
                 path: "src/lib.rs".to_string(),
                 patch: "@@ -1 +1 @@\n-before\n+after".to_string(),

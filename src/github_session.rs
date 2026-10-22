@@ -39,6 +39,7 @@ const fn can_use_gh(workspace: &ReviewWorkspace) -> bool {
             | GitHubAuthState::Failed(_)
             | GitHubAuthState::ReauthorizationRequired
     ) && !workspace.review_publication.is_publishing()
+        && !workspace.remote_commit_state.is_busy()
         && !matches!(
             workspace.thread_reply_state,
             crate::ThreadReplyState::Publishing(_)

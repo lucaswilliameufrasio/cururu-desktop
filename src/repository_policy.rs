@@ -25,10 +25,33 @@ impl ReviewReuse {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecommendationHint {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl RecommendationHint {
+    const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryPolicy {
     pub profile: Option<String>,
     pub publication_hint: Option<String>,
+    pub recommendations: RecommendationHint,
     pub fingerprint: String,
     pub max_diff_bytes: usize,
     pub chunk_bytes: usize,
@@ -53,6 +76,7 @@ impl Default for RepositoryPolicy {
         Self {
             profile: None,
             publication_hint: None,
+            recommendations: RecommendationHint::Disabled,
             fingerprint: "absent".to_string(),
             max_diff_bytes: crate::local_review::MAX_LOCAL_DIFF_BYTES,
             chunk_bytes: crate::local_review::MAX_LOCAL_FILE_DIFF_BYTES,
@@ -193,10 +217,8 @@ impl RepositoryPolicy {
             policy.local_document = Some(crate::shared_base::ConfigDocument::new(raw));
         }
         if let Some(review) = parsed.review {
-            ensure!(
-                !review.recommendations.unwrap_or(false),
-                "repository recommendations cannot enable extra provider requests; only recommendations = false is supported"
-            );
+            policy.recommendations =
+                RecommendationHint::from_enabled(review.recommendations.unwrap_or(false));
             if let Some(mode) = review.comment_mode {
                 cururu_engine::config::validate_choice(
                     "review.comment_mode",
@@ -302,6 +324,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.publication_hint.as_deref(), Some("summary"));
+        assert!(!policy.recommendations.is_enabled());
         assert!(!policy.context.requires_choice());
         for raw in [
             "language = ''",
@@ -309,10 +332,17 @@ mod tests {
             "technical_level = 'unsupported'",
             "suggestion_detail = 'unsupported'",
             "comment_mode = 'unsupported'",
-            "recommendations = true",
         ] {
             assert!(RepositoryPolicy::parse(&format!("version = 1\n[review]\n{raw}")).is_err());
         }
+    }
+
+    #[test]
+    fn recommendations_are_only_an_availability_hint_in_repository_configuration() {
+        let policy =
+            RepositoryPolicy::parse("version = 1\n[review]\nrecommendations = true").unwrap();
+
+        assert!(policy.recommendations.is_enabled());
     }
 
     #[test]

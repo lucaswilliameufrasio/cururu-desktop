@@ -238,6 +238,7 @@ mod tests {
             reference: crate::github_pr::PullRequestRef::parse("Example/Repository#1").unwrap(),
             base_sha: "a".repeat(40),
             head_sha: "b".repeat(40),
+            event: crate::github_pr::ReviewEvent::Comment,
             body: "synthetic-private-body-marker".to_string(),
             comments: Vec::new(),
         };

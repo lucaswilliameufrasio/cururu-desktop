@@ -45,6 +45,7 @@ pub mod local_review;
 mod local_review_history;
 mod local_review_history_ui;
 mod publication_preference;
+mod remote_commit;
 mod remote_suggestion;
 pub mod repository;
 mod repository_policy;
@@ -127,6 +128,7 @@ struct ReviewWorkspace {
     remote_reply_input: Option<Entity<InputState>>,
     remote_comment_input: Option<Entity<InputState>>,
     remote_review_summary_input: Option<Entity<InputState>>,
+    remote_commit_message_input: Option<Entity<InputState>>,
     review_publication: review_publication::ReviewPublication,
     thread_reply_state: ThreadReplyState,
     review_mode: ReviewMode,
@@ -143,6 +145,7 @@ struct ReviewWorkspace {
     evaluator_result_anchor: Option<evaluation_history::EvaluationAnchor>,
     local_context_state: local_context_ui::ContextState,
     remote_suggestion_state: remote_suggestion::RemoteSuggestionState,
+    remote_commit_state: remote_commit::RemoteCommitState,
     shared_base_state: shared_base_ui::SharedBaseState,
     local_history_state: local_review_history_ui::HistoryState,
     action_history: action_history_ui::ActionHistory,
@@ -214,6 +217,18 @@ struct LocalReviewRequest {
     context: LocalReviewRequestContext,
     repository_root: PathBuf,
     settings: session_store::LocalReviewSettings,
+}
+
+#[derive(Clone)]
+struct PendingRecommendation {
+    request: LocalReviewRequest,
+    finish_reason: String,
+}
+
+impl PendingRecommendation {
+    fn matches(&self, other: &Self) -> bool {
+        self.finish_reason == other.finish_reason && self.request.context == other.request.context
+    }
 }
 
 #[derive(Clone)]
@@ -309,6 +324,17 @@ enum LocalReviewState {
     Running(LocalReviewRequestContext),
     Complete(Box<local_review::LocalReviewResult>),
     Skipped(String),
+    RecommendationAvailable(PendingRecommendation),
+    RecommendationPreview(PendingRecommendation),
+    RecommendationRunning(PendingRecommendation),
+    RecommendationComplete {
+        answer: String,
+        usage: Option<cururu_engine::ReviewUsage>,
+    },
+    RecommendationFailed {
+        pending: PendingRecommendation,
+        message: SharedString,
+    },
     Failed(SharedString),
 }
 
@@ -462,6 +488,7 @@ impl ReviewWorkspace {
             remote_reply_input: None,
             remote_comment_input: None,
             remote_review_summary_input: None,
+            remote_commit_message_input: None,
             review_publication: review_publication::ReviewPublication::default(),
             thread_reply_state: ThreadReplyState::Idle,
             review_mode: ReviewMode::ReviewChanges,
@@ -478,6 +505,7 @@ impl ReviewWorkspace {
             evaluator_result_anchor: None,
             local_context_state: local_context_ui::ContextState::default(),
             remote_suggestion_state: remote_suggestion::RemoteSuggestionState::default(),
+            remote_commit_state: remote_commit::RemoteCommitState::default(),
             shared_base_state: shared_base_ui::SharedBaseState::default(),
             local_history_state: local_review_history_ui::HistoryState::default(),
             action_history: action_history_ui::ActionHistory::default(),
@@ -775,7 +803,9 @@ fn start_repository_picker(
     entity: Entity<ReviewWorkspace>,
     store: Option<session_store::SessionStore>,
 ) {
-    if entity.read(cx).remote_suggestion_state.is_busy() {
+    if entity.read(cx).remote_suggestion_state.is_busy()
+        || entity.read(cx).remote_commit_state.is_busy()
+    {
         return;
     }
     let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -835,7 +865,9 @@ fn start_reopen_last_session(
     path: PathBuf,
     store: Option<session_store::SessionStore>,
 ) {
-    if entity.read(cx).remote_suggestion_state.is_busy() {
+    if entity.read(cx).remote_suggestion_state.is_busy()
+        || entity.read(cx).remote_commit_state.is_busy()
+    {
         return;
     }
     cx.spawn(async move |cx| {
@@ -996,6 +1028,7 @@ impl ReviewWorkspace {
         }
         self.ensure_local_command_input(window, cx);
         self.ensure_review_comment_input(window, cx);
+        self.ensure_remote_commit_input(window, cx);
         if self.pull_request_input.is_none() {
             self.pull_request_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx).placeholder("owner/repository#123")
@@ -1318,6 +1351,7 @@ impl ReviewWorkspace {
         let is_publishing_reply =
             matches!(&self.thread_reply_state, ThreadReplyState::Publishing(_))
                 || self.review_publication.is_publishing();
+        let is_remote_commit_busy = self.remote_commit_state.is_busy();
         let is_applying_suggestion = matches!(
             &self.suggested_change_state,
             SuggestedChangeState::Applying(_)
@@ -1328,6 +1362,7 @@ impl ReviewWorkspace {
         );
         let is_loading = matches!(self.remote_review_state, RemoteReviewState::Loading(_))
             || is_publishing_reply
+            || is_remote_commit_busy
             || is_applying_suggestion
             || is_running_local_command;
         let label = remote_review_status(&self.remote_review_state);
@@ -1335,7 +1370,9 @@ impl ReviewWorkspace {
         let http = cx.http_client();
         let load_button = Button::new("load-github-pull-request")
             .label(if is_loading {
-                if is_publishing_reply {
+                if is_remote_commit_busy {
+                    "Remote commit in progress…"
+                } else if is_publishing_reply {
                     "Publishing reply…"
                 } else if is_applying_suggestion {
                     "Applying local suggestion…"
@@ -1369,6 +1406,14 @@ impl ReviewWorkspace {
         http: Arc<dyn gpui::http_client::HttpClient>,
         cx: &mut Context<Self>,
     ) {
+        if self.remote_commit_state.is_busy() {
+            self.notice = Some(
+                "Wait for the confirmed remote commit operation to finish before changing the GitHub session."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let access_token_expired = self
             .github_credentials
             .as_ref()
@@ -1514,7 +1559,7 @@ impl ReviewWorkspace {
             GitHubAuthState::Disconnecting => Some("Removing GitHub credentials…".to_string()),
             GitHubAuthState::Failed(message) => Some(message.to_string()),
             GitHubAuthState::SignedOut => Some(
-                "GitHub is not connected · the app requests Contents read and Pull requests read/write."
+                "GitHub is not connected · register a GitHub App with Device Flow and set CURURU_GITHUB_APP_CLIENT_ID."
                     .to_string(),
             ),
         };
@@ -1585,6 +1630,7 @@ impl ReviewWorkspace {
                     let can_open = entity.update(cx, |this, cx| {
                         if this.is_opening_repository
                             || this.remote_suggestion_state.is_busy()
+                            || this.remote_commit_state.is_busy()
                             || matches!(
                                 &this.suggested_change_state,
                                 SuggestedChangeState::Applying(_)
@@ -1626,6 +1672,7 @@ impl ReviewWorkspace {
                 let can_open = entity.update(cx, |this, cx| {
                     if this.is_opening_repository
                         || this.remote_suggestion_state.is_busy()
+                        || this.remote_commit_state.is_busy()
                         || matches!(
                             &this.suggested_change_state,
                             SuggestedChangeState::Applying(_)
@@ -2105,6 +2152,7 @@ impl ReviewWorkspace {
                     .child(self.render_evaluator_action(cx, snapshot))
                     .child(self.render_evaluation_history(cx, snapshot))
                     .child(self.render_remote_suggestion(cx, snapshot))
+                    .child(self.render_remote_commit(cx, snapshot))
                     .child(self.render_thread_reply_composer(cx))
             }
             (ReviewMode::ReviewChanges, RemoteReviewState::Loaded(snapshot)) => div()
@@ -2117,7 +2165,8 @@ impl ReviewWorkspace {
                     snapshot.files.len(),
                     short_sha(&snapshot.head_sha)
                 ))
-                .child(self.render_comment_review(cx, snapshot, path, selected_line)),
+                .child(self.render_comment_review(cx, snapshot, path, selected_line))
+                .child(self.render_remote_commit(cx, snapshot)),
             (ReviewMode::UnderstandReview, _) => div()
                 .flex()
                 .flex_col()
@@ -2161,7 +2210,10 @@ impl ReviewWorkspace {
             LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
         );
         let is_other_work_running = self.local_opinion_state.busy()
-            || matches!(self.local_review_state, LocalReviewState::Running(_))
+            || matches!(
+                self.local_review_state,
+                LocalReviewState::Running(_) | LocalReviewState::RecommendationRunning(_)
+            )
             || matches!(
                 self.suggested_change_state,
                 SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
@@ -2352,7 +2404,140 @@ impl ReviewWorkspace {
             &self.suggested_change_state,
             Some(snapshot_fingerprint),
         );
-        div().children(result).children(suggestion_status)
+        let recommendation =
+            self.render_local_recommendation(snapshot, identity, snapshot_fingerprint, cx);
+        div()
+            .children(result)
+            .children(suggestion_status)
+            .child(recommendation)
+    }
+
+    // Each enum variant has a distinct consent/status rendering branch.
+    #[allow(clippy::too_many_lines)]
+    fn render_local_recommendation(
+        &self,
+        snapshot: &repository::RepositorySnapshot,
+        identity: &str,
+        snapshot_fingerprint: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        match &self.local_review_state {
+            LocalReviewState::RecommendationAvailable(pending) => {
+                let current = local_recommendation_matches(
+                    self,
+                    pending,
+                    snapshot,
+                    identity,
+                    snapshot_fingerprint,
+                );
+                let entity = cx.entity();
+                let pending = pending.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child("A recognized output-token truncation occurred. No recommendation call was made.")
+                    .child(
+                        Button::new("preview-local-truncation-recommendation")
+                            .label("Preview optional provider recommendation")
+                            .disabled(!current || self.evidence_edits_busy())
+                            .on_click(move |_, _, cx| {
+                                preview_local_recommendation(&entity, &pending, cx);
+                            }),
+                    )
+            }
+            LocalReviewState::RecommendationPreview(pending) => {
+                let current = local_recommendation_matches(
+                    self,
+                    pending,
+                    snapshot,
+                    identity,
+                    snapshot_fingerprint,
+                );
+                let entity = cx.entity();
+                let confirm = entity.clone();
+                let cancel = entity;
+                let pending_for_preview = pending.clone();
+                let pending_for_cancel = pending.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!(
+                        "ADDITIONAL REQUEST PREVIEW · {} · model {} · finish_reason={}\nOnly the truncation finish reason is sent; no diff, source, review output, or repository context is included. One additional request, at most 500 output tokens, 30-second timeout. Credentials are read from the OS keyring only after confirmation. No request has been sent.",
+                        pending.request.settings.openai_endpoint,
+                        pending.request.settings.openai_model,
+                        pending.finish_reason
+                    ))
+                    .children((!current).then(|| {
+                        div().text_color(rgb(0x00e5_b6ba)).child(
+                            "This preview is stale. Reopen/review the current checkout and prepare a new preview.",
+                        )
+                    }))
+                    .child(
+                        Button::new("confirm-local-truncation-recommendation")
+                            .label("Confirm this additional provider request")
+                            .disabled(!current || self.evidence_edits_busy())
+                            .on_click(move |_, _, cx| {
+                                start_local_recommendation(&confirm, &pending_for_preview, cx);
+                            }),
+                    )
+                    .child(
+                        Button::new("cancel-local-truncation-recommendation")
+                            .label("Cancel recommendation preview")
+                            .on_click(move |_, _, cx| {
+                                cancel.update(cx, |this, cx| {
+                                    if let LocalReviewState::RecommendationPreview(active) =
+                                        &this.local_review_state
+                                        && active.matches(&pending_for_cancel)
+                                    {
+                                        this.local_review_state =
+                                            LocalReviewState::RecommendationAvailable(active.clone());
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+            }
+            LocalReviewState::RecommendationRunning(_) => div().text_color(rgb(0x009b_aaba)).child(
+                "Sending the separately confirmed, finish-reason-only recommendation request…",
+            ),
+            LocalReviewState::RecommendationComplete { answer, usage, .. } => {
+                let usage = usage.as_ref().map_or_else(
+                    || "usage unavailable".to_string(),
+                    |usage| {
+                        format!(
+                            "{} prompt + {} output tokens",
+                            usage.prompt_tokens, usage.completion_tokens
+                        )
+                    },
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("Optional recommendation · {usage}"))
+                    .child(answer.clone())
+            }
+            LocalReviewState::RecommendationFailed { pending, message } => {
+                let entity = cx.entity();
+                let pending = pending.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(message.clone())
+                    .child(
+                        Button::new("preview-retry-local-recommendation")
+                            .label("Prepare a new recommendation request preview")
+                            .disabled(self.evidence_edits_busy())
+                            .on_click(move |_, _, cx| {
+                                preview_local_recommendation(&entity, &pending, cx);
+                            }),
+                    )
+            }
+            _ => div(),
+        }
     }
 
     fn render_evaluator_action(
@@ -2977,7 +3162,8 @@ fn begin_thread_reply_confirmation(
         let body_is_valid = github_pr::validate_thread_reply_body(&pending.body).is_ok();
         let no_publication_is_running =
             !matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
-                && !this.review_publication.is_publishing();
+                && !this.review_publication.is_publishing()
+                && !this.remote_commit_state.is_busy();
         if !pull_request_matches
             || !selected_comment_matches
             || !body_is_valid
@@ -3037,12 +3223,28 @@ fn local_review_state_message(state: &LocalReviewState) -> Option<SharedString> 
                 .into(),
         ),
         LocalReviewState::Skipped(id) => Some(format!("Incremental: an exact input match was observed in saved record {id}. No provider request or restoration of findings/permissions occurred.").into()),
-        LocalReviewState::Failed(message) => Some(message.clone()),
+        LocalReviewState::RecommendationAvailable(_) => Some(
+            "Review output was truncated. No additional provider request has been made.".into(),
+        ),
+        LocalReviewState::RecommendationPreview(_) => Some(
+            "Recommendation request preview is ready. No additional provider request has been made.".into(),
+        ),
+        LocalReviewState::RecommendationRunning(_) => Some(
+            "The separately confirmed recommendation request is running…".into(),
+        ),
+        LocalReviewState::RecommendationComplete { .. } => Some(
+            "Recommendation received. It is informational and did not change the review or checkout.".into(),
+        ),
+        LocalReviewState::RecommendationFailed { message, .. }
+        | LocalReviewState::Failed(message) => Some(message.clone()),
     }
 }
 
 const fn local_review_state_color(state: &LocalReviewState) -> u32 {
-    if matches!(state, LocalReviewState::Failed(_)) {
+    if matches!(
+        state,
+        LocalReviewState::Failed(_) | LocalReviewState::RecommendationFailed { .. }
+    ) {
         0x00e5_b6ba
     } else {
         0x00b8_dfc4
@@ -3798,7 +4000,11 @@ fn begin_local_command_preflight(
         if matches!(
             this.local_command_state,
             LocalCommandState::Preparing(_) | LocalCommandState::Running { .. }
-        ) || this.local_opinion_state.busy() || matches!(this.local_review_state, LocalReviewState::Running(_))
+        ) || this.local_opinion_state.busy()
+            || matches!(
+                this.local_review_state,
+                LocalReviewState::Running(_) | LocalReviewState::RecommendationRunning(_)
+            )
             || matches!(
                 this.suggested_change_state,
                 SuggestedChangeState::Preparing(_) | SuggestedChangeState::Applying(_)
@@ -4018,6 +4224,8 @@ fn complete_local_command_run(
     cx.notify();
 }
 
+// This orchestrates the review's guarded state transition and async completion.
+#[allow(clippy::too_many_lines)]
 fn start_local_review(
     entity: &Entity<ReviewWorkspace>,
     mut request: LocalReviewRequest,
@@ -4116,7 +4324,32 @@ fn start_local_review(
                     this.notice = Some("Exact archived inputs found; no keyring/provider access was needed and no findings or permissions were restored. Inspect saved history or explicitly force a fresh review.".into());
                 }
                 Err(error) => {
-                    this.local_review_state = LocalReviewState::Failed(error.to_string().into());
+                    let recommendations_enabled = this
+                        .local_repository_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .review_policy
+                                .as_ref()
+                                .is_ok_and(|policy| policy.recommendations.is_enabled())
+                        });
+                    if let Some(finish_reason) = local_review::recommendation_finish_reason(
+                        &error,
+                        recommendations_enabled,
+                    ) {
+                        this.local_review_state = LocalReviewState::RecommendationAvailable(
+                            PendingRecommendation {
+                                request: request.clone(),
+                                finish_reason,
+                            },
+                        );
+                        this.notice = Some(
+                            "Review output was truncated. The optional recommendation is a separate provider request; preview and confirm it explicitly.".into(),
+                        );
+                    } else {
+                        this.local_review_state =
+                            LocalReviewState::Failed(error.to_string().into());
+                    }
                 }
             }
             cx.notify();
@@ -4136,9 +4369,10 @@ async fn run_local_review(
         .spawn(async move { incremental_review::preflight(&preflight_store, &preflight_request) })
         .await?;
 
-    let result = if let Some(id) = matching {
-        incremental_review::Outcome::Skipped(id)
-    } else {
+    let result = async {
+        if let Some(id) = matching {
+            return Ok(incremental_review::Outcome::Skipped(id));
+        }
         let secrets = executor
             .spawn(async move {
                 local_review::LocalReviewSecrets::load()?
@@ -4153,8 +4387,9 @@ async fn run_local_review(
             request.analysis.as_ref(),
         )
         .await?;
-        incremental_review::Outcome::Complete(Box::new(review))
-    };
+        Ok(incremental_review::Outcome::Complete(Box::new(review)))
+    }
+    .await;
 
     let postflight_store = store;
     let postflight_request = request;
@@ -4168,7 +4403,225 @@ async fn run_local_review(
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    Ok(result)
+    result
+}
+
+async fn run_local_recommendation(
+    store: session_store::SessionStore,
+    pending: PendingRecommendation,
+    executor: BackgroundExecutor,
+) -> anyhow::Result<(String, Option<cururu_engine::ReviewUsage>)> {
+    let request = pending.request;
+    let preflight_store = store.clone();
+    let preflight_request = request.clone();
+    executor
+        .spawn(async move {
+            validate_local_review_request(&preflight_store, &preflight_request)?;
+            let snapshot =
+                repository::RepositorySnapshot::open(&preflight_request.repository_root)?
+                    .with_shared_base(preflight_request.base.as_ref())?;
+            validate_local_review_snapshot(&preflight_request, &snapshot)?;
+            validate_recommendations_enabled(&snapshot)
+        })
+        .await?;
+
+    let secrets = executor
+        .spawn(async move {
+            local_review::LocalReviewSecrets::load()?
+                .context("local review API key is unavailable in the OS keyring")
+        })
+        .await?;
+    let result = local_review::recommend_after_truncation(
+        &request.settings,
+        &secrets,
+        &pending.finish_reason,
+    )
+    .await;
+
+    let postflight_store = store;
+    let postflight_request = request;
+    executor
+        .spawn(async move {
+            validate_local_review_request(&postflight_store, &postflight_request)?;
+            let snapshot =
+                repository::RepositorySnapshot::open(&postflight_request.repository_root)?
+                    .with_shared_base(postflight_request.base.as_ref())?;
+            validate_local_review_snapshot(&postflight_request, &snapshot)?;
+            validate_recommendations_enabled(&snapshot)
+        })
+        .await?;
+    result
+}
+
+fn validate_recommendations_enabled(
+    snapshot: &repository::RepositorySnapshot,
+) -> anyhow::Result<()> {
+    let policy = snapshot.review_policy.as_ref().map_err(|error| {
+        anyhow::anyhow!("Repository review configuration blocks recommendations: {error}")
+    })?;
+    anyhow::ensure!(
+        policy.recommendations.is_enabled(),
+        "repository configuration no longer exposes recommendations"
+    );
+    Ok(())
+}
+
+fn local_recommendation_matches(
+    workspace: &ReviewWorkspace,
+    pending: &PendingRecommendation,
+    snapshot: &repository::RepositorySnapshot,
+    identity: &str,
+    snapshot_fingerprint: &str,
+) -> bool {
+    let request = &pending.request;
+    let Some(settings) = workspace.local_review_settings.as_ref() else {
+        return false;
+    };
+    let Ok(config_fingerprint) = local_review::config_fingerprint(settings) else {
+        return false;
+    };
+    let Ok(current_identity) = local_review::repository_identity(&snapshot.root) else {
+        return false;
+    };
+    let is_authorized = workspace.local_review_authorized_for.as_ref().is_some_and(
+        |(authorized_identity, authorized_fingerprint)| {
+            authorized_identity == identity && authorized_fingerprint == &config_fingerprint
+        },
+    );
+    let recommendations_enabled = snapshot
+        .review_policy
+        .as_ref()
+        .is_ok_and(|policy| policy.recommendations.is_enabled());
+
+    matches!(pending.finish_reason.as_str(), "length" | "max_tokens")
+        && settings == &request.settings
+        && current_identity == identity
+        && workspace.local_review_identity.as_deref() == Some(identity)
+        && request.context.repository_identity == identity
+        && request.context.config_fingerprint == config_fingerprint
+        && request.context.snapshot_fingerprint == snapshot_fingerprint
+        && local_review::snapshot_fingerprint(snapshot) == snapshot_fingerprint
+        && workspace
+            .approved_analysis()
+            .map(|analysis| &analysis.fingerprint)
+            == request.context.analysis_fingerprint.as_ref()
+        && shared_base::fingerprint(snapshot) == request.context.base_fingerprint
+        && workspace.context_matches_request(request)
+        && recommendations_enabled
+        && is_authorized
+}
+
+fn preview_local_recommendation(
+    entity: &Entity<ReviewWorkspace>,
+    expected: &PendingRecommendation,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        let active = match &this.local_review_state {
+            LocalReviewState::RecommendationAvailable(active) if active.matches(expected) => {
+                Some(active.clone())
+            }
+            LocalReviewState::RecommendationFailed { pending, .. }
+                if pending.matches(expected) =>
+            {
+                Some(pending.clone())
+            }
+            _ => None,
+        };
+        let Some(active) = active else {
+            return;
+        };
+        let Some(snapshot) = this.local_repository_snapshot.as_ref() else {
+            return;
+        };
+        let identity = this.local_review_identity.as_deref().unwrap_or_default();
+        let fingerprint = local_review::snapshot_fingerprint(snapshot);
+        if this.evidence_edits_busy()
+            || !local_recommendation_matches(this, &active, snapshot, identity, &fingerprint)
+        {
+            this.notice = Some(
+                "Recommendation preview is stale or another local operation is active; refresh the checkout and review again.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        this.local_review_state = LocalReviewState::RecommendationPreview(active);
+        cx.notify();
+    });
+}
+
+fn start_local_recommendation(
+    entity: &Entity<ReviewWorkspace>,
+    expected: &PendingRecommendation,
+    cx: &mut App,
+) {
+    let operation = entity.update(cx, |this, cx| {
+        let active = match &this.local_review_state {
+            LocalReviewState::RecommendationPreview(active) if active.matches(expected) => {
+                Some(active.clone())
+            }
+            _ => None,
+        }?;
+        let snapshot = this.local_repository_snapshot.as_ref()?;
+        let identity = this.local_review_identity.as_deref().unwrap_or_default();
+        let fingerprint = local_review::snapshot_fingerprint(snapshot);
+        if this.evidence_edits_busy()
+            || !local_recommendation_matches(this, &active, snapshot, identity, &fingerprint)
+        {
+            this.notice = Some(
+                "Recommendation preview expired. Prepare a new preview against the current checkout.".into(),
+            );
+            cx.notify();
+            return None;
+        }
+        let Some(store) = this.session_store.clone() else {
+            this.notice = Some("Local database is unavailable; recommendation is blocked.".into());
+            cx.notify();
+            return None;
+        };
+        this.local_review_state = LocalReviewState::RecommendationRunning(active.clone());
+        this.notice = Some(
+            "Sending only the confirmed truncation metadata to the configured provider…".into(),
+        );
+        cx.notify();
+        Some((store, active))
+    });
+    let Some((store, pending)) = operation else {
+        return;
+    };
+
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let executor = cx.background_executor();
+        let result = run_local_recommendation(store, pending.clone(), executor.clone()).await;
+        let _ = entity.update(cx, |this, cx| {
+            if !matches!(
+                &this.local_review_state,
+                LocalReviewState::RecommendationRunning(active) if active.matches(&pending)
+            ) {
+                return;
+            }
+            match result {
+                Ok((answer, usage)) => {
+                    this.local_review_state = LocalReviewState::RecommendationComplete {
+                        answer,
+                        usage,
+                    };
+                }
+                Err(error) => {
+                    this.local_review_state = LocalReviewState::RecommendationFailed {
+                        pending,
+                        message: format!(
+                            "Recommendation failed or its outcome is uncertain: {error}. No automatic retry was attempted."
+                        )
+                        .into(),
+                    };
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 fn validate_local_review_request(
@@ -5102,6 +5555,7 @@ fn start_thread_reply_publication(
         });
         if !confirmation_is_current
             || this.review_publication.is_publishing()
+            || this.remote_commit_state.is_busy()
             || !pull_request_is_current
             || !selected_comment_is_current
             || !credentials_are_current
@@ -5366,7 +5820,9 @@ fn handle_open_pull_request(
     input_entity: Option<Entity<InputState>>,
     cx: &mut App,
 ) {
-    if entity.read(cx).remote_suggestion_state.is_busy() {
+    if entity.read(cx).remote_suggestion_state.is_busy()
+        || entity.read(cx).remote_commit_state.is_busy()
+    {
         return;
     }
     let Some(input) = input_entity else {
@@ -5413,6 +5869,7 @@ fn handle_open_pull_request(
         }
         if matches!(this.remote_review_state, RemoteReviewState::Loading(_))
             || this.review_publication.is_publishing()
+            || this.remote_commit_state.is_busy()
             || matches!(&this.thread_reply_state, ThreadReplyState::Publishing(_))
             || matches!(
                 &this.suggested_change_state,
@@ -6177,6 +6634,8 @@ mod tests {
                 html_url: "https://github.com/octo/repo/pull/9".to_string(),
                 base_sha: "base".to_string(),
                 head_sha: "head".to_string(),
+                head_repository: None,
+                head_branch: None,
                 files: Vec::new(),
                 reviews: Vec::new(),
                 review_threads: Vec::new(),
@@ -6251,6 +6710,8 @@ mod tests {
             html_url: "https://github.com/octo/repo/pull/9".to_string(),
             base_sha: "base".to_string(),
             head_sha: "head".to_string(),
+            head_repository: None,
+            head_branch: None,
             files: Vec::new(),
             reviews: Vec::new(),
             review_threads: vec![crate::github_pr::PullRequestReviewThread {

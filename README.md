@@ -38,8 +38,10 @@ inclusion. They travel as JSON user data, never system instructions, and are
 covered by context/review/suggestion/incremental fingerprints. Diff-only excludes
 them as well. No defaults or provider/permission settings are copied from CLI.
 Valid `review.comment_mode` is an advisory hint only; personal publication controls
-still choose the actual workflow. `recommendations = false` is accepted; true
-remains blocked because it must not authorize extra provider calls from the repo.
+still choose the actual workflow. `recommendations` may expose a recommendation
+action, but neither `true` nor any other repository setting authorizes an extra
+provider request: each recommendation requires a separate local preview and
+confirmation, and is never requested automatically after a truncated review.
 
 **Local static analysis** supports explicit `[analysis] enabled = true` with an
 exact `manifest` path and optional exact `sarif_paths`. Read the manifest first
@@ -157,6 +159,15 @@ Provider prose can contain quoted code; full inputs and keys are not archived.
 Limits: 200 records, 64,000 bytes each, 20 per page; nothing is silently pruned.
 Manual assessments do not enable automatic filtering or calibrated thresholds.
 
+An offline labeled benchmark is available at `evaluation/benchmark/v1.jsonl`.
+Version 1 contains 10 balanced **synthetic fixtures** across the five explanation
+classifications; it has no real-labeled production examples. Run
+`python3 scripts/evaluator_benchmark.py` to validate and summarize the corpus, or
+pass `--predictions <jsonl>` with one `{ "id", "classification" }` result per
+case to calculate accuracy, macro-F1, per-class scores, and a confusion matrix.
+This corpus is an initial reproducible harness, not representative evidence or
+threshold calibration. Evaluator filtering remains disabled.
+
 Cururu Desktop is a native code-review client built on GPUI and the shared
 `cururu-core` domain crate plus `cururu-engine` review contracts. Both Cururu
 dependencies are pinned to the same Git revision so app updates adopt engine
@@ -216,6 +227,16 @@ informational and are never applied automatically. A structured single-line
 suggestion can be previewed as a local diff; only a separate confirmation applies
 it after rechecking the reviewed diff and exact file contents. Applying a
 suggestion does not run commands, stage, commit, or push.
+
+If a review is rejected specifically because the model reached its output-token
+limit and `.cururu.toml` sets `review.recommendations = true`, the app may offer
+an optional recommendation. The setting only exposes the action: no request is
+automatic. A separate preview shows the provider/model and the exact
+`finish_reason`; after a second, explicit confirmation, one additional request
+sends only that reason (no diff, source, review output, or repository context).
+The keyring is read only after confirmation. The request is capped at 500 output
+tokens and 30 seconds, has no automatic retry, and is discarded if the checkout,
+settings, or consent changes.
 
 Local review reads a regular `.cururu.toml` at the checkout root (up to 64 KiB)
 using the shared engine schema. Supported restriction fields are:
@@ -282,12 +303,47 @@ unsandboxed-confirmation path. Otherwise, running without isolation requires a
 separate confirmation and may access or modify anything permitted to the OS
 user. Remote PR text never supplies or authorizes a command.
 
-GitHub sign-in uses the Device Flow. Set the public GitHub App client ID in
-`CURURU_GITHUB_APP_CLIENT_ID` after configuring an app with Device Flow enabled.
-GitHub authentication and read-only pull-request inspection are available;
-individual thread replies use the separate explicit write flow below.
+GitHub sign-in uses the Device Flow. Register a GitHub App for the account or
+organization that should own it, enable Device Flow, then set its public client
+ID in `CURURU_GITHUB_APP_CLIENT_ID`. The desktop reads this variable from its
+process environment at startup; it does not load `.env` files. No client secret
+or private key belongs in the desktop configuration. After setup, PR inspection
+is read-only until you explicitly confirm one of the write flows below.
 **Disconnect GitHub** removes local credentials but does not revoke the grant at
 GitHub.
+
+### Register and configure the desktop GitHub App
+
+The repository contains no GitHub App registration or permission manifest. Set
+up the App in GitHub, and install it only on repositories you want Cururu Desktop
+to access:
+
+1. In the owning GitHub account or organization, open **Settings → Developer
+   settings → GitHub Apps → New GitHub App**.
+2. Enable **Device Flow** in the App's general settings.
+3. Under **Permissions & events → Repository permissions**, set **Contents** to
+   **Read and write** and **Pull requests** to **Read and write**. Do not grant
+   unrelated permissions for this desktop client.
+4. Install the App on the intended repositories. The installation owner may need
+   to approve the requested permissions. Repository access and branch protection
+   still apply; `Contents:write` does not bypass them.
+5. Set the App's public client ID in the environment used to launch the desktop,
+   then restart it. For example, in a terminal:
+
+   ```sh
+   export CURURU_GITHUB_APP_CLIENT_ID="YOUR_PUBLIC_CLIENT_ID"
+   cargo run
+   ```
+
+   For a packaged app, make the variable available to its launcher instead. The
+   ID is public; do not add a client secret or App private key. The Device Flow
+   sends `offline_access`; repository permissions come from the App registration
+   and its approved installation, not from that OAuth scope.
+
+Remote commit creation and branch updates require **Contents: Read and write**.
+Publishing reviews and replies requires **Pull requests: Read and write**. The
+desktop still previews and separately confirms each write; the App permission
+does not itself authorize or trigger an operation.
 
 Alternatively, explicitly choose **Use existing gh login (memory only)**. This
 runs only `gh auth token --hostname github.com` from a supported installed CLI
@@ -319,18 +375,39 @@ PR before deciding whether to retry.
 In **Review changes**, select a new-side line to queue a new inline comment.
 Provide a review summary, then preview one comment or all queued comments for
 the exact PR/base/head. Only **Confirm and publish this review** sends a single
-GitHub `COMMENT` review with those comments and summary. The app rechecks that
-the PR is open, base/head are unchanged, anchors remain in the diff, and identical
-comments do not already exist. Requests are never retried automatically. Failed
-or ambiguous writes keep drafts and require a PR refresh before another attempt.
+GitHub `COMMENT` review with those comments and summary. You can also preview a
+standalone `REQUEST_CHANGES` vote or include one/all queued inline comments.
+The vote type, required summary, PR/base/head, and exact selected comments are
+shown before a separate confirmation. The app rechecks that the PR is open,
+base/head are unchanged, anchors remain in the diff, and identical comments do
+not already exist. Requests are never retried automatically. Failed or ambiguous
+writes keep drafts and require a PR refresh before another attempt.
 Queued comments survive mode/layout changes. **Save queued comments and summary
 locally** explicitly persists them in SQLite; saved drafts are restored on app
 startup without sending anything. Later edits, removals, or publication require
 another save to update that local snapshot. Concurrent saves from another app
 instance are rejected instead of overwriting its drafts. Tokens and source
 snapshots are never part of this record. Stale/other-PR drafts remain visible and
-cannot be sent against a different PR/head. General conversation comments and approval or
-request-changes votes are not implemented yet.
+cannot be sent against a different PR/head. General conversation comments remain
+a separate capability.
+
+The **Remote commit** panel offers per-file selection from either the opened
+local checkout (only when its branch and HEAD exactly match the PR source) or the
+currently selected, validated GitHub suggestion. It supports bounded text files
+and fails closed for binary, symlink, mode-only, or ambiguous changes. The exact
+PR, repository/branch, parent SHA, commit message, and selected file diffs are
+previewed before confirming creation of remote tree/commit objects. This never
+stages or changes local files and does not update a branch. After creation, a
+second preview names the expected old ref and new commit; only a separate
+confirmation can update the PR branch, using a non-force fast-forward update
+after rechecking the PR, commit parent, and branch ref. Writes are not retried
+automatically; refresh GitHub before deciding what to do after an uncertain
+outcome. A created object may remain unreferenced if you cancel the branch update.
+Creating Git objects and updating the branch require a GitHub App with repository
+`Contents:read/write`, installed and authorized for the target repository. The
+repository does not configure or widen App permissions; see [Register and
+configure the desktop GitHub App](#register-and-configure-the-desktop-github-app).
+Real OAuth validation remains a separate prerequisite.
 
 “Understand a review” can optionally run a second opinion through both a
 user-configured OpenAI-compatible chat-completions endpoint and Jev. Configure
