@@ -93,8 +93,12 @@ fn read_token(mut command: Command, timeout: Duration) -> anyhow::Result<GhToken
     let mut status = None;
     while Instant::now() < deadline {
         let mut buffer = [0_u8; 1_024];
+        let mut should_wait = false;
         match stdout.read(&mut buffer) {
-            Ok(0) => eof = true,
+            Ok(0) => {
+                eof = true;
+                should_wait = true;
+            }
             Ok(count) => {
                 ensure!(
                     output.len() + count <= 16_384,
@@ -102,7 +106,9 @@ fn read_token(mut command: Command, timeout: Duration) -> anyhow::Result<GhToken
                 );
                 output.extend_from_slice(&buffer[..count]);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                should_wait = true;
+            }
             Err(_) => anyhow::bail!("could not read gh output"),
         }
         if status.is_none() {
@@ -120,7 +126,9 @@ fn read_token(mut command: Command, timeout: Duration) -> anyhow::Result<GhToken
                 return validate_token(output);
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if should_wait {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     anyhow::bail!("gh credential read timed out; no credential was loaded")
 }
@@ -218,7 +226,7 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("size limit"));
+        assert!(error.to_string().contains("size limit"), "{error:#}");
         assert!(!error.to_string().contains("xxxxxxxx"));
     }
 
