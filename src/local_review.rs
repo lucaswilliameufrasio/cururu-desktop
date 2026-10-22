@@ -210,6 +210,38 @@ pub async fn review_snapshot(
     Ok(result)
 }
 
+#[must_use]
+pub fn recommendation_finish_reason(
+    error: &anyhow::Error,
+    repository_hint_enabled: bool,
+) -> Option<String> {
+    if !repository_hint_enabled {
+        return None;
+    }
+    let failure = error.downcast_ref::<cururu_engine::InvalidReviewOutput>()?;
+    matches!(failure.finish_reason.as_str(), "length" | "max_tokens")
+        .then(|| failure.finish_reason.clone())
+}
+
+pub async fn recommend_after_truncation(
+    settings: &LocalReviewSettings,
+    secrets: &LocalReviewSecrets,
+    finish_reason: &str,
+) -> anyhow::Result<(String, Option<cururu_engine::ReviewUsage>)> {
+    settings.validate()?;
+    let agent = cururu_engine::OpenAiCompatibleAgent::new(
+        cururu_engine::OpenAiCompatibleSettings {
+            base_url: settings.openai_endpoint.clone(),
+            api_key: secrets.as_str().to_string(),
+            model: settings.openai_model.clone(),
+            temperature: REVIEW_TEMPERATURE,
+            max_output_tokens: REVIEW_MAX_OUTPUT_TOKENS,
+        },
+        system_prompt(),
+    )?;
+    agent.recommend_after_truncation(finish_reason).await
+}
+
 fn bounded_chunks(snapshot: &RepositorySnapshot) -> anyhow::Result<Vec<cururu_core::DiffChunk>> {
     let policy = snapshot.review_policy.as_ref().map_err(|error| {
         anyhow::anyhow!("Repository review configuration blocks sending: {error}")
@@ -361,7 +393,8 @@ mod tests {
     use super::{
         LocalReviewSecrets, MAX_LOCAL_DIFF_BYTES, MAX_LOCAL_FILE_DIFF_BYTES,
         assemble_review_result, assemble_with_analysis, bounded_chunks, config_fingerprint,
-        diff_byte_count, repository_identity, snapshot_fingerprint, validate_api_key,
+        diff_byte_count, recommend_after_truncation, recommendation_finish_reason,
+        repository_identity, snapshot_fingerprint, validate_api_key,
     };
     use crate::{repository::RepositorySnapshot, session_store::LocalReviewSettings};
     use cururu_core::{ChangedFile, ReviewFinding, ReviewResult};
@@ -371,6 +404,43 @@ mod tests {
             openai_endpoint: endpoint.to_string(),
             openai_model: model.to_string(),
         }
+    }
+
+    #[test]
+    fn recommendation_requires_an_enabled_hint_and_recognized_output_truncation() {
+        let truncated = anyhow::Error::new(cururu_engine::InvalidReviewOutput {
+            finish_reason: "length".to_string(),
+        });
+        let content_filtered = anyhow::Error::new(cururu_engine::InvalidReviewOutput {
+            finish_reason: "content_filter".to_string(),
+        });
+
+        assert_eq!(recommendation_finish_reason(&truncated, false), None);
+        assert_eq!(
+            recommendation_finish_reason(&truncated, true).as_deref(),
+            Some("length")
+        );
+        assert_eq!(recommendation_finish_reason(&content_filtered, true), None);
+    }
+
+    #[test]
+    fn recommendation_rejects_ineligible_finish_reason_without_provider_request() {
+        let secrets = LocalReviewSecrets {
+            api_key: "test-key".to_string(),
+        };
+        let result = futures::executor::block_on(recommend_after_truncation(
+            &settings("https://api.openai.com/v1", "test-model"),
+            &secrets,
+            "stop",
+        ));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("recognized output-limit")
+        );
     }
 
     fn changed_file(path: &str, diff: &str, right_lines: &[u32]) -> ChangedFile {

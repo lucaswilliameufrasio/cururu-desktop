@@ -57,6 +57,13 @@ enum DraftStorage {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentSelection {
+    Standalone,
+    All,
+    One(usize),
+}
+
 impl ReviewPublication {
     pub const fn restore_preference(&mut self, preference: PublicationPreference) {
         self.preference = PreferenceState::Ready(preference);
@@ -139,6 +146,7 @@ impl ReviewPublication {
             reference: snapshot.reference.clone(),
             base_sha: snapshot.base_sha.clone(),
             head_sha: snapshot.head_sha.clone(),
+            event: github_pr::ReviewEvent::Comment,
             body: String::new(),
             comments: vec![comment],
         });
@@ -151,7 +159,8 @@ impl ReviewPublication {
     fn preview(
         &mut self,
         snapshot: &github_pr::PullRequestSnapshot,
-        only: Option<usize>,
+        selection: CommentSelection,
+        event: github_pr::ReviewEvent,
         body: String,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -159,18 +168,34 @@ impl ReviewPublication {
             "refresh the pull request before another publication attempt"
         );
         ensure!(snapshot.state == "open", "the pull request is closed");
-        github_pr::validate_thread_reply_body(&body)?;
         let mut comments = Vec::new();
-        for (index, draft) in self.drafts.iter().enumerate() {
-            if draft.matches(snapshot) && only.is_none_or(|requested| requested == index) {
+        match selection {
+            CommentSelection::Standalone => {}
+            CommentSelection::All => {
+                for draft in &self.drafts {
+                    if draft.matches(snapshot) {
+                        comments.extend(draft.comments.clone());
+                    }
+                }
+            }
+            CommentSelection::One(index) => {
+                let draft = self
+                    .drafts
+                    .get(index)
+                    .context("the selected comment draft no longer exists")?;
+                ensure!(
+                    draft.matches(snapshot),
+                    "the selected comment belongs to a different PR or head"
+                );
                 comments.extend(draft.comments.clone());
             }
         }
-        github_pr::validate_review_comments(&snapshot.files, &comments)?;
+        github_pr::validate_review_submission(event, &snapshot.files, &body, &comments)?;
         self.state = PublicationState::Confirming(PendingReview {
             reference: snapshot.reference.clone(),
             base_sha: snapshot.base_sha.clone(),
             head_sha: snapshot.head_sha.clone(),
+            event,
             body,
             comments,
         });
@@ -188,7 +213,8 @@ impl ReviewPublication {
         match result {
             Ok(review) => {
                 self.drafts.retain(|draft| {
-                    !(draft.reference == pending.reference
+                    !(!pending.comments.is_empty()
+                        && draft.reference == pending.reference
                         && draft.base_sha == pending.base_sha
                         && draft.head_sha == pending.head_sha
                         && draft
@@ -241,7 +267,14 @@ impl ReviewWorkspace {
                 Button::new("preview-all-despite-preference")
                     .label("Preview all queued comments instead")
                     .disabled(self.review_publication.is_publishing())
-                    .on_click(move |_, _, cx| preview(&entity, None, cx)),
+                    .on_click(move |_, _, cx| {
+                        preview(
+                            &entity,
+                            CommentSelection::All,
+                            github_pr::ReviewEvent::Comment,
+                            cx,
+                        );
+                    }),
             );
         }
         panel
@@ -271,6 +304,8 @@ impl ReviewWorkspace {
         }
     }
 
+    // One panel presents the related queue, event choices, and exact preview actions.
+    #[allow(clippy::too_many_lines)]
     pub fn render_comment_review(
         &self,
         cx: &Context<Self>,
@@ -298,6 +333,7 @@ impl ReviewWorkspace {
                 .disabled(
                     line.is_none()
                         || snapshot.state != "open"
+                        || self.remote_commit_state.is_busy()
                         || self.review_publication.is_publishing(),
                 )
                 .on_click(move |_event, window, cx| {
@@ -339,17 +375,61 @@ impl ReviewWorkspace {
                 })
                 .disabled(
                     self.review_publication.is_publishing()
+                        || self.remote_commit_state.is_busy()
                         || (preference == PublicationPreference::Individual && preferred.is_none()),
                 )
                 .on_click(move |_event, _window, cx| {
                     if preference == PublicationPreference::Individual && preferred.is_none() {
                         return;
                     }
-                    preview(&entity, preferred, cx);
+                    let selection = preferred.map_or(CommentSelection::All, CommentSelection::One);
+                    preview(&entity, selection, github_pr::ReviewEvent::Comment, cx);
+                }),
+        );
+        let entity = cx.entity();
+        content = content.child(
+            Button::new("preview-request-changes-standalone")
+                .label("Preview standalone REQUEST_CHANGES")
+                .disabled(
+                    self.review_publication.is_publishing()
+                        || self.remote_commit_state.is_busy()
+                        || snapshot.state != "open",
+                )
+                .on_click(move |_event, _window, cx| {
+                    preview(
+                        &entity,
+                        CommentSelection::Standalone,
+                        github_pr::ReviewEvent::RequestChanges,
+                        cx,
+                    );
+                }),
+        );
+        let entity = cx.entity();
+        let has_current_comments = self
+            .review_publication
+            .drafts
+            .iter()
+            .any(|draft| draft.matches(snapshot));
+        content = content.child(
+            Button::new("preview-request-changes-with-comments")
+                .label("Preview REQUEST_CHANGES with queued inline comments")
+                .disabled(
+                    self.review_publication.is_publishing()
+                        || self.remote_commit_state.is_busy()
+                        || snapshot.state != "open"
+                        || !has_current_comments,
+                )
+                .on_click(move |_event, _window, cx| {
+                    preview(
+                        &entity,
+                        CommentSelection::All,
+                        github_pr::ReviewEvent::RequestChanges,
+                        cx,
+                    );
                 }),
         );
         content
-            .child("Review summary (required for publication)")
+            .child("Review summary (required for COMMENT and REQUEST_CHANGES)")
             .children(
                 self.remote_review_summary_input
                     .as_ref()
@@ -389,6 +469,7 @@ impl ReviewWorkspace {
         let comment = &draft.comments[0];
         let entity = cx.entity();
         let preview_entity = entity.clone();
+        let changes_preview_entity = entity.clone();
         gpui::div()
             .flex()
             .flex_col()
@@ -413,7 +494,25 @@ impl ReviewWorkspace {
                     .label("Preview this comment")
                     .disabled(!draft.matches(snapshot) || self.review_publication.is_publishing())
                     .on_click(move |_event, _window, cx| {
-                        preview(&preview_entity, Some(index), cx);
+                        preview(
+                            &preview_entity,
+                            CommentSelection::One(index),
+                            github_pr::ReviewEvent::Comment,
+                            cx,
+                        );
+                    }),
+            )
+            .child(
+                Button::new(("preview-one-request-changes", index))
+                    .label("Preview this comment as REQUEST_CHANGES")
+                    .disabled(!draft.matches(snapshot) || self.review_publication.is_publishing())
+                    .on_click(move |_event, _window, cx| {
+                        preview(
+                            &changes_preview_entity,
+                            CommentSelection::One(index),
+                            github_pr::ReviewEvent::RequestChanges,
+                            cx,
+                        );
                     }),
             )
             .child(
@@ -444,15 +543,22 @@ impl ReviewWorkspace {
         match &self.review_publication.state {
             PublicationState::Drafting => {}
             PublicationState::Publishing(_) => {
-                content = content.child("Publishing one comment review…");
+                content = content.child("Publishing one GitHub review…");
             }
             PublicationState::Published(url) => {
                 content = content.child(format!("Review published: {url}"));
             }
             PublicationState::Failed(message) => content = content.child(message.clone()),
             PublicationState::Confirming(pending) => {
-                content = content.child(format!("Confirm COMMENT review on https://github.com/{}/{}/pull/{}\nBase: {}\nHead: {}",
-                    pending.reference.owner, pending.reference.repository, pending.reference.number, pending.base_sha, pending.head_sha));
+                content = content.child(format!(
+                    "Confirm {} review on https://github.com/{}/{}/pull/{}\nBase: {}\nHead: {}",
+                    pending.event.label(),
+                    pending.reference.owner,
+                    pending.reference.repository,
+                    pending.reference.number,
+                    pending.base_sha,
+                    pending.head_sha
+                ));
                 for comment in &pending.comments {
                     content = content.child(format!(
                         "{}:{} RIGHT\n{}",
@@ -465,7 +571,8 @@ impl ReviewWorkspace {
                 content = content
                     .child(
                         Button::new("confirm-comment-review")
-                            .label("Confirm and publish this review")
+                            .label(format!("Confirm and publish {}", pending.event.label()))
+                            .disabled(self.remote_commit_state.is_busy())
                             .on_click(move |_event, _window, cx| publish(&entity, cx)),
                     )
                     .child(
@@ -491,6 +598,7 @@ fn save_preference(
 ) {
     let store = entity.update(cx, |this, cx| {
         if this.review_publication.is_publishing()
+            || this.remote_commit_state.is_busy()
             || matches!(
                 this.review_publication.preference,
                 PreferenceState::Saving(_)
@@ -528,8 +636,21 @@ fn save_preference(
     }).detach();
 }
 
-fn preview(entity: &Entity<ReviewWorkspace>, only: Option<usize>, cx: &mut App) {
+fn preview(
+    entity: &Entity<ReviewWorkspace>,
+    selection: CommentSelection,
+    event: github_pr::ReviewEvent,
+    cx: &mut App,
+) {
     entity.update(cx, |this, cx| {
+        if this.remote_commit_state.is_busy() {
+            this.notice = Some(
+                "Wait for the confirmed remote commit operation before preparing another GitHub write."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let RemoteReviewState::Loaded(snapshot) = &this.remote_review_state else {
             return;
         };
@@ -538,7 +659,10 @@ fn preview(entity: &Entity<ReviewWorkspace>, only: Option<usize>, cx: &mut App) 
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
-        if let Err(error) = this.review_publication.preview(snapshot, only, body) {
+        if let Err(error) = this
+            .review_publication
+            .preview(snapshot, selection, event, body)
+        {
             this.notice = Some(error.to_string().into());
         }
         cx.notify();
@@ -597,6 +721,7 @@ fn publish(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
         if !pending.matches(snapshot)
             || snapshot.state != "open"
             || !matches!(this.github_auth_state, GitHubAuthState::SignedIn)
+            || this.remote_commit_state.is_busy()
             || matches!(
                 this.thread_reply_state,
                 crate::ThreadReplyState::Publishing(_)
@@ -626,10 +751,11 @@ fn publish(entity: &Entity<ReviewWorkspace>, cx: &mut App) {
         let result = async {
             let client = github_pr::GitHubPullRequestClient::new(http, token)?;
             crate::with_network_timeout(
-                client.publish_comment_review(
+                client.publish_review(
                     &pending.reference,
                     &pending.base_sha,
                     &pending.head_sha,
+                    pending.event,
                     &pending.body,
                     &pending.comments,
                 ),
@@ -661,6 +787,8 @@ mod tests {
             html_url: "https://github.com/octo/repo/pull/1".to_string(),
             base_sha: "b".repeat(40),
             head_sha: "a".repeat(40),
+            head_repository: None,
+            head_branch: None,
             files: cururu_core::parse_unified_diff(
                 "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n",
             ),
@@ -687,7 +815,12 @@ mod tests {
         let drafts = publication.drafts.clone();
         assert_eq!(publication.preferred_preview(&snapshot), None);
         publication
-            .preview(&snapshot, None, "Review notes".to_string())
+            .preview(
+                &snapshot,
+                CommentSelection::All,
+                github_pr::ReviewEvent::Comment,
+                "Review notes".to_string(),
+            )
             .unwrap();
         publication.change_preference(PublicationPreference::Individual);
         assert_eq!(publication.preferred_preview(&snapshot), Some(0));
@@ -696,7 +829,10 @@ mod tests {
         publication
             .preview(
                 &snapshot,
-                publication.preferred_preview(&snapshot),
+                publication
+                    .preferred_preview(&snapshot)
+                    .map_or(CommentSelection::All, CommentSelection::One),
+                github_pr::ReviewEvent::Comment,
                 "Review notes".to_string(),
             )
             .unwrap();
@@ -748,14 +884,24 @@ mod tests {
         publication.queue(&snapshot, comment(2)).unwrap();
         assert!(publication.queue(&snapshot, comment(1)).is_err());
         publication
-            .preview(&snapshot, Some(1), "Review notes".to_string())
+            .preview(
+                &snapshot,
+                CommentSelection::One(1),
+                github_pr::ReviewEvent::Comment,
+                "Review notes".to_string(),
+            )
             .unwrap();
         let PublicationState::Confirming(pending) = &publication.state else {
             panic!("preview missing")
         };
         assert_eq!(pending.comments, vec![comment(2)]);
         publication
-            .preview(&snapshot, None, "Review notes".to_string())
+            .preview(
+                &snapshot,
+                CommentSelection::All,
+                github_pr::ReviewEvent::Comment,
+                "Review notes".to_string(),
+            )
             .unwrap();
         let PublicationState::Confirming(pending) = &publication.state else {
             panic!("preview missing")
@@ -766,6 +912,61 @@ mod tests {
     }
 
     #[test]
+    fn request_changes_preview_supports_standalone_and_queued_comments() {
+        let snapshot = snapshot();
+        let mut publication = ReviewPublication::default();
+        publication
+            .preview(
+                &snapshot,
+                CommentSelection::Standalone,
+                github_pr::ReviewEvent::RequestChanges,
+                "Please address the blocking issue.".to_string(),
+            )
+            .unwrap();
+        let PublicationState::Confirming(pending) = &publication.state else {
+            panic!("standalone request-changes preview missing")
+        };
+        assert_eq!(pending.event, github_pr::ReviewEvent::RequestChanges);
+        assert_eq!(pending.comments.len(), 0);
+        assert_eq!(pending.body, "Please address the blocking issue.");
+
+        publication.queue(&snapshot, comment(1)).unwrap();
+        publication.queue(&snapshot, comment(2)).unwrap();
+        publication
+            .preview(
+                &snapshot,
+                CommentSelection::One(1),
+                github_pr::ReviewEvent::RequestChanges,
+                "Please address this line before merge.".to_string(),
+            )
+            .unwrap();
+        let PublicationState::Confirming(pending) = &publication.state else {
+            panic!("request-changes preview with comment missing")
+        };
+        assert_eq!(pending.event, github_pr::ReviewEvent::RequestChanges);
+        assert_eq!(pending.comments, vec![comment(2)]);
+        assert_eq!(publication.drafts.len(), 2);
+    }
+
+    #[test]
+    fn standalone_request_changes_requires_a_summary_and_keeps_queued_comments() {
+        let snapshot = snapshot();
+        let mut publication = ReviewPublication::default();
+        publication.queue(&snapshot, comment(1)).unwrap();
+        assert!(
+            publication
+                .preview(
+                    &snapshot,
+                    CommentSelection::Standalone,
+                    github_pr::ReviewEvent::RequestChanges,
+                    "  ".to_string(),
+                )
+                .is_err()
+        );
+        assert_eq!(publication.drafts.len(), 1);
+    }
+
+    #[test]
     fn stale_or_different_pr_drafts_are_retained_but_cannot_be_published() {
         let mut snapshot = snapshot();
         let mut publication = ReviewPublication::default();
@@ -773,14 +974,24 @@ mod tests {
         snapshot.head_sha = "c".repeat(40);
         assert!(
             publication
-                .preview(&snapshot, None, "Review notes".to_string())
+                .preview(
+                    &snapshot,
+                    CommentSelection::All,
+                    github_pr::ReviewEvent::Comment,
+                    "Review notes".to_string(),
+                )
                 .is_err()
         );
         snapshot.head_sha = "a".repeat(40);
         snapshot.reference.number = 2;
         assert!(
             publication
-                .preview(&snapshot, Some(0), "Review notes".to_string())
+                .preview(
+                    &snapshot,
+                    CommentSelection::One(0),
+                    github_pr::ReviewEvent::Comment,
+                    "Review notes".to_string(),
+                )
                 .is_err()
         );
         assert_eq!(publication.drafts.len(), 1);
@@ -792,7 +1003,12 @@ mod tests {
         let mut publication = ReviewPublication::default();
         publication.queue(&snapshot, comment(1)).unwrap();
         publication
-            .preview(&snapshot, None, "Review notes".to_string())
+            .preview(
+                &snapshot,
+                CommentSelection::All,
+                github_pr::ReviewEvent::Comment,
+                "Review notes".to_string(),
+            )
             .unwrap();
         let PublicationState::Confirming(pending) = &publication.state else {
             panic!("preview missing")
@@ -803,13 +1019,23 @@ mod tests {
         assert_eq!(publication.drafts.len(), 1);
         assert!(
             publication
-                .preview(&snapshot, None, "Review notes".to_string())
+                .preview(
+                    &snapshot,
+                    CommentSelection::All,
+                    github_pr::ReviewEvent::Comment,
+                    "Review notes".to_string(),
+                )
                 .is_err()
         );
         publication.refreshed();
         assert!(
             publication
-                .preview(&snapshot, None, "Review notes".to_string())
+                .preview(
+                    &snapshot,
+                    CommentSelection::All,
+                    github_pr::ReviewEvent::Comment,
+                    "Review notes".to_string(),
+                )
                 .is_ok()
         );
     }
@@ -821,7 +1047,12 @@ mod tests {
         publication.queue(&snapshot, comment(1)).unwrap();
         publication.queue(&snapshot, comment(2)).unwrap();
         publication
-            .preview(&snapshot, Some(0), "Review notes".to_string())
+            .preview(
+                &snapshot,
+                CommentSelection::One(0),
+                github_pr::ReviewEvent::Comment,
+                "Review notes".to_string(),
+            )
             .unwrap();
         let PublicationState::Confirming(pending) = &publication.state else {
             panic!("preview missing")

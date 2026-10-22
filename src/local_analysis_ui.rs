@@ -36,10 +36,12 @@ impl ReviewWorkspace {
     pub const fn evidence_edits_busy(&self) -> bool {
         self.is_opening_repository
             || self.local_opinion_state.busy()
+            || self.remote_commit_state.is_busy()
             || matches!(self.local_analysis_state, AnalysisState::Loading(_))
             || matches!(
                 self.local_review_state,
                 crate::LocalReviewState::Running(_)
+                    | crate::LocalReviewState::RecommendationRunning(_)
                     | crate::LocalReviewState::SavingSettings
                     | crate::LocalReviewState::Authorizing { .. }
                     | crate::LocalReviewState::Revoking { .. }

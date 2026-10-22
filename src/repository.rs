@@ -1,5 +1,6 @@
 use gix::bstr::ByteSlice;
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -91,6 +92,139 @@ impl RepositorySnapshot {
             review_policy,
         })
     }
+}
+
+pub fn remote_commit_files(
+    snapshot: &RepositorySnapshot,
+) -> anyhow::Result<Vec<crate::github_pr::GitHubCommitFile>> {
+    anyhow::ensure!(
+        !snapshot.changed_files.is_empty(),
+        "the local checkout has no supported text diffs to commit"
+    );
+    let changed_path_set: BTreeSet<&str> =
+        snapshot.changed_paths.iter().map(String::as_str).collect();
+    let changed_file_set: BTreeSet<&str> = snapshot
+        .changed_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    anyhow::ensure!(
+        changed_path_set == changed_file_set,
+        "local changes include an unsupported empty, mode-only, or non-text file"
+    );
+
+    let repository = gix::discover(&snapshot.root)?;
+    let current_head = repository.head_id().ok().map(|id| id.to_string());
+    anyhow::ensure!(
+        current_head == snapshot.head_oid,
+        "local checkout HEAD changed; reopen it before preparing a remote commit"
+    );
+    let head_tree = repository
+        .head_tree_id_or_empty()?
+        .object()?
+        .try_into_tree()?;
+
+    let before = RepositorySnapshot::open(&snapshot.root)?;
+    anyhow::ensure!(
+        crate::local_review::snapshot_fingerprint(&before)
+            == crate::local_review::snapshot_fingerprint(snapshot),
+        "local checkout changed; refresh before preparing a remote commit"
+    );
+
+    let mut files = Vec::with_capacity(snapshot.changed_files.len());
+    let mut total_bytes = 0_usize;
+    for changed_file in &snapshot.changed_files {
+        anyhow::ensure!(
+            !changed_file.path.is_empty()
+                && changed_file.path.len() <= 4_096
+                && !changed_file.path.contains('\\')
+                && changed_file
+                    .path
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+                && !changed_file.path.chars().any(char::is_control)
+                && Path::new(&changed_file.path)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "local checkout contains an unsupported path"
+        );
+        let relative_path = Path::new(&changed_file.path);
+        let head_entry = head_tree.lookup_entry_by_path(relative_path)?;
+        let mode = match &head_entry {
+            Some(entry) => {
+                anyhow::ensure!(
+                    entry.mode().is_blob() && !entry.mode().is_link(),
+                    "local remote commits support only regular text files"
+                );
+                if entry.mode().is_executable() {
+                    "100755"
+                } else {
+                    "100644"
+                }
+            }
+            None => "100644",
+        };
+        let content = read_local_commit_content(
+            &snapshot.root,
+            &changed_file.path,
+            head_entry.is_some(),
+            &mut total_bytes,
+        )?;
+        files.push(crate::github_pr::GitHubCommitFile {
+            path: changed_file.path.clone(),
+            mode: mode.to_string(),
+            content,
+        });
+    }
+
+    let after = RepositorySnapshot::open(&snapshot.root)?;
+    anyhow::ensure!(
+        crate::local_review::snapshot_fingerprint(&after)
+            == crate::local_review::snapshot_fingerprint(&before),
+        "local checkout changed while preparing the remote commit"
+    );
+    Ok(files)
+}
+
+fn read_local_commit_content(
+    root: &Path,
+    path: &str,
+    exists_at_head: bool,
+    total_bytes: &mut usize,
+) -> anyhow::Result<Option<String>> {
+    let worktree_path = root.join(path);
+    let content = match fs::symlink_metadata(worktree_path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "local remote commits support only regular text files"
+            );
+            let bytes = crate::local_context::read_worktree(
+                root,
+                path,
+                usize::try_from(MAX_LOCAL_FILE_BYTES)?,
+            )?;
+            let content = String::from_utf8(bytes)
+                .map_err(|_| anyhow::anyhow!("local remote commits do not support binary files"))?;
+            anyhow::ensure!(
+                !content.contains('\0'),
+                "local remote commits do not support binary file content"
+            );
+            *total_bytes = total_bytes.saturating_add(content.len());
+            anyhow::ensure!(
+                content.len() <= crate::github_pr::MAX_REMOTE_COMMIT_FILE_BYTES
+                    && *total_bytes <= crate::github_pr::MAX_REMOTE_COMMIT_BYTES,
+                "local selected files exceed the remote commit size limits"
+            );
+            Some(content)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(exists_at_head, "local deletion does not exist at HEAD");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -209,7 +343,7 @@ fn ensure_file_size(path: &str, file_size: u64, total_input_bytes: &mut u64) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::RepositorySnapshot;
+    use super::{RepositorySnapshot, remote_commit_files};
     use gix::bstr::ByteSlice;
     use std::fs;
     #[test]
@@ -304,6 +438,119 @@ mod tests {
         assert!(staged_snapshot.changed_files[0].patch.contains("+staged"));
         assert_eq!(staged_snapshot.changed_files[0].right_lines, [1]);
         assert_eq!(fs::read(index_path).unwrap(), index_before_open);
+    }
+
+    #[test]
+    fn remote_commit_candidates_capture_modified_added_and_deleted_text_files_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = gix::init(directory.path()).unwrap();
+        let kept_blob = repository.write_blob(b"before\n").unwrap().detach();
+        let removed_blob = repository.write_blob(b"remove me\n").unwrap().detach();
+        let tree = gix::objs::Tree {
+            entries: vec![
+                gix::objs::tree::Entry {
+                    mode: (0o100_644).try_into().unwrap(),
+                    filename: "kept.rs".into(),
+                    oid: kept_blob,
+                },
+                gix::objs::tree::Entry {
+                    mode: (0o100_644).try_into().unwrap(),
+                    filename: "removed.rs".into(),
+                    oid: removed_blob,
+                },
+            ],
+        };
+        let tree_id = repository.write_object(&tree).unwrap().detach();
+        let actor = gix::actor::SignatureRef {
+            name: b"Cururu Test".as_bstr(),
+            email: b"cururu@example.test".as_bstr(),
+            time: "1 +0000",
+        };
+        repository
+            .commit_as(
+                actor,
+                actor,
+                "refs/heads/main",
+                "base commit",
+                tree_id,
+                std::iter::empty::<gix::ObjectId>(),
+            )
+            .unwrap();
+        fs::write(directory.path().join("removed.rs"), "remove me\n").unwrap();
+        fs::write(directory.path().join("kept.rs"), "after\n").unwrap();
+        fs::remove_file(directory.path().join("removed.rs")).unwrap();
+        fs::write(directory.path().join("new.rs"), "new content\n").unwrap();
+        let snapshot = RepositorySnapshot::open(directory.path()).unwrap();
+        let index_before = fs::read(directory.path().join(".git/index")).ok();
+
+        let files = remote_commit_files(&snapshot).unwrap();
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.path == "kept.rs")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("after\n")
+        );
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.path == "removed.rs")
+                .unwrap()
+                .content,
+            None
+        );
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.path == "new.rs")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("new content\n")
+        );
+        assert_eq!(
+            fs::read(directory.path().join(".git/index")).ok(),
+            index_before
+        );
+    }
+
+    #[test]
+    fn remote_commit_candidates_reject_unsupported_mode_only_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = gix::init(directory.path()).unwrap();
+        let blob = repository.write_blob(b"same\n").unwrap().detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: (0o100_644).try_into().unwrap(),
+                filename: "tracked.rs".into(),
+                oid: blob,
+            }],
+        };
+        let tree_id = repository.write_object(&tree).unwrap().detach();
+        let actor = gix::actor::SignatureRef {
+            name: b"Cururu Test".as_bstr(),
+            email: b"cururu@example.test".as_bstr(),
+            time: "1 +0000",
+        };
+        repository
+            .commit_as(
+                actor,
+                actor,
+                "refs/heads/main",
+                "base commit",
+                tree_id,
+                std::iter::empty::<gix::ObjectId>(),
+            )
+            .unwrap();
+        fs::write(directory.path().join("tracked.rs"), "same\n").unwrap();
+        let mut snapshot = RepositorySnapshot::open(directory.path()).unwrap();
+        snapshot.changed_paths = vec!["tracked.rs".to_string()];
+
+        assert!(remote_commit_files(&snapshot).is_err());
     }
 
     #[test]
