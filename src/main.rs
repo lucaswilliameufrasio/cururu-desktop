@@ -6542,7 +6542,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| ReviewWorkspace::from_cli()),
+            |window, cx| {
+                // gpui-component inputs require the window's first layer to be a Root.
+                let view = cx.new(|_| ReviewWorkspace::from_cli());
+                cx.new(|cx| gpui_component::Root::new(view.into(), window, cx))
+            },
         )
         .unwrap();
         cx.activate(true);
