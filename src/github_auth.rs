@@ -124,13 +124,7 @@ pub struct GitHubDeviceFlow {
 
 impl GitHubDeviceFlow {
     pub fn new(client_id: String, http: Arc<dyn HttpClient>) -> anyhow::Result<Self> {
-        ensure!(
-            !client_id.is_empty()
-                && client_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
-            "GitHub App client ID is missing or malformed"
-        );
+        validate_client_id(&client_id)?;
         Ok(Self { client_id, http })
     }
 
@@ -325,6 +319,25 @@ impl GitHubDeviceFlow {
         }
         serde_json::from_slice(&bytes).context("GitHub returned an invalid authorization response")
     }
+}
+
+pub fn validate_client_id(client_id: &str) -> anyhow::Result<()> {
+    ensure!(
+        !client_id.is_empty(),
+        "Enter the GitHub App Client ID, or set CURURU_GITHUB_APP_CLIENT_ID before launching Cururu."
+    );
+    ensure!(
+        !client_id.bytes().all(|byte| byte.is_ascii_digit()),
+        "This looks like the numeric App ID. Copy the Client ID from GitHub App settings instead; it usually starts with Iv1. or Ov23."
+    );
+    ensure!(
+        client_id.len() <= 255
+            && client_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+        "GitHub App Client ID is malformed. Copy the public Client ID from the App's General settings."
+    );
+    Ok(())
 }
 
 pub struct CredentialStore;

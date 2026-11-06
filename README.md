@@ -2,7 +2,7 @@
 
 **Second opinion for a local finding** is available for live provider findings
 (including policy-suppressed findings) and loaded static findings, in Review
-changes or Understand a review. Configure both evaluators in Understand a review,
+changes or Understand a review. Configure both evaluators in **Second opinion** settings,
 select **Preview second opinion**, inspect the exact finding JSON/full selected
 file diff and both destinations, then choose **Confirm send to both**.
 This is one-shot consent for that checkout/finding/configuration, separate from
@@ -185,10 +185,17 @@ dual-provider second-opinion workflow. The review workspace includes:
 - unified and side-by-side layouts with synchronized virtualized scrolling;
 - separately approved local test/analyzer commands for an opened checkout.
 
-Without an argument, the app renders a 10,000-row synthetic unified diff parsed
-through the pinned `cururu-core` parser. The sample does not access a
-repository or evaluator; GitHub is contacted only if you explicitly choose
-**Connect GitHub**.
+Without an argument, the app starts at **Start**, with separate entry points for
+local changes and GitHub pull requests. No synthetic findings are shown in a
+normal session. **Review** contains the file rail, diff and a contextual inspector
+with **Discussion**, **AI**, **Checks** and **History** sections. GitHub connection,
+review-provider settings and second-opinion settings have separate destinations;
+navigating never grants consent or publishes anything. See
+[Desktop experience](docs/desktop-experience.md) for the journey and acceptance map.
+
+For isolated visual fixtures, `cargo run -- --ui-preview` (optionally followed by
+`github` or `settings`) skips SQLite restoration and credential-store access.
+This is a visual preview, not proof of OAuth or persistence integration.
 
 Local Git access uses the embedded `gix` library rather than a Git subprocess.
 Open a worktree with the **Open repository…** folder picker, or from the command
@@ -305,9 +312,10 @@ user. Remote PR text never supplies or authorizes a command.
 
 GitHub sign-in uses the Device Flow. Register a GitHub App for the account or
 organization that should own it, enable Device Flow, then set its public client
-ID in `CURURU_GITHUB_APP_CLIENT_ID`. The desktop reads this variable from its
-process environment at startup; it does not load `.env` files. No client secret
-or private key belongs in the desktop configuration. After setup, PR inspection
+ID in `CURURU_GITHUB_APP_CLIENT_ID`, or enter it in the **GitHub** destination for
+the current session. Use the **Client ID**, not the numeric **App ID**. The desktop
+reads the variable from its process environment at startup; it does not load
+`.env` files. No client secret or private key belongs in the desktop configuration. After setup, PR inspection
 is read-only until you explicitly confirm one of the write flows below.
 **Disconnect GitHub** removes local credentials but does not revoke the grant at
 GitHub.
@@ -411,8 +419,8 @@ Real OAuth validation remains a separate prerequisite.
 
 “Understand a review” can optionally run a second opinion through both a
 user-configured OpenAI-compatible chat-completions endpoint and Jev. Configure
-both models and enter both API keys in that mode; keys are stored only in the
-OS keyring, while non-secret settings stay in local SQLite. The app requires
+both models and enter both API keys in **Second opinion** settings; keys are
+stored only in the OS keyring, while non-secret settings stay in local SQLite. The app requires
 explicit local authorization for the exact `owner/repository` and provider
 configuration, then a separate **Send this bounded thread** action. That
 action sends the selected inline thread, a small source excerpt at the comment

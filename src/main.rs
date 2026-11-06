@@ -25,6 +25,8 @@ mod action_history;
 mod action_history_ui;
 mod automatic_context;
 mod context_discovery;
+mod desktop_http;
+mod desktop_theme;
 mod diff_view;
 mod evaluation_history;
 mod evaluation_history_ui;
@@ -54,6 +56,7 @@ pub mod session_store;
 mod shared_base;
 mod shared_base_ui;
 pub mod suggested_change;
+mod workspace_ui;
 
 const DIFF_LINE_COUNT: usize = 10_000;
 const LINE_HEIGHT: f32 = 24.0;
@@ -84,11 +87,16 @@ struct DiffFile {
     lines: Vec<DiffLine>,
     split_rows: Vec<diff_view::SplitRow>,
     split_indices: Vec<usize>,
+    widest_unified_row: Option<usize>,
+    widest_split_row: Option<usize>,
     added: usize,
     removed: usize,
 }
 
 struct ReviewWorkspace {
+    destination: workspace_ui::Destination,
+    inspector_section: workspace_ui::InspectorSection,
+    github_client_id_input: Option<Entity<InputState>>,
     files: Vec<DiffFile>,
     repository_root: Option<SharedString>,
     branch: Option<SharedString>,
@@ -449,6 +457,9 @@ impl ReviewWorkspace {
             .collect();
 
         Self {
+            destination: workspace_ui::Destination::default(),
+            inspector_section: workspace_ui::InspectorSection::default(),
+            github_client_id_input: None,
             files,
             repository_root: None,
             branch: None,
@@ -525,6 +536,27 @@ impl ReviewWorkspace {
 
     fn from_cli() -> Self {
         let mut workspace = Self::sample();
+        workspace.files.clear();
+        workspace.selected_file = None;
+        workspace.selected_line = 0;
+        // A deliberately isolated visual fixture: no DB restore or keyring read.
+        if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ui-preview")) {
+            workspace.github_auth_state = GitHubAuthState::SignedOut;
+            workspace.github_app_client_id = None;
+            workspace.destination = match std::env::args().nth(2).as_deref() {
+                Some("github") => workspace_ui::Destination::GitHub,
+                Some("settings") => workspace_ui::Destination::ReviewSettings,
+                Some("review") => {
+                    if let Some(path) = std::env::args_os().nth(3) {
+                        workspace
+                            .apply_repository_result(load_repository_session(path.into(), None));
+                    }
+                    workspace_ui::Destination::Review
+                }
+                _ => workspace_ui::Destination::Start,
+            };
+            return workspace;
+        }
         match session_store::SessionStore::open_default() {
             Ok(store) => {
                 match store.publication_preference() {
@@ -577,6 +609,7 @@ impl ReviewWorkspace {
         self.is_opening_repository = false;
         match result {
             Ok(opened) => {
+                self.destination = workspace_ui::Destination::Review;
                 self.cancel_local_command_run();
                 self.local_command_state = LocalCommandState::Idle;
                 let snapshot = opened.snapshot;
@@ -955,13 +988,86 @@ fn parse_diff_file(file: cururu_core::ChangedFile) -> DiffFile {
     }
 
     let (split_rows, split_indices) = diff_view::split_rows(&lines);
+    let widths: Vec<usize> = lines
+        .iter()
+        .map(|line| unicode_width::UnicodeWidthStr::width(line.text.as_ref()))
+        .collect();
+    let widest_unified_row = widths
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, width)| *width)
+        .map(|(index, _)| index);
+    let widest_split_row = split_rows
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, row)| {
+            row.left
+                .into_iter()
+                .chain(row.right)
+                .map(|index| widths[index])
+                .max()
+                .unwrap_or(0)
+        })
+        .map(|(index, _)| index);
     DiffFile {
         path: file.path.into(),
         lines,
         split_rows,
         split_indices,
+        widest_unified_row,
+        widest_split_row,
         added,
         removed,
+    }
+}
+
+const fn diff_width_measurement_index(
+    file: &DiffFile,
+    layout: diff_view::DiffLayout,
+) -> Option<usize> {
+    match layout {
+        diff_view::DiffLayout::Unified => file.widest_unified_row,
+        diff_view::DiffLayout::SideBySide => file.widest_split_row,
+    }
+}
+
+fn diff_content_width(
+    file: &DiffFile,
+    layout: diff_view::DiffLayout,
+    window: &Window,
+) -> gpui::Pixels {
+    let Some(index) = diff_width_measurement_index(file, layout) else {
+        return px(0.0);
+    };
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let measure = |index: usize| {
+        let text = file.lines[index].text.clone();
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(desktop_theme::CODE_FONT),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(text, font_size, &[run], None)
+            .width
+    };
+    match layout {
+        diff_view::DiffLayout::Unified => measure(index) + px(120.0),
+        diff_view::DiffLayout::SideBySide => {
+            let row = file.split_rows[index];
+            let width = row
+                .left
+                .into_iter()
+                .chain(row.right)
+                .map(measure)
+                .fold(px(0.0), gpui::Pixels::max);
+            (width + px(68.0)) * 2.0
+        }
     }
 }
 
@@ -1018,6 +1124,7 @@ fn sample_unified_diff() -> String {
 
 impl ReviewWorkspace {
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_connection_input(window, cx);
         if self.draft_input.is_none() {
             self.draft_input = Some(cx.new(|input_cx| {
                 InputState::new(window, input_cx)
@@ -1071,6 +1178,10 @@ impl ReviewWorkspace {
                     .masked(true)
             }));
         }
+        self.ensure_evaluator_inputs(window, cx);
+    }
+
+    fn ensure_evaluator_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.evaluator_endpoint_input.is_none() {
             let value = self
                 .evaluator_settings
@@ -1131,8 +1242,11 @@ impl ReviewWorkspace {
 
 impl Render for ReviewWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_github_credentials_loaded(cx);
+        if self.destination == workspace_ui::Destination::GitHub {
+            self.ensure_github_credentials_loaded(cx);
+        }
         self.ensure_inputs(window, cx);
+        let layout = workspace_ui::WorkspaceLayout::for_width(window.viewport_size().width);
         div()
             .flex()
             .flex_col()
@@ -1140,18 +1254,6 @@ impl Render for ReviewWorkspace {
             .bg(rgb(0x0011_1820))
             .text_color(rgb(0x00d5_dee8))
             .child(self.render_header(cx))
-            .child(self.render_mode_switch(cx))
-            .children(
-                (self.review_mode == ReviewMode::ReviewChanges
-                    && matches!(self.remote_review_state, RemoteReviewState::Idle))
-                .then(|| self.render_local_review_settings(cx)),
-            )
-            .child(self.render_github_auth_status())
-            .child(self.render_pull_request_loader(cx))
-            .children(
-                (self.review_mode == ReviewMode::UnderstandReview)
-                    .then(|| self.render_evaluator_settings(cx)),
-            )
             .children(self.notice.clone().map(|notice| {
                 div()
                     .px_4()
@@ -1166,14 +1268,51 @@ impl Render for ReviewWorkspace {
                     .text_color(rgb(0x00f0_a090))
                     .child(error)
             }))
+            .children(self.load_error.clone().map(|error| {
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_color(rgb(0x00f0_a090))
+                    .child(error)
+            }))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_file_rail(cx))
-                    .child(self.render_diff(cx))
-                    .child(self.render_finding_panel(cx)),
+                    .child(self.render_navigation(layout.navigation, cx))
+                    .child(
+                        if self.destination == workspace_ui::Destination::Review
+                            && self.has_review()
+                        {
+                            div()
+                                .id("review-content")
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(self.render_mode_switch(cx))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(self.render_file_rail(layout.files, cx))
+                                        .child(self.render_diff(window, cx))
+                                        .child(self.render_finding_panel(layout.inspector, cx)),
+                                )
+                        } else {
+                            div()
+                                .id("destination-content")
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .p_8()
+                                .child(self.render_destination(cx))
+                        },
+                    ),
             )
     }
 }
@@ -1198,21 +1337,13 @@ impl ReviewWorkspace {
         } else {
             "Save provider settings"
         };
-        let save_button = div()
-            .id("save-local-review-settings")
-            .px_3()
-            .py_2()
-            .bg(rgb(if is_saving { 0x001b_2732 } else { 0x0026_3442 }))
-            .child(save_label);
-        let save_button = if is_saving {
-            save_button
-        } else {
-            save_button
-                .cursor_pointer()
-                .on_click(move |_event, window, cx| {
-                    save_local_review_configuration(&entity, inputs.clone(), window, cx);
-                })
-        };
+        let save_button = Button::new("save-local-review-settings")
+            .label(save_label)
+            .primary()
+            .disabled(is_saving)
+            .on_click(move |_event, window, cx| {
+                save_local_review_configuration(&entity, inputs.clone(), window, cx);
+            });
         div()
             .flex()
             .flex_col()
@@ -1228,7 +1359,7 @@ impl ReviewWorkspace {
             .children(model)
             .child("API key · stored only in the OS keyring")
             .children(api_key)
-            .child(save_button)
+            .child(div().flex().child(save_button))
             .child(
                 div()
                     .text_color(rgb(0x009b_aaba))
@@ -1276,10 +1407,15 @@ impl ReviewWorkspace {
             .border_b_1()
             .border_color(rgb(0x002b_3946))
             .child("Second opinion · both providers receive the selected review context")
+            .child("Provider base URL (HTTPS)")
             .children(endpoint)
+            .child("OpenAI-compatible model")
             .children(openai_model)
+            .child("Jev model")
             .children(jev_model)
+            .child("OpenAI-compatible API key")
             .children(openai_key)
+            .child("Jev API key")
             .children(jev_key)
             .child(
                 div()
@@ -1317,31 +1453,19 @@ impl ReviewWorkspace {
             .children(modes.into_iter().map(|(mode, label)| {
                 let is_selected = self.review_mode == mode;
                 let entity = entity.clone();
-                div()
-                    .id(match mode {
-                        ReviewMode::ReviewChanges => "mode-review-changes",
-                        ReviewMode::UnderstandReview => "mode-understand-review",
-                    })
-                    .px_3()
-                    .py_2()
-                    .bg(rgb(if is_selected {
-                        0x0026_3442
-                    } else {
-                        0x0015_1e27
-                    }))
-                    .text_color(rgb(if is_selected {
-                        0x00f0_f3f6
-                    } else {
-                        0x009b_aaba
-                    }))
-                    .cursor_pointer()
-                    .child(label)
-                    .on_click(move |_event, _window, cx| {
-                        entity.update(cx, |this, cx| {
-                            this.select_review_mode(mode);
-                            cx.notify();
-                        });
-                    })
+                Button::new(match mode {
+                    ReviewMode::ReviewChanges => "mode-review-changes",
+                    ReviewMode::UnderstandReview => "mode-understand-review",
+                })
+                .label(label)
+                .ghost()
+                .selected(is_selected)
+                .on_click(move |_event, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.select_review_mode(mode);
+                        cx.notify();
+                    });
+                })
             }))
     }
 
@@ -1390,14 +1514,15 @@ impl ReviewWorkspace {
             });
         div()
             .flex()
-            .items_center()
+            .flex_col()
             .gap_3()
             .px_4()
             .py_2()
             .border_b_1()
             .border_color(rgb(0x002b_3946))
+            .child("Pull request reference (owner/repository#number)")
             .children(input)
-            .child(load_button)
+            .child(div().flex().child(load_button))
             .child(div().text_color(rgb(0x009b_aaba)).child(label))
     }
 
@@ -1467,13 +1592,16 @@ impl ReviewWorkspace {
                 start_github_refresh(cx.entity(), client_id, http, credentials, cx);
             }
             GitHubAuthState::SignedOut | GitHubAuthState::Failed(_) => {
-                let Some(client_id) = self.github_app_client_id.clone() else {
-                    self.github_auth_state = GitHubAuthState::Failed(
-                        "Configure CURURU_GITHUB_APP_CLIENT_ID before connecting GitHub.".into(),
-                    );
+                let client_id = self.github_client_id_input.as_ref().map_or_else(
+                    || self.github_app_client_id.clone().unwrap_or_default(),
+                    |input| input.read(cx).value().trim().to_string(),
+                );
+                if let Err(error) = github_auth::validate_client_id(&client_id) {
+                    self.github_auth_state = GitHubAuthState::Failed(error.to_string().into());
                     cx.notify();
                     return;
-                };
+                }
+                self.github_app_client_id = Some(client_id.clone());
                 self.github_auth_state = GitHubAuthState::StartingDeviceFlow;
                 start_github_device_login(cx.entity(), client_id, http, cx);
             }
@@ -1559,14 +1687,20 @@ impl ReviewWorkspace {
             GitHubAuthState::Disconnecting => Some("Removing GitHub credentials…".to_string()),
             GitHubAuthState::Failed(message) => Some(message.to_string()),
             GitHubAuthState::SignedOut => Some(
-                "GitHub is not connected · register a GitHub App with Device Flow and set CURURU_GITHUB_APP_CLIENT_ID."
+                "Not connected. Enter your App's public Client ID below, then connect. Device Flow must be enabled in the App settings."
                     .to_string(),
             ),
         };
         div()
             .px_4()
             .py_2()
-            .text_color(rgb(0x009b_aaba))
+            .text_color(rgb(
+                if matches!(self.github_auth_state, GitHubAuthState::Failed(_)) {
+                    0x00f0_a090
+                } else {
+                    0x00a6_b5c5
+                },
+            ))
             .children(message)
     }
 
@@ -1585,13 +1719,14 @@ impl ReviewWorkspace {
             }
             (_, Some(root), Some(branch)) => format!("{root} · {branch} → working tree"),
             (_, Some(root), None) => format!("{root} · detached HEAD → working tree"),
-            (_, None, None) => "synthetic review workspace".to_string(),
+            (_, None, None) => "No project open".to_string(),
             (_, None, Some(branch)) => format!("{branch} → working tree"),
         };
         div()
             .flex()
             .items_center()
             .justify_between()
+            .gap_3()
             .h(px(52.0))
             .px_4()
             .border_b_1()
@@ -1599,12 +1734,28 @@ impl ReviewWorkspace {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .gap_3()
                     .child(div().text_color(rgb(0x00e5_a84b)).child("CURURU"))
                     .child(div().text_color(rgb(0x009b_aaba)).child("review workspace")),
             )
-            .child(div().text_color(rgb(0x009b_aaba)).child(subtitle))
-            .child(self.render_header_actions(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(0x009b_aaba))
+                    .child(subtitle),
+            )
+            .child(
+                Self::destination_button(
+                    "header-start",
+                    "Open…",
+                    workspace_ui::Destination::Start,
+                    cx,
+                )
+                .flex_shrink_0(),
+            )
     }
 
     fn render_header_actions(&self, cx: &Context<Self>) -> gpui::Div {
@@ -1648,19 +1799,15 @@ impl ReviewWorkspace {
                     }
                 })
         });
-        let open_button = div()
-            .id("open-repository")
-            .px_3()
-            .py_2()
-            .bg(rgb(
-                if self.is_opening_repository || is_applying_suggestion {
-                    0x001b_2732
-                } else {
-                    0x0026_3442
-                },
-            ))
-            .cursor_pointer()
-            .child(if is_applying_suggestion {
+        let open_button = Button::new("open-repository")
+            .primary()
+            .disabled(
+                self.is_opening_repository
+                    || is_applying_suggestion
+                    || self.remote_commit_state.is_busy()
+                    || self.remote_suggestion_state.is_busy(),
+            )
+            .label(if is_applying_suggestion {
                 "Applying local suggestion…"
             } else if self.is_opening_repository {
                 "Opening repository…"
@@ -1690,17 +1837,14 @@ impl ReviewWorkspace {
                     start_repository_picker(cx, entity, store.clone());
                 }
             });
-        let auth_button = self.render_github_auth_button(cx);
         div()
             .flex()
             .gap_2()
             .children(reopen_button)
-            .child(auth_button)
-            .child(self.render_gh_fallback_button(cx))
             .child(open_button)
     }
 
-    fn render_github_auth_button(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_github_auth_button(&self, cx: &Context<Self>) -> Button {
         let label = match self.github_auth_state {
             GitHubAuthState::SignedIn
                 if self
@@ -1725,13 +1869,18 @@ impl ReviewWorkspace {
         };
         let entity = cx.entity();
         let http = cx.http_client();
-        div()
-            .id("github-auth-action")
-            .px_3()
-            .py_2()
-            .bg(rgb(0x0020_2b36))
-            .cursor_pointer()
-            .child(label)
+        Button::new("github-auth-action")
+            .label(label)
+            .disabled(matches!(
+                self.github_auth_state,
+                GitHubAuthState::Uninitialized
+                    | GitHubAuthState::CheckingCredentials
+                    | GitHubAuthState::StartingDeviceFlow
+                    | GitHubAuthState::ReadingGhSession
+                    | GitHubAuthState::RefreshingToken
+                    | GitHubAuthState::SavingCredentials
+                    | GitHubAuthState::Disconnecting
+            ))
             .on_click(move |_event, _window, cx| {
                 entity.update(cx, |this, cx| {
                     this.handle_github_auth_action(http.clone(), cx);
@@ -1739,7 +1888,7 @@ impl ReviewWorkspace {
             })
     }
 
-    fn render_file_rail(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_file_rail(&self, width: gpui::Pixels, cx: &Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let mut file_rows = Vec::with_capacity(self.files.len());
         for (index, file) in self.files.iter().enumerate() {
@@ -1751,6 +1900,7 @@ impl ReviewWorkspace {
                 div()
                     .id(("changed-file", index))
                     .flex()
+                    .gap_2()
                     .items_center()
                     .justify_between()
                     .px_3()
@@ -1763,14 +1913,26 @@ impl ReviewWorkspace {
                             cx.notify();
                         });
                     })
-                    .child(div().text_color(rgb(0x00d5_dee8)).child(path))
-                    .child(div().text_color(rgb(0x008c_a392)).child(summary)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(0x00d5_dee8))
+                            .child(path),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(0x008c_a392))
+                            .child(summary),
+                    ),
             );
         }
         div()
             .flex()
             .flex_col()
-            .w(px(224.0))
+            .w(width)
             .flex_shrink_0()
             .border_r_1()
             .border_color(rgb(0x002b_3946))
@@ -1827,7 +1989,35 @@ impl ReviewWorkspace {
                     }),
             );
         }
-        div().flex().gap_2().children(buttons)
+        for (id, label, amount) in [
+            ("diff-scroll-left", "Scroll left", 240.0),
+            ("diff-scroll-right", "Scroll right", -240.0),
+        ] {
+            let entity = cx.entity();
+            buttons.push(
+                Button::new(id)
+                    .label(label)
+                    .ghost()
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.scroll_diff_horizontal(px(amount));
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+        div().flex().flex_wrap().gap_2().children(buttons)
+    }
+
+    fn scroll_diff_horizontal(&self, amount: gpui::Pixels) {
+        let state = self.diff_scroll_handle.0.borrow();
+        let Some(size) = state.last_item_size else {
+            return;
+        };
+        let limit = (size.contents.width - size.item.width).max(px(0.0));
+        let offset = state.base_handle.offset();
+        let x = (offset.x + amount).max(-limit).min(px(0.0));
+        state.base_handle.set_offset(gpui::point(x, offset.y));
     }
 
     fn render_split_cell(
@@ -1838,6 +2028,7 @@ impl ReviewWorkspace {
         entity: &Entity<Self>,
     ) -> gpui::Div {
         let cell = div()
+            .font_family(desktop_theme::CODE_FONT)
             .flex()
             .flex_1()
             .min_w_0()
@@ -1916,6 +2107,7 @@ impl ReviewWorkspace {
         let entity = entity.clone();
         div()
             .id(index)
+            .font_family(desktop_theme::CODE_FONT)
             .flex()
             .items_center()
             .h(px(LINE_HEIGHT))
@@ -1949,7 +2141,7 @@ impl ReviewWorkspace {
             )
     }
 
-    fn render_diff(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_diff(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let Some(selected_file) = self.selected_file else {
             let message = self
                 .load_error
@@ -1971,6 +2163,8 @@ impl ReviewWorkspace {
             diff_view::DiffLayout::Unified => file.lines.len(),
             diff_view::DiffLayout::SideBySide => file.split_rows.len(),
         };
+        let widest_row = diff_width_measurement_index(file, self.diff_layout);
+        let content_width = diff_content_width(file, self.diff_layout, window);
         div()
             .flex()
             .flex_col()
@@ -1978,9 +2172,12 @@ impl ReviewWorkspace {
             .min_w_0()
             .child(
                 div()
-                    .h(px(38.0))
+                    .min_h(px(38.0))
+                    .py_1()
                     .px_3()
                     .flex()
+                    .flex_wrap()
+                    .gap_2()
                     .items_center()
                     .justify_between()
                     .border_b_1()
@@ -2002,6 +2199,7 @@ impl ReviewWorkspace {
                                     div()
                                         .id(index)
                                         .flex()
+                                        .min_w(content_width)
                                         .h(px(LINE_HEIGHT))
                                         .child(this.render_split_cell(
                                             selected_file,
@@ -2018,32 +2216,35 @@ impl ReviewWorkspace {
                                 );
                                 continue;
                             }
-                            elements.push(this.render_unified_row(&lines[index], index, &entity));
+                            elements.push(
+                                this.render_unified_row(&lines[index], index, &entity)
+                                    .min_w(content_width),
+                            );
                         }
                         elements
                     }),
                 )
+                .with_width_from_item(widest_row)
+                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
                 .track_scroll(self.diff_scroll_handle.clone())
                 .flex_1(),
             )
     }
 
-    fn render_finding_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_finding_panel(&self, width: gpui::Pixels, cx: &Context<Self>) -> impl IntoElement {
         let Some(selected_file) = self.selected_file else {
             return div()
                 .id("review-detail-panel")
                 .min_h_0()
                 .overflow_y_scroll()
-                .w(px(300.0))
+                .w(width)
                 .flex_shrink_0()
                 .border_l_1()
                 .border_color(rgb(0x002b_3946))
                 .bg(rgb(0x0015_1e27))
                 .p_4()
-                .child(self.render_local_history(cx))
-                .child(self.render_local_analysis(cx))
-                .child(self.render_local_finding_opinion(cx))
-                .child(self.render_action_history(cx));
+                .child(self.render_inspector_navigation(cx))
+                .child(self.render_review_controls(cx, "", None));
         };
         let file = &self.files[selected_file];
         let line = &file.lines[self.selected_line];
@@ -2070,21 +2271,21 @@ impl ReviewWorkspace {
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.render_review_controls(cx, file.path.as_ref(), line.new_number))
-            .child(self.render_action_history(cx));
+            .child(self.render_review_controls(cx, file.path.as_ref(), line.new_number));
         div()
             .id("review-detail-panel")
             .min_h_0()
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .w(px(300.0))
+            .w(width)
             .flex_shrink_0()
             .border_l_1()
             .border_color(rgb(0x002b_3946))
             .bg(rgb(0x0015_1e27))
             .p_4()
             .gap_3()
+            .child(self.render_inspector_navigation(cx))
             .child(div().text_color(rgb(0x00e5_a84b)).child(label))
             .child(div().text_lg().text_color(rgb(0x00f0_f3f6)).child(title))
             .child(div().text_color(rgb(0x00b5_c0cb)).child(description))
@@ -2123,6 +2324,70 @@ impl ReviewWorkspace {
         path: &str,
         selected_line: Option<usize>,
     ) -> impl IntoElement {
+        use workspace_ui::InspectorSection;
+        match self.inspector_section {
+            InspectorSection::History => {
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(self.render_action_history(cx));
+                if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state {
+                    panel = panel.child(self.render_evaluation_history(cx, snapshot));
+                } else {
+                    panel = panel.child(self.render_local_history(cx));
+                }
+                return panel;
+            }
+            InspectorSection::Checks => {
+                if matches!(self.remote_review_state, RemoteReviewState::Loaded(_)) {
+                    return div()
+                        .child("Open the local checkout to inspect SARIF or run approved checks.");
+                }
+                return div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(self.render_local_analysis(cx))
+                    .child(self.render_local_command_action(cx));
+            }
+            InspectorSection::Assistance => {
+                let destination =
+                    if matches!(self.remote_review_state, RemoteReviewState::Loaded(_)) {
+                        workspace_ui::Destination::OpinionSettings
+                    } else {
+                        workspace_ui::Destination::ReviewSettings
+                    };
+                let settings = Self::destination_button(
+                    "inspector-provider-settings",
+                    "Configure providers",
+                    destination,
+                    cx,
+                );
+                let panel = div().flex().flex_col().gap_4().child(settings);
+                return if let RemoteReviewState::Loaded(snapshot) = &self.remote_review_state {
+                    panel.child(self.render_evaluator_action(cx, snapshot))
+                } else {
+                    panel
+                        .child(self.render_local_review_action(cx))
+                        .child(self.render_local_finding_opinion(cx))
+                };
+            }
+            InspectorSection::Discussion => {
+                if path.is_empty() {
+                    return div().child("Select a changed line to write a comment. Use Checks or History for project-wide actions.");
+                }
+            }
+        }
+        self.render_discussion_controls(cx, path, selected_line)
+    }
+
+    fn render_discussion_controls(
+        &self,
+        cx: &Context<Self>,
+        path: &str,
+        selected_line: Option<usize>,
+    ) -> gpui::Div {
         match (&self.review_mode, &self.remote_review_state) {
             (ReviewMode::UnderstandReview, RemoteReviewState::Loaded(snapshot)) => {
                 let entity = cx.entity();
@@ -2149,8 +2414,6 @@ impl ReviewWorkspace {
                             .iter()
                             .map(render_remote_conversation_comment),
                     )
-                    .child(self.render_evaluator_action(cx, snapshot))
-                    .child(self.render_evaluation_history(cx, snapshot))
                     .child(self.render_remote_suggestion(cx, snapshot))
                     .child(self.render_remote_commit(cx, snapshot))
                     .child(self.render_thread_reply_composer(cx))
@@ -2177,11 +2440,6 @@ impl ReviewWorkspace {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(self.render_local_review_action(cx))
-                .child(self.render_local_history(cx))
-                .child(self.render_local_analysis(cx))
-                .child(self.render_local_finding_opinion(cx))
-                .child(self.render_local_command_action(cx))
                 .child(self.render_draft_controls(cx, path, selected_line)),
         }
     }
@@ -5932,6 +6190,7 @@ fn start_pull_request_load(
                     this.selected_file = (!this.files.is_empty()).then_some(0);
                     this.selected_line = 0;
                     this.remote_review_state = RemoteReviewState::Loaded(Box::new(snapshot));
+                    this.destination = workspace_ui::Destination::Review;
                     this.notice = Some("Pull request loaded read-only from GitHub.".into());
                 }
                 Err(error) => {
@@ -6534,23 +6793,53 @@ fn persist_comment_draft(entity: Entity<ReviewWorkspace>, save: DraftSave, cx: &
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        gpui_component::init(cx);
-        let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                // gpui-component inputs require the window's first layer to be a Root.
-                let view = cx.new(|_| ReviewWorkspace::from_cli());
-                cx.new(|cx| gpui_component::Root::new(view.into(), window, cx))
-            },
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    let http =
+        desktop_http::DesktopHttpClient::new().expect("Could not initialize the HTTP client");
+    Application::new()
+        .with_http_client(http)
+        .run(|cx: &mut App| {
+            gpui_component::init(cx);
+            desktop_theme::init(cx);
+            cx.spawn(async move |cx| {
+                // Wayland output discovery completes after the application callback.
+                for _ in 0..100 {
+                    if cx.update(|cx| !cx.displays().is_empty()).unwrap_or(true) {
+                        break;
+                    }
+                    gpui::Timer::after(std::time::Duration::from_millis(10)).await;
+                }
+                let _ = cx.update(open_main_window);
+            })
+            .detach();
+        });
+}
+
+fn open_main_window(cx: &mut App) {
+    // Wayland does not expose a primary display in this GPUI version.
+    let display = cx
+        .primary_display()
+        .or_else(|| cx.displays().into_iter().next());
+    let initial_size = display
+        .as_ref()
+        .map_or(size(px(1440.0), px(900.0)), |display| {
+            workspace_ui::initial_window_size(display.bounds().size)
+        });
+    let display_id = display.map(|display| display.id());
+    let bounds = Bounds::centered(display_id, initial_size, cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            display_id,
+            ..Default::default()
+        },
+        |window, cx| {
+            // gpui-component inputs require the window's first layer to be a Root.
+            let view = cx.new(|_| ReviewWorkspace::from_cli());
+            cx.new(|cx| gpui_component::Root::new(view.into(), window, cx))
+        },
+    )
+    .unwrap();
+    cx.activate(true);
 }
 
 #[cfg(test)]
@@ -6564,6 +6853,41 @@ mod tests {
         validate_local_review_snapshot,
     };
     use std::fs;
+
+    #[test]
+    fn horizontal_diff_measurement_uses_visual_columns_and_maps_split_rows() {
+        let patch = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-éééééé\n+abcdefghij\n";
+        let file = parse_diff_file(cururu_core::parse_unified_diff(patch).remove(0));
+        assert_eq!(
+            super::diff_width_measurement_index(&file, super::diff_view::DiffLayout::Unified),
+            Some(1)
+        );
+        assert_eq!(
+            super::diff_width_measurement_index(&file, super::diff_view::DiffLayout::SideBySide),
+            Some(0)
+        );
+        assert_eq!(file.split_rows[0].right, Some(1));
+    }
+
+    #[test]
+    fn horizontal_diff_buttons_clamp_to_real_content_and_preserve_vertical_offset() {
+        let workspace = ReviewWorkspace::sample();
+        let handle = workspace.diff_scroll_handle.0.borrow().base_handle.clone();
+        workspace.diff_scroll_handle.0.borrow_mut().last_item_size = Some(gpui::ItemSize {
+            item: gpui::size(gpui::px(640.0), gpui::px(480.0)),
+            contents: gpui::size(gpui::px(1800.0), gpui::px(2000.0)),
+        });
+        handle.set_offset(gpui::point(gpui::px(0.0), gpui::px(-48.0)));
+        workspace.scroll_diff_horizontal(gpui::px(-240.0));
+        assert_eq!(
+            handle.offset(),
+            gpui::point(gpui::px(-240.0), gpui::px(-48.0))
+        );
+        workspace.scroll_diff_horizontal(gpui::px(-5000.0));
+        assert_eq!(handle.offset().x, gpui::px(-1160.0));
+        workspace.scroll_diff_horizontal(gpui::px(5000.0));
+        assert_eq!(handle.offset().x, gpui::px(0.0));
+    }
 
     #[test]
     fn suggestion_preview_does_not_replace_an_in_flight_application() {
@@ -6878,6 +7202,28 @@ mod tests {
         assert!(workspace.local_repository_snapshot.is_some());
         assert!(workspace.local_review_identity.is_some());
         assert!(workspace.notice.as_ref().unwrap().contains("read-only"));
+        assert_eq!(
+            workspace.destination,
+            super::workspace_ui::Destination::Review
+        );
+    }
+
+    #[test]
+    fn failed_open_does_not_navigate_into_a_fake_review() {
+        let mut workspace = ReviewWorkspace::sample();
+        workspace.apply_repository_result(Err(anyhow::anyhow!("synthetic missing checkout")));
+        assert_eq!(
+            workspace.destination,
+            super::workspace_ui::Destination::Start
+        );
+        assert!(!workspace.has_review());
+        assert!(
+            workspace
+                .load_error
+                .as_ref()
+                .unwrap()
+                .contains("synthetic missing checkout")
+        );
     }
 
     #[test]

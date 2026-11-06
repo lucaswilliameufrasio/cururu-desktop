@@ -905,3 +905,31 @@ evaluator filtering remains disabled until representative real examples,
 approved metrics/thresholds, and rollout criteria have been reviewed. Visual and
 runtime interaction checks and real GitHub OAuth remain user-owned external
 validation.
+
+## Journey-based desktop shell and real HTTP transport (2026-11-06)
+
+The first macOS screenshot exposed a product-structure failure: setup forms,
+authentication, sample findings and review actions competed in the same view.
+Separate Start, Review, GitHub connection, review-provider settings and
+second-opinion settings. The review inspector separates discussion, assistance,
+checks and history. Navigation changes visibility, not authorization, evidence
+identity, drafts or publication state. Default launch must not show sample data.
+Do not load GitHub credentials before the user enters the GitHub destination.
+
+Use the existing gpui-component controls with a shared native theme rather than
+inventing another button/form system. Framework migration is a separate pending
+decision; `gpui-kit` is not assumed to be a drop-in replacement. Journey and
+acceptance details live in [Desktop experience](desktop-experience.md).
+
+GPUI's default Application client is `NullHttpClient`; it returns
+`No HttpClient available`. Install an isahc-backed client explicitly at startup.
+It supports futures I/O without a Tokio runtime, preserves response status and
+streaming bounds in domain clients, applies connect/request deadlines, and never
+follows redirects with authorization headers. Local protocol fixtures verify
+transport independently of live GitHub credentials. Numeric App IDs are rejected
+with guidance to use the public Client ID instead. Support entering that public
+ID for the current session, plus copy/reopen actions for device authorization.
+
+Agent-owned native visual checks should use a private display and isolated app
+data, never the user's desktop or credential store. Compilation/tests and
+screenshots must not be represented as completed real OAuth or macOS acceptance.

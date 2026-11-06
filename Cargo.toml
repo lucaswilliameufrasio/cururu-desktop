@@ -33,6 +33,8 @@ similar = "2"
 shell-words = "1.1"
 tempfile = "3"
 url = "2"
+isahc = { version = "1.7", default-features = false }
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "=0.31.3", features = ["signal", "fs"] }
